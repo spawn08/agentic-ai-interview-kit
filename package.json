@@ -1,7 +1,28 @@
 {
   "name": "agentic-ai-interview-kit",
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "Comprehensive open-source study guide for mastering agentic AI -- from LLM foundations through production system design and interview preparation.",
   "private": true,
+  "author": "spawn08",
+  "license": "MIT",
+  "homepage": "https://spawn08.github.io/agentic-ai-interview-kit/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/spawn08/agentic-ai-interview-kit.git"
+  },
+  "keywords": [
+    "agentic-ai",
+    "llm",
+    "interview-preparation",
+    "system-design",
+    "ai-agents",
+    "langchain",
+    "langgraph",
+    "crewai",
+    "autogen",
+    "rag",
+    "docusaurus"
+  ],
   "scripts": {
     "docusaurus": "docusaurus",
     "start": "docusaurus start",

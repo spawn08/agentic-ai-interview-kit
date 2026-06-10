@@ -1,0 +1,9 @@
+{
+  "label": "Core Concepts",
+  "position": 3,
+  "collapsed": false,
+  "link": {
+    "type": "generated-index",
+    "description": "What makes an AI system agentic."
+  }
+}

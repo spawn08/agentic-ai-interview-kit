@@ -1,0 +1,63 @@
+:root {
+  --ifm-color-primary: #5b21b6;
+  --ifm-color-primary-dark: #4c1d95;
+  --ifm-color-primary-darker: #44198a;
+  --ifm-color-primary-darkest: #3b0f72;
+  --ifm-color-primary-light: #6d28d9;
+  --ifm-color-primary-lighter: #7c3aed;
+  --ifm-color-primary-lightest: #8b5cf6;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(91, 33, 182, 0.1);
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #a78bfa;
+  --ifm-color-primary-dark: #8b5cf6;
+  --ifm-color-primary-darker: #7c3aed;
+  --ifm-color-primary-darkest: #6d28d9;
+  --ifm-color-primary-light: #c4b5fd;
+  --ifm-color-primary-lighter: #ddd6fe;
+  --ifm-color-primary-lightest: #ede9fe;
+  --ifm-background-color: #0f0a1a;
+  --ifm-background-surface-color: #1a1025;
+  --docusaurus-highlighted-code-line-bg: rgba(167, 139, 250, 0.15);
+}
+
+.badge--beginner {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background-color: #10b981;
+  color: white;
+}
+
+.badge--intermediate {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background-color: #f59e0b;
+  color: white;
+}
+
+.badge--advanced {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  background-color: #ef4444;
+  color: white;
+}
+
+article pre {
+  border-radius: 8px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+}
+
+.table-of-contents {
+  font-size: 0.85rem;
+}

@@ -78,56 +78,25 @@ The foundation of scalable agent orchestration is asynchronous, queue-based disp
 ### Implementation Pattern
 
 ```python
-import asyncio
-from dataclasses import dataclass, field
-from enum import IntEnum
-
 class Priority(IntEnum):
-    HIGH = 0      # User-facing, real-time
-    NORMAL = 1    # Standard agent tasks
-    BATCH = 2     # Background processing, bulk operations
-
-@dataclass(order=True)
-class AgentTask:
-    priority: Priority
-    task_id: str = field(compare=False)
-    session_id: str = field(compare=False)
-    payload: dict = field(compare=False)
-    created_at: float = field(compare=False)
+    HIGH = 0        # User-facing, real-time
+    NORMAL = 1      # Standard agent tasks
+    BATCH = 2       # Background / bulk
 
 class TaskDispatcher:
-    def __init__(self, queue_client, num_workers: int = 10):
-        self.queue = queue_client
-        self.num_workers = num_workers
+    def __init__(self, queue_client, num_workers=10): ...
 
-    async def submit(self, task: AgentTask):
-        """Submit a task to the priority queue."""
-        await self.queue.enqueue(
-            queue_name=f"agent-tasks-{task.priority.name.lower()}",
-            message=task,
-            deduplication_id=task.task_id,
-        )
+    async def submit(self, task):
+        await self.queue.enqueue(f"agent-tasks-{task.priority.name}", task)
 
-    async def start_workers(self):
-        """Start a pool of workers that consume from all priority queues."""
-        workers = [
-            asyncio.create_task(self._worker_loop(i))
-            for i in range(self.num_workers)
-        ]
-        await asyncio.gather(*workers)
-
-    async def _worker_loop(self, worker_id: int):
+    async def _worker_loop(self, worker_id):
         while True:
-            # Poll high-priority first, then normal, then batch
-            task = (
-                await self.queue.dequeue("agent-tasks-high")
-                or await self.queue.dequeue("agent-tasks-normal")
-                or await self.queue.dequeue("agent-tasks-batch")
-            )
+            # Drain highest-priority queue first
+            task = (await self.queue.dequeue("high")
+                    or await self.queue.dequeue("normal")
+                    or await self.queue.dequeue("batch"))
             if task:
                 await self._process(worker_id, task)
-            else:
-                await asyncio.sleep(0.1)
 ```
 
 :::tip
@@ -154,41 +123,23 @@ graph LR
 ### Example Router
 
 ```python
-from enum import Enum
-
 class TaskComplexity(Enum):
-    SIMPLE = "simple"
-    STANDARD = "standard"
-    COMPLEX = "complex"
-    SPECIALIZED = "specialized"
+    SIMPLE = "simple"       # FAQs, single-step lookups
+    STANDARD = "standard"   # Multi-step, 1-3 tool calls
+    COMPLEX = "complex"     # Multi-tool research, long-running
+    SPECIALIZED = "specialized"  # Domain-specific (legal, medical)
 
 class TaskRouter:
-    def __init__(self, classifier_llm, agent_pools: dict):
-        self.classifier = classifier_llm
-        self.pools = agent_pools
+    def __init__(self, classifier_llm, agent_pools): ...
 
-    async def route(self, task: AgentTask) -> str:
-        """Classify a task and route to the appropriate agent pool."""
-        complexity = await self._classify(task)
-
+    async def route(self, task):
+        complexity = await self._classify(task)     # small LLM classifies
         pool = self.pools[complexity]
-        worker = await pool.acquire_worker()
-        return worker
+        return await pool.acquire_worker()          # route to matching pool
 
-    async def _classify(self, task: AgentTask) -> TaskComplexity:
-        """Use a small, fast LLM to classify task complexity."""
-        prompt = f"""Classify this task's complexity:
-Task: {task.payload['instruction']}
-
-Rules:
-- SIMPLE: Direct answers, FAQs, single-step lookups
-- STANDARD: Multi-step reasoning, 1-3 tool calls
-- COMPLEX: Research tasks, multi-tool orchestration, long-running
-- SPECIALIZED: Domain-specific (legal, medical, financial)
-
-Respond with one word: SIMPLE, STANDARD, COMPLEX, or SPECIALIZED."""
-
-        result = await self.classifier.generate(prompt, max_tokens=10)
+    async def _classify(self, task) -> TaskComplexity:
+        result = await self.classifier.generate(
+            f"Classify complexity: {task.payload['instruction']}", max_tokens=10)
         return TaskComplexity(result.strip().lower())
 ```
 
@@ -217,24 +168,16 @@ Agent workloads are fundamentally different from traditional web workloads. A si
 class CapacityAwareBalancer:
     """Routes tasks based on remaining LLM token budget per worker."""
 
-    def __init__(self, workers: list, rate_limiter):
-        self.workers = workers
-        self.rate_limiter = rate_limiter
-
-    async def select_worker(self, estimated_tokens: int):
-        """Select the worker with the most remaining token budget."""
-        candidates = []
-        for worker in self.workers:
-            remaining = await self.rate_limiter.remaining_budget(worker.id)
-            if remaining >= estimated_tokens:
-                candidates.append((remaining, worker))
-
+    async def select_worker(self, estimated_tokens):
+        candidates = [
+            (await self.rate_limiter.remaining_budget(w.id), w)
+            for w in self.workers
+        ]
+        candidates = [(r, w) for r, w in candidates if r >= estimated_tokens]
         if not candidates:
-            raise BackpressureError("All workers at capacity. Requeue the task.")
-
-        # Select worker with most headroom
+            raise BackpressureError("All workers at capacity.")
         candidates.sort(reverse=True, key=lambda x: x[0])
-        return candidates[0][1]
+        return candidates[0][1]  # worker with most headroom
 ```
 
 ---
@@ -339,26 +282,12 @@ sequenceDiagram
 For interactive use cases, clients need results as they are produced, not after the entire agent loop completes.
 
 ```python
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-import asyncio
-
-app = FastAPI()
-
 @app.post("/agent/run-stream")
-async def run_agent_stream(request: AgentRequest):
+async def run_agent_stream(request):
     async def event_stream():
         async for event in agent.run_streaming(request):
-            match event.type:
-                case "thinking":
-                    yield f"data: {json.dumps({'type': 'thinking', 'content': event.content})}\n\n"
-                case "tool_call":
-                    yield f"data: {json.dumps({'type': 'tool_call', 'tool': event.tool_name})}\n\n"
-                case "tool_result":
-                    yield f"data: {json.dumps({'type': 'tool_result', 'result': event.result})}\n\n"
-                case "final":
-                    yield f"data: {json.dumps({'type': 'final', 'content': event.content})}\n\n"
-
+            # SSE: emit thinking, tool_call, tool_result, final events
+            yield f"data: {json.dumps({'type': event.type, **event.data})}\n\n"
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 ```
 
@@ -371,58 +300,25 @@ For complex, multi-step agent orchestration -- especially when steps can run for
 ### Temporal Example
 
 ```python
-from temporalio import workflow, activity
-from datetime import timedelta
-
-@activity.defn
-async def call_llm(prompt: str, model: str) -> str:
-    response = await llm_client.generate(prompt, model=model)
-    return response
-
-@activity.defn
-async def execute_tool(tool_name: str, params: dict) -> dict:
-    return await tool_executor.execute(tool_name, params)
-
 @workflow.defn
 class AgentWorkflow:
     @workflow.run
-    async def run(self, task: AgentTask) -> str:
-        # Step 1: Plan
+    async def run(self, task):
+        # Step 1: LLM plans (durable activity with retry)
         plan = await workflow.execute_activity(
-            call_llm,
-            args=[task.planning_prompt, "gpt-4o"],
-            start_to_close_timeout=timedelta(seconds=30),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-
-        steps = parse_plan(plan)
-
-        # Step 2: Execute each step with checkpointing
+            call_llm, args=[task.prompt, "gpt-4o"], timeout=30s, retries=3)
+        # Step 2: Execute each step; optionally wait for human approval
         results = []
-        for step in steps:
+        for step in parse_plan(plan):
             if step.requires_approval:
-                # Wait for human approval (durable timer -- survives restarts)
-                approved = await workflow.wait_condition(
-                    lambda: self.approval_received,
-                    timeout=timedelta(hours=24),
-                )
-                if not approved:
-                    return "Task cancelled: approval timeout."
-
+                if not await workflow.wait_condition(self.approved, timeout=24h):
+                    return "Cancelled: approval timeout."
             result = await workflow.execute_activity(
-                execute_tool,
-                args=[step.tool_name, step.params],
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
+                execute_tool, args=[step.tool_name, step.params], timeout=60s)
             results.append(result)
-
-        # Step 3: Synthesize
+        # Step 3: Synthesize results via LLM
         return await workflow.execute_activity(
-            call_llm,
-            args=[build_synthesis_prompt(results), "gpt-4o"],
-            start_to_close_timeout=timedelta(seconds=30),
-        )
+            call_llm, args=[synthesis_prompt(results), "gpt-4o"], timeout=30s)
 ```
 
 ### Temporal vs. Prefect vs. Custom
@@ -450,37 +346,19 @@ When downstream systems (LLM APIs, tool services) cannot keep up with incoming t
 
 ```python
 class BackpressureController:
-    def __init__(self, max_concurrent: int, max_queue_depth: int):
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.max_queue_depth = max_queue_depth
-        self.current_queue_depth = 0
+    def __init__(self, max_concurrent, max_queue_depth): ...
 
-    async def submit(self, task: AgentTask):
-        # Strategy 1: Reject when queue is full
-        if self.current_queue_depth >= self.max_queue_depth:
-            raise ServiceOverloadedError(
-                "System at capacity. Retry after backoff.",
-                retry_after=30,
-            )
-
-        self.current_queue_depth += 1
-
+    async def submit(self, task):
+        if self.queue_depth >= self.max_queue_depth:          # 1: shed load
+            raise ServiceOverloadedError(retry_after=30)
+        self.queue_depth += 1
         try:
-            # Strategy 2: Limit concurrency with semaphore
-            async with self.semaphore:
-                return await self._process(task)
+            async with self.semaphore:                        # 2: cap concurrency
+                if self.error_rate > 0.3:                     # 3: adaptive slowdown
+                    await asyncio.sleep(self._adaptive_delay())
+                return await self.worker.process(task)
         finally:
-            self.current_queue_depth -= 1
-
-    async def _process(self, task: AgentTask):
-        # Strategy 3: Adaptive rate limiting based on error rate
-        if self.error_rate > 0.3:
-            await asyncio.sleep(self._adaptive_delay())
-        return await self.worker.process(task)
-
-    def _adaptive_delay(self) -> float:
-        """Increase delay as error rate increases."""
-        return min(30.0, 1.0 * (self.error_rate / 0.1) ** 2)
+            self.queue_depth -= 1
 ```
 
 ### Key Backpressure Signals

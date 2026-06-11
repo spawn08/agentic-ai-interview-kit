@@ -83,61 +83,21 @@ LLM-specific tracing captures the full prompt-completion lifecycle: what was sen
 ### Instrumenting LLM Calls
 
 ```python
-from opentelemetry import trace
-from opentelemetry.trace import StatusCode
-import time
-
-tracer = trace.get_tracer("agent.llm")
-
 class InstrumentedLLMClient:
-    def __init__(self, client, cost_tracker):
-        self.client = client
-        self.cost_tracker = cost_tracker
-
-    async def generate(self, prompt: str, model: str = "gpt-4o", **kwargs) -> str:
+    async def generate(self, prompt, model="gpt-4o", **kwargs):
         with tracer.start_as_current_span("llm.generate") as span:
             span.set_attribute("llm.model", model)
-            span.set_attribute("llm.prompt_length", len(prompt))
-            span.set_attribute("llm.temperature", kwargs.get("temperature", 1.0))
-
             start = time.monotonic()
             try:
-                response = await self.client.complete(
-                    prompt=prompt, model=model, **kwargs
-                )
-
-                # Record metrics
-                duration = time.monotonic() - start
-                span.set_attribute("llm.completion_length", len(response.text))
-                span.set_attribute("llm.prompt_tokens", response.usage.prompt_tokens)
-                span.set_attribute("llm.completion_tokens", response.usage.completion_tokens)
+                response = await self.client.complete(prompt=prompt, model=model, **kwargs)
+                # Record: tokens, duration, cost on the span
                 span.set_attribute("llm.total_tokens", response.usage.total_tokens)
-                span.set_attribute("llm.duration_seconds", duration)
-                span.set_attribute("llm.cost_usd", self._compute_cost(model, response.usage))
-
-                # Track cost
-                await self.cost_tracker.record(
-                    model=model,
-                    prompt_tokens=response.usage.prompt_tokens,
-                    completion_tokens=response.usage.completion_tokens,
-                )
-
-                span.set_status(StatusCode.OK)
+                span.set_attribute("llm.cost_usd", compute_cost(model, response.usage))
+                await self.cost_tracker.record(model, response.usage)
                 return response.text
-
             except Exception as e:
                 span.set_status(StatusCode.ERROR, str(e))
-                span.record_exception(e)
                 raise
-
-    def _compute_cost(self, model: str, usage) -> float:
-        pricing = {
-            "gpt-4o": {"input": 2.50 / 1_000_000, "output": 10.00 / 1_000_000},
-            "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
-            "claude-sonnet-4-20250514": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
-        }
-        rates = pricing.get(model, {"input": 0, "output": 0})
-        return (usage.prompt_tokens * rates["input"]) + (usage.completion_tokens * rates["output"])
 ```
 
 ---
@@ -173,49 +133,21 @@ graph LR
 ### Agent-Specific Span Attributes
 
 ```python
-# Standard attributes to set on every agent span
 AGENT_SPAN_ATTRIBUTES = {
-    # Identity
-    "agent.name": "research-agent",
-    "agent.version": "2.1.0",
-    "agent.session_id": "sess-abc123",
-
-    # Step context
-    "agent.step.number": 3,
-    "agent.step.type": "tool_execution",  # "planning", "reasoning", "tool_execution", "synthesis"
-    "agent.step.tool_name": "web_search",
-
-    # LLM context
-    "llm.model": "gpt-4o",
-    "llm.prompt_tokens": 1500,
-    "llm.completion_tokens": 350,
-    "llm.total_cost_usd": 0.0073,
-
-    # Performance
-    "agent.total_steps": 5,
-    "agent.total_tool_calls": 3,
-    "agent.total_tokens": 8500,
-    "agent.total_cost_usd": 0.034,
+    # Identity:    agent.name, agent.version, agent.session_id
+    # Step:        agent.step.number, agent.step.type (planning|reasoning|tool|synthesis)
+    # LLM:         llm.model, llm.prompt_tokens, llm.completion_tokens, llm.total_cost_usd
+    # Performance: agent.total_steps, agent.total_tool_calls, agent.total_tokens, agent.total_cost_usd
 }
 ```
 
 ### Setting Up OpenTelemetry
 
 ```python
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-
-def setup_tracing(service_name: str, otlp_endpoint: str):
-    resource = Resource.create({"service.name": service_name})
-    provider = TracerProvider(resource=resource)
-
-    exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
-    processor = BatchSpanProcessor(exporter)
-    provider.add_span_processor(processor)
-
+def setup_tracing(service_name, otlp_endpoint):
+    provider = TracerProvider(resource=Resource({"service.name": service_name}))
+    provider.add_span_processor(BatchSpanProcessor(
+        OTLPSpanExporter(endpoint=otlp_endpoint)))
     trace.set_tracer_provider(provider)
     return trace.get_tracer(service_name)
 
@@ -232,56 +164,16 @@ LLM costs can spike unexpectedly. A runaway agent loop, an unoptimized prompt, o
 ### Cost Tracking System
 
 ```python
-from dataclasses import dataclass
-from datetime import datetime
-
-@dataclass
-class CostRecord:
-    session_id: str
-    user_id: str
-    model: str
-    prompt_tokens: int
-    completion_tokens: int
-    cost_usd: float
-    timestamp: datetime
+# CostRecord: session_id, user_id, model, prompt_tokens, completion_tokens, cost_usd, timestamp
 
 class CostTracker:
-    def __init__(self, store, budget_config):
-        self.store = store
-        self.budget = budget_config
-
-    async def record(self, session_id: str, user_id: str, model: str,
-                     prompt_tokens: int, completion_tokens: int):
-        cost = self._compute_cost(model, prompt_tokens, completion_tokens)
-        record = CostRecord(
-            session_id=session_id,
-            user_id=user_id,
-            model=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cost_usd=cost,
-            timestamp=datetime.utcnow(),
-        )
-        await self.store.append(record)
-
-        # Check budgets
-        await self._check_session_budget(session_id, cost)
-        await self._check_user_budget(user_id, cost)
-        await self._check_global_budget(cost)
-
-    async def _check_session_budget(self, session_id: str, cost: float):
-        total = await self.store.sum_cost(session_id=session_id)
-        if total > self.budget.max_per_session:
-            raise BudgetExceededError(
-                f"Session {session_id} exceeded budget: ${total:.4f} > ${self.budget.max_per_session:.4f}"
-            )
-
-    async def _check_user_budget(self, user_id: str, cost: float):
-        total = await self.store.sum_cost_today(user_id=user_id)
-        if total > self.budget.max_per_user_per_day:
-            raise BudgetExceededError(
-                f"User {user_id} exceeded daily budget: ${total:.2f}"
-            )
+    async def record(self, session_id, user_id, model, prompt_tokens, completion_tokens):
+        cost = compute_cost(model, prompt_tokens, completion_tokens)
+        await self.store.append(CostRecord(session_id, user_id, model, cost))
+        # Enforce budgets at session, user, and global level
+        await self._check_session_budget(session_id)   # raises BudgetExceededError
+        await self._check_user_budget(user_id)
+        await self._check_global_budget()
 ```
 
 ### Cost Dashboard Metrics
@@ -315,38 +207,22 @@ pie title "Latency Budget (120s total)"
 
 ```python
 class LatencyBudget:
-    """Track and enforce latency budgets across agent steps."""
+    # total_budget_ms, allocations per component, actuals per component
 
-    def __init__(self, total_budget_ms: float):
-        self.total_budget = total_budget_ms
-        self.allocations: dict[str, float] = {}
-        self.actuals: dict[str, float] = {}
-        self.start_time = time.monotonic()
-
-    def allocate(self, component: str, fraction: float):
+    def allocate(self, component, fraction):
         self.allocations[component] = self.total_budget * fraction
 
-    def remaining(self, component: str) -> float:
-        allocated = self.allocations.get(component, 0)
-        used = self.actuals.get(component, 0)
-        return max(0, allocated - used)
+    def remaining(self, component):
+        return max(0, self.allocations.get(component, 0) - self.actuals.get(component, 0))
 
-    def record(self, component: str, duration_ms: float):
+    def record(self, component, duration_ms):
         self.actuals[component] = self.actuals.get(component, 0) + duration_ms
-
         if self.actuals[component] > self.allocations.get(component, float('inf')):
-            logger.warning(
-                f"Component '{component}' exceeded budget: "
-                f"{self.actuals[component]:.0f}ms > {self.allocations[component]:.0f}ms"
-            )
+            logger.warning(f"'{component}' exceeded budget")
 
     @property
-    def total_elapsed(self) -> float:
-        return (time.monotonic() - self.start_time) * 1000
-
-    @property
-    def total_remaining(self) -> float:
-        return max(0, self.total_budget - self.total_elapsed)
+    def total_remaining(self):
+        return max(0, self.total_budget - elapsed_ms())
 ```
 
 ---
@@ -391,39 +267,18 @@ class LatencyBudget:
 
 ```python
 class AlertManager:
-    async def evaluate_alerts(self, metrics: dict):
-        # Critical: Page the on-call engineer immediately
+    async def evaluate_alerts(self, metrics):
         if metrics["error_rate_5m"] > 0.20:
-            await self.page(
-                severity="critical",
-                title="Agent error rate > 20%",
-                runbook="https://runbook.internal/agent-high-error-rate",
-            )
-
-        # Warning: Send to Slack, investigate within 1 hour
+            await self.page(severity="critical", title="Error rate > 20%")
         elif metrics["error_rate_5m"] > 0.05:
-            await self.notify_slack(
-                channel="#agent-alerts",
-                title="Agent error rate > 5%",
-                metrics=metrics,
-            )
+            await self.notify_slack(title="Error rate > 5%")
 
-        # Cost alert: Budget protection
         if metrics["hourly_cost_usd"] > self.budget_threshold * 2:
-            await self.page(
-                severity="critical",
-                title=f"Agent cost spike: ${metrics['hourly_cost_usd']:.2f}/hr",
-                runbook="https://runbook.internal/agent-cost-spike",
-            )
-            # Automatic mitigation: reduce concurrency
-            await self.reduce_worker_count(factor=0.5)
+            await self.page(severity="critical", title="Cost spike")
+            await self.reduce_worker_count(factor=0.5)  # auto-mitigate
 
-        # DLQ alert: Any entry means a task permanently failed
         if metrics["dlq_depth"] > 0:
-            await self.notify_slack(
-                channel="#agent-alerts",
-                title=f"DLQ has {metrics['dlq_depth']} entries",
-            )
+            await self.notify_slack(title=f"DLQ has {metrics['dlq_depth']} entries")
 ```
 
 :::warning
@@ -446,51 +301,20 @@ Alert fatigue kills observability. Start with a small set of high-signal alerts 
 ### Structured Logging for Agents
 
 ```python
-import structlog
-
-logger = structlog.get_logger()
-
 class ObservableAgentLoop:
-    async def run_step(self, step_number: int, context: dict):
-        log = logger.bind(
-            session_id=context["session_id"],
-            step_number=step_number,
-            agent_name=self.name,
-        )
-
-        log.info("agent.step.start", step_type="reasoning")
-
+    async def run_step(self, step_number, context):
+        log = structlog.get_logger().bind(
+            session_id=context["session_id"], step=step_number, agent=self.name)
+        log.info("agent.step.start")
         try:
             action = await self.llm.generate(context["prompt"])
-            log.info(
-                "agent.step.llm_complete",
-                model=action.model,
-                tokens=action.total_tokens,
-                cost_usd=action.cost,
-                action_type=action.type,
-            )
-
+            log.info("agent.step.llm_complete", tokens=action.total_tokens)
             if action.type == "tool_call":
-                log.info(
-                    "agent.step.tool_call",
-                    tool_name=action.tool_name,
-                    parameters=action.parameters,
-                )
                 result = await self.tool_executor.execute(action.tool_name, action.parameters)
-                log.info(
-                    "agent.step.tool_result",
-                    tool_name=action.tool_name,
-                    success=not result.get("error"),
-                    result_size=len(str(result)),
-                )
-
+                log.info("agent.step.tool_result", tool=action.tool_name,
+                         success=not result.get("error"))
         except Exception as e:
-            log.error(
-                "agent.step.error",
-                error_type=type(e).__name__,
-                error_message=str(e),
-                exc_info=True,
-            )
+            log.error("agent.step.error", error_type=type(e).__name__, exc_info=True)
             raise
 ```
 

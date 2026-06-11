@@ -2,12 +2,12 @@
 slug: /
 sidebar_position: 1
 title: "Agentic AI Interview Kit"
-description: "Your complete guide to agentic AI — from foundations to system design"
+description: "Your complete guide to agentic AI — from foundations to architecture design and real-world projects"
 ---
 
 # Agentic AI Interview Kit
 
-**The comprehensive, open-source study guide for mastering agentic AI concepts, design patterns, and system design -- built for engineers preparing for interviews and practitioners building real systems.**
+**The comprehensive, open-source study guide for mastering agentic AI concepts, design patterns, architecture design, and real-world implementations -- built for engineers preparing for interviews and practitioners building production systems.**
 
 ---
 
@@ -33,7 +33,7 @@ The convergence of powerful foundation models, mature tool-use frameworks (LangC
 
 ## What You Will Learn
 
-This guide is organized into seven progressive sections. Each section builds on the previous one.
+This guide is organized into eight progressive sections. Each section builds on the previous one.
 
 ### 1. Foundations
 Prerequisite knowledge that every agentic AI engineer must have. Covers LLM internals, prompting techniques, embeddings, RAG pipelines, fine-tuning tradeoffs, and evaluation metrics. If you are new to LLMs, start here.
@@ -47,13 +47,16 @@ Proven architectural patterns for building agents. Covers single-agent patterns 
 ### 4. Frameworks
 Hands-on walkthroughs of the most popular agentic AI frameworks. Covers LangChain/LangGraph, LlamaIndex, CrewAI, AutoGen/AG2, OpenAI Agents SDK, and Semantic Kernel. Each walkthrough includes architecture diagrams and working code.
 
-### 5. System Design
-End-to-end system design for agentic applications. Covers scalability, reliability, observability, cost management, security, and deployment. Structured as system design interview questions with full solutions.
+### 5. Code Walkthroughs
+Pattern-focused code examples that teach you the building blocks. Covers ReAct agents, RAG with tools, multi-agent crews, LangGraph workflows, tool calling, and evaluation harnesses.
 
-### 6. Implementations
-Complete, production-grade reference implementations. Covers a customer support agent, a research assistant, a code generation pipeline, and a multi-agent workflow. Each implementation includes architecture diagrams, code, and test strategies.
+### 6. Architecture Design
+Interview-ready system design for agentic applications. Each topic follows an interview format: problem statement, clarifying questions, requirements, architecture diagrams, component design rationale, data flow, scaling strategies, cost analysis, and trade-offs. Covers 19 architecture design problems across general-purpose agents, developer tools, platforms, and domain-specific applications.
 
-### 7. Interview Prep
+### 7. Real-World Projects
+Complete, production-grade implementations with runnable code. Four projects covering different frameworks and use cases: a customer support agent (LangGraph), a deep research agent (LangGraph), a code assistant (custom implementation), and a data pipeline agent (LangChain). Each project includes a framework decision rationale explaining why that framework was chosen.
+
+### 8. Interview Prep
 Targeted preparation for agentic AI interviews. Covers common questions organized by difficulty, sample answers, whiteboard exercises, and a study plan.
 
 ---
@@ -67,9 +70,10 @@ graph LR
     A[Foundations] --> B[Core Concepts]
     B --> C[Design Patterns]
     C --> D[Frameworks]
-    D --> E[System Design]
-    E --> F[Implementations]
-    F --> G[Interview Prep]
+    D --> E[Code Walkthroughs]
+    E --> F[Architecture Design]
+    F --> G[Real-World Projects]
+    G --> H[Interview Prep]
 ```
 
 **For each topic, you will find:**
@@ -95,7 +99,7 @@ Choose your starting point based on your experience level.
 | **New to LLMs** | [Foundations: LLM Fundamentals](./foundations/llm-fundamentals) | Full guide (20-25 hours) |
 | **Comfortable with LLMs, new to agents** | [Core Concepts](./core-concepts/what-are-agents) | Sections 2-7 (15-18 hours) |
 | **Built simple agents, want depth** | [Design Patterns](./design-patterns/react-pattern) | Sections 3-7 (10-12 hours) |
-| **Experienced practitioner, interview prep** | [Interview Prep](./interview-questions/foundational-qa) | Section 7 + review (5-8 hours) |
+| **Experienced practitioner, interview prep** | [Interview Prep](./interview-questions/foundational-qa) | Section 8 + review (5-8 hours) |
 
 ### If You Have One Hour
 
@@ -111,7 +115,7 @@ Work through Foundations and Core Concepts end to end. Build the code examples a
 
 ### If You Have One Week
 
-Complete the full guide. Spend extra time on System Design and Implementations, as these sections most closely mirror what you will encounter in senior-level interviews.
+Complete the full guide. Spend extra time on Architecture Design and Real-World Projects, as these sections most closely mirror what you will encounter in senior-level interviews.
 
 ---
 

@@ -19,25 +19,15 @@ An agentic system is not a monolith. The LLM, the tool executor, the memory stor
 ### Example
 
 ```python
-from abc import ABC, abstractmethod
-from typing import Any
-
 class ToolExecutor(ABC):
-    """Interface for executing tools. Implementations can be local, sandboxed, or remote."""
-
-    @abstractmethod
-    async def execute(self, tool_name: str, parameters: dict[str, Any]) -> dict[str, Any]:
-        """Execute a tool and return structured output."""
-        ...
+    async def execute(self, tool_name, parameters) -> dict: ...
 
 class LocalToolExecutor(ToolExecutor):
-    async def execute(self, tool_name: str, parameters: dict[str, Any]) -> dict[str, Any]:
-        func = self._registry[tool_name]
-        return await func(**parameters)
+    async def execute(self, tool_name, parameters):
+        return await self._registry[tool_name](**parameters)
 
 class SandboxedToolExecutor(ToolExecutor):
-    async def execute(self, tool_name: str, parameters: dict[str, Any]) -> dict[str, Any]:
-        # Execute inside a gVisor/Firecracker sandbox
+    async def execute(self, tool_name, parameters):
         return await self._sandbox.run(tool_name, parameters, timeout=30)
 ```
 
@@ -65,24 +55,15 @@ Agentic systems make frequent calls to LLM APIs, external tools, databases, and 
 ### Example
 
 ```python
-import asyncio
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
 class ResilientLLMClient:
-    def __init__(self, primary_client, fallback_client):
-        self.primary = primary_client
-        self.fallback = fallback_client
+    def __init__(self, primary, fallback):
+        self.primary, self.fallback = primary, fallback
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type((TimeoutError, ConnectionError)),
-    )
-    async def generate(self, prompt: str, **kwargs) -> str:
+    @retry(stop=3, wait=exponential_backoff(max=10))
+    async def generate(self, prompt, **kwargs):
         try:
             return await self.primary.generate(prompt, **kwargs)
         except RateLimitError:
-            # Fallback to secondary provider
             return await self.fallback.generate(prompt, **kwargs)
 ```
 
@@ -109,30 +90,18 @@ LLM-based systems are especially vulnerable to duplicate execution because retri
 ### Example
 
 ```python
-import hashlib
-import json
-
 class IdempotentToolExecutor:
-    def __init__(self, executor: ToolExecutor, cache):
-        self._executor = executor
-        self._cache = cache
+    def __init__(self, executor, cache):
+        self._executor, self._cache = executor, cache
 
-    async def execute(self, tool_name: str, parameters: dict, idempotency_key: str = None):
-        # Generate a deterministic key from the call signature
-        key = idempotency_key or self._compute_key(tool_name, parameters)
-
-        cached_result = await self._cache.get(key)
-        if cached_result is not None:
-            return cached_result
-
+    async def execute(self, tool_name, parameters, idempotency_key=None):
+        key = idempotency_key or sha256(canonical_json(tool_name, parameters))
+        cached = await self._cache.get(key)
+        if cached is not None:
+            return cached
         result = await self._executor.execute(tool_name, parameters)
         await self._cache.set(key, result, ttl=3600)
         return result
-
-    @staticmethod
-    def _compute_key(tool_name: str, parameters: dict) -> str:
-        payload = json.dumps({"tool": tool_name, "params": parameters}, sort_keys=True)
-        return hashlib.sha256(payload.encode()).hexdigest()
 ```
 
 ### Where Idempotency Matters Most
@@ -196,44 +165,33 @@ In an agentic system, this means separating:
 ### Anti-Pattern: The God Agent
 
 ```python
-# BAD: Everything in one class
+# BAD: One class handles planning, execution, state, safety, logging, formatting
 class GodAgent:
-    async def handle(self, user_input: str):
-        plan = await self.llm.generate(f"Plan for: {user_input}")  # Planning
+    async def handle(self, user_input):
+        plan = await self.llm.generate(f"Plan for: {user_input}")
         for step in self.parse_plan(plan):
-            result = await self.run_tool(step.tool, step.params)    # Execution
-            self.memory.append(result)                               # State
-            if self.is_harmful(result):                              # Safety
-                return "I cannot help with that."
-            await self.log(step, result)                             # Observability
-        return self.format_response(self.memory)                     # Presentation
+            result = await self.run_tool(step.tool, step.params)
+            self.memory.append(result)
+            if self.is_harmful(result): return "Blocked."
+        return self.format_response(self.memory)
 ```
 
 ### Refactored: Clean Separation
 
 ```python
-# GOOD: Each concern is a separate component
+# GOOD: Each concern is injected as a separate component
 class AgentOrchestrator:
-    def __init__(self, planner, executor, memory, guardrail, formatter):
-        self.planner = planner
-        self.executor = executor
-        self.memory = memory
-        self.guardrail = guardrail
-        self.formatter = formatter
+    def __init__(self, planner, executor, memory, guardrail, formatter): ...
 
-    async def handle(self, user_input: str):
+    async def handle(self, user_input):
         if not await self.guardrail.check_input(user_input):
             return self.formatter.blocked_response()
-
         plan = await self.planner.create_plan(user_input, self.memory.context())
-
         for step in plan.steps:
             result = await self.executor.execute(step)
             await self.memory.record(step, result)
-
             if not await self.guardrail.check_output(result):
                 return self.formatter.blocked_response()
-
         return self.formatter.format(self.memory.context())
 ```
 
@@ -271,25 +229,14 @@ graph LR
 
 ```python
 class StatelessAgentWorker:
-    """Worker that can process any step from any session."""
+    def __init__(self, llm, tool_executor, state_store): ...
 
-    def __init__(self, llm, tool_executor, state_store):
-        self.llm = llm
-        self.tool_executor = tool_executor
-        self.state_store = state_store
-
-    async def process_step(self, session_id: str, step_id: str):
-        # Load state from external store
-        state = await self.state_store.load(session_id)
-
-        # Execute the step
+    async def process_step(self, session_id, step_id):
+        state = await self.state_store.load(session_id)       # load from external store
         step = state.pending_steps[step_id]
         result = await self.tool_executor.execute(step.tool, step.params)
-
-        # Persist updated state
         state.record_result(step_id, result)
-        await self.state_store.save(session_id, state)
-
+        await self.state_store.save(session_id, state)        # persist back
         return result
 ```
 
@@ -333,20 +280,15 @@ graph TD
 
 ```python
 class DegradingAgent:
-    async def generate_response(self, query: str, context: dict) -> str:
-        # Level 1: Full capability
+    async def generate_response(self, query, context):
         try:
-            return await self._full_agent_response(query, context)
+            return await self._full_agent_response(query, context)   # Level 1: full LLM
         except LLMUnavailableError:
             pass
-
-        # Level 2: Cached similar responses
-        cached = await self._find_similar_cached_response(query)
+        cached = await self._find_similar_cached_response(query)     # Level 2: cache
         if cached:
-            return f"{cached}\n\n(Note: This is a cached response. Live agent is temporarily unavailable.)"
-
-        # Level 3: Rule-based fallback
-        return self._rule_based_response(query)
+            return cached + "\n(Cached response -- live agent unavailable.)"
+        return self._rule_based_response(query)                      # Level 3: rules
 ```
 
 :::warning

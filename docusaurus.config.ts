@@ -4,7 +4,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'Agentic AI Interview Kit',
-  tagline: 'From foundations to system design — your complete guide to agentic AI',
+  tagline: 'From foundations to architecture design — your complete guide to agentic AI',
   favicon: 'img/favicon.ico',
 
   future: {
@@ -81,9 +81,15 @@ const config: Config = {
         },
         {
           type: 'docSidebar',
-          sidebarId: 'systemDesign',
+          sidebarId: 'architectureDesign',
           position: 'left',
-          label: 'System Design',
+          label: 'Architecture Design',
+        },
+        {
+          type: 'docSidebar',
+          sidebarId: 'projects',
+          position: 'left',
+          label: 'Real-World Projects',
         },
         {
           type: 'docSidebar',
@@ -113,8 +119,8 @@ const config: Config = {
           title: 'Build',
           items: [
             {label: 'Frameworks', to: '/frameworks/langchain-overview'},
-            {label: 'System Design', to: '/system-design/design-principles'},
-            {label: 'Implementations', to: '/implementations/basic-react-agent'},
+            {label: 'Architecture Design', to: '/architecture-design/design-principles'},
+            {label: 'Real-World Projects', to: '/projects/customer-support-agent'},
           ],
         },
         {

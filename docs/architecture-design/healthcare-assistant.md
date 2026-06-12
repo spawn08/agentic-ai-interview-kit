@@ -101,7 +101,7 @@ graph TB
     subgraph "Compliance & Audit"
         AuditLog[Audit Logger<br/>Immutable, 7-Year Retention]
         AccessCtrl[Access Control<br/>RBAC + Context-Based]
-        Encrypt[Encryption<br/>At Rest (AES-256) + In Transit (TLS 1.3)]
+        Encrypt["Encryption<br/>At Rest AES-256 + In Transit TLS 1.3"]
         ConsentMgr[Consent Manager<br/>Patient Data Access Tracking]
     end
 

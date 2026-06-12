@@ -6,7 +6,7 @@ description: "Core engineering principles for building production-grade agentic 
 
 # Design Principles
 
-Building agentic AI systems that survive contact with production traffic requires the same rigour as any distributed system -- plus additional discipline around non-deterministic LLM behaviour. This page covers the seven foundational principles every agentic system architect must internalise.
+Traditional distributed systems are deterministic: the same input produces the same output, failures are classifiable, and retry logic is straightforward. Agentic AI systems break all three assumptions. An LLM might return a different tool-call sequence on every invocation, a single "retry" can double your API bill, and a failure in step 5 of an 8-step reasoning chain may require replaying the entire chain rather than just retrying the failed call. The seven principles below are the engineering constraints that keep this inherent non-determinism from becoming production chaos.
 
 ---
 
@@ -329,6 +329,191 @@ graph TD
     style GD fill:#264653,stroke:#2a9d8f,color:#e9c46a
     style O fill:#264653,stroke:#2a9d8f,color:#e9c46a
 ```
+
+---
+
+## Critical Algorithm: Cost-Aware Adaptive Model Router
+
+The single most expensive mistake in agentic AI is routing every LLM call to the same frontier model. In a multi-step agent loop where each session triggers 5-15 LLM calls, sending every call to GPT-4o at ~$10/1M output tokens creates runaway costs. Most of those calls -- classification, parameter extraction, simple reformulation -- do not need frontier-level reasoning. An adaptive router that dispatches each step to the cheapest model meeting quality constraints can cut LLM spend by 60-80% without measurable quality loss on aggregate task completion.
+
+The naive approach breaks at roughly $5K/month in LLM spend. Below that threshold, the engineering cost of maintaining a router exceeds the savings. Above it, the router pays for itself within weeks.
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+import hashlib, json, logging
+
+logger = logging.getLogger(__name__)
+
+
+class Complexity(Enum):
+    SIMPLE = "simple"        # FAQ, classification, entity extraction
+    MODERATE = "moderate"    # multi-step reasoning, tool selection
+    COMPLEX = "complex"      # code generation, nuanced analysis
+    CRITICAL = "critical"    # financial decisions, safety-critical outputs
+
+
+@dataclass
+class ModelConfig:
+    name: str
+    cost_per_1k_input: float      # USD per 1K input tokens
+    cost_per_1k_output: float     # USD per 1K output tokens
+    quality_score: float          # 0.0 - 1.0, calibrated on eval set
+    max_tokens: int
+    latency_p50_ms: int
+
+
+@dataclass
+class AgentTask:
+    instruction: str
+    estimated_output_tokens: int
+    step_index: int
+
+
+class BudgetExhaustedError(Exception):
+    def __init__(self, remaining: float, tokens_needed: int):
+        super().__init__(
+            f"Budget exhausted: ${remaining:.4f} remaining, "
+            f"need ~{tokens_needed} output tokens"
+        )
+
+
+class ComplexityClassifier(ABC):
+    @abstractmethod
+    async def classify(self, instruction: str) -> Complexity: ...
+
+
+class AdaptiveModelRouter:
+    """Routes each agent step to the cost-optimal model that meets quality constraints.
+
+    This is the most impactful cost optimization in agentic systems. A naive system
+    sends every request to GPT-4o at $10/1M output tokens. An adaptive router sends
+    60% of traffic to GPT-4o-mini at $0.60/1M output tokens -- a 10x savings on the
+    majority of requests.
+    """
+
+    def __init__(self, models: list[ModelConfig], classifier: ComplexityClassifier):
+        # Models sorted by cost ascending so the cheapest qualified model is always first
+        self.models = sorted(models, key=lambda m: m.cost_per_1k_output)
+        self.classifier = classifier
+
+    async def route(self, task: AgentTask, budget: "TokenBudget") -> ModelConfig:
+        complexity = await self.classifier.classify(task.instruction)
+
+        # Hard constraint: remaining budget must cover worst-case token usage
+        affordable = [
+            m for m in self.models
+            if m.cost_per_1k_output * (task.estimated_output_tokens / 1000)
+               <= budget.remaining_usd
+        ]
+        if not affordable:
+            raise BudgetExhaustedError(
+                budget.remaining_usd, task.estimated_output_tokens
+            )
+
+        # Quality constraint: model must meet minimum quality for this complexity tier
+        quality_floor = {
+            Complexity.SIMPLE: 0.5,      # FAQ, classification -- any model works
+            Complexity.MODERATE: 0.7,    # multi-step reasoning, tool selection
+            Complexity.COMPLEX: 0.85,    # code generation, nuanced analysis
+            Complexity.CRITICAL: 0.95,   # financial decisions, safety-critical
+        }
+
+        qualified = [
+            m for m in affordable
+            if m.quality_score >= quality_floor[complexity]
+        ]
+
+        if not qualified:
+            # No model meets both budget AND quality -- take the best affordable
+            # model and flag for human review
+            best = max(affordable, key=lambda m: m.quality_score)
+            logger.warning(
+                "quality_compromise",
+                extra={
+                    "required": quality_floor[complexity],
+                    "actual": best.quality_score,
+                    "model": best.name,
+                },
+            )
+            return best
+
+        # Among qualified models, pick cheapest (list is pre-sorted by cost)
+        return qualified[0]
+
+
+class TokenBudget:
+    """Tracks spend across an entire agent session with per-step allocation.
+
+    Prevents a single expensive step from consuming the budget that later steps need.
+    The per_step_budget property distributes remaining funds evenly across remaining
+    steps, creating back-pressure on the router to choose cheaper models as the
+    session progresses.
+    """
+
+    def __init__(self, total_usd: float, max_steps: int):
+        self.total_usd = total_usd
+        self.spent_usd = 0.0
+        self.max_steps = max_steps
+        self.step_count = 0
+
+    @property
+    def remaining_usd(self) -> float:
+        return self.total_usd - self.spent_usd
+
+    @property
+    def per_step_budget(self) -> float:
+        remaining_steps = max(1, self.max_steps - self.step_count)
+        return self.remaining_usd / remaining_steps
+
+    def record(self, model: str, input_tokens: int, output_tokens: int, cost: float):
+        self.spent_usd += cost
+        self.step_count += 1
+        if self.spent_usd > self.total_usd * 0.8:
+            logger.warning(
+                "budget_80pct",
+                extra={"spent": self.spent_usd, "total": self.total_usd},
+            )
+```
+
+The router's `quality_floor` mapping is the key design decision. Set thresholds too high and you waste budget on over-qualified models for simple tasks. Set them too low and complex reasoning tasks produce unreliable outputs. Calibrate by running an evaluation set against each model tier and measuring task completion accuracy. In practice, start with a conservative mapping (route everything to the frontier model), collect a labeled dataset of task-complexity pairs from production traces, then progressively lower thresholds as you gain confidence in each model tier's accuracy on your specific workloads.
+
+---
+
+## When Principles Collide: Design Decision Framework
+
+The seven principles above are individually sound, but production systems force you to choose between them. Every senior design interview eventually reaches the question: "what would you trade off and why?" This section addresses the five most common conflicts in agentic AI architecture.
+
+### Modularity vs Latency
+
+Every service boundary adds a network hop. An agent that calls an LLM service, then a tool-execution service, then a second LLM service pays three round-trips -- typically 50-150ms of pure network overhead on top of the actual compute time. A monolithic agent loop with in-process tool execution pays zero network overhead for the same three steps. The modular architecture wins when you need independent scaling (the tool executor is CPU-bound while the LLM gateway is I/O-bound) or when teams ship on different deployment cadences. For systems below roughly 1,000 QPS, a modular monolith -- separate modules within a single deployable unit -- usually delivers better p99 latency than a microservice decomposition. The concrete recommendation: start monolithic, measure per-component scaling pressure, and extract services only when a specific module hits a resource ceiling that the rest of the system does not share.
+
+### Observability vs Cost
+
+Logging every prompt-completion pair costs real money in storage and egress. At 10K agent sessions per day with an average of 4K tokens per LLM call and 8 calls per session, you generate roughly 320M tokens per day of raw trace data. Stored as structured JSON, that is 1-2 GB/day before indexing. Full capture is essential during development and the first weeks of production, but unsustainable at scale. Head-based sampling (log 10% of all sessions randomly) is cheap but misses rare failures. Tail-based sampling (capture the full trace only when the session errors or exceeds a latency threshold) catches the interesting cases but requires buffering traces in memory until the outcome is known. The practical approach: use tail-based sampling in production with a 5-10% random head sample as a baseline, and always capture the full trace for any session flagged by guardrails or user feedback.
+
+### Fault Tolerance vs User Experience
+
+A three-tier fallback chain (GPT-4o, then Claude Sonnet, then GPT-4o-mini, then a template) maximizes availability but introduces response quality inconsistency. A user who asks a nuanced question might get a frontier-quality answer on their first try and a generic template on the retry -- even within the same conversation. This inconsistency erodes trust faster than a clean error message. The design choice depends on the domain: for customer support agents where any answer is better than no answer, cascade aggressively. For financial advisory or medical triage agents where a wrong answer is worse than no answer, fail fast after the first fallback tier and route to a human. In all cases, communicate the degradation to the user so they can calibrate their trust in the response.
+
+### Idempotency vs Freshness
+
+Caching tool results for idempotency guarantees means serving potentially stale data. An order-status lookup cached with a 60-second TTL is stale if the customer's package was delivered 10 seconds after the cache write. The tension is real: without caching, a retry storm during an LLM rate-limit event can hammer your downstream services; with caching, you trade correctness for resilience. The resolution is to classify tools by staleness tolerance. Read-only reference data (product catalogs, FAQ lookups) tolerates TTLs of minutes to hours. Transactional state queries (order status, account balance) should use short TTLs of 5-10 seconds or bypass the idempotency cache entirely and instead deduplicate only write operations. Never apply a single TTL policy across all tools -- it will be wrong for at least half of them.
+
+### Statelessness vs Context Quality
+
+Loading full conversation state from Redis on every agent step adds 2-5ms per load. In a 10-step agent loop, that is 20-50ms of cumulative state-loading overhead -- usually negligible compared to LLM latency of 500-2000ms per call. But the overhead becomes significant when state payloads grow large: a conversation with 50 turns and embedded tool results can reach 100KB+, and deserializing that on every step adds real cost. The alternative -- keeping state in-process on a pinned worker -- eliminates serialization overhead but prevents failover to another worker if the process crashes mid-session. The break-even point is session duration: for short sessions (under 5 steps, under 30 seconds), in-process state with at-most-once delivery is simpler and faster. For long-running sessions (10+ steps, minutes to hours), externalized state with checkpointing is the only safe option because the probability of a mid-session worker failure becomes non-trivial.
+
+### Decision Table
+
+| Conflict | Default Choice | Switch When | Key Metric to Watch |
+|----------|---------------|-------------|-------------------|
+| Modularity vs Latency | Modular monolith | Single module needs independent scaling or separate deploy cadence | p99 latency per agent step, QPS per module |
+| Observability vs Cost | Tail-based sampling + 5% head sample | Debugging a specific failure class requires full capture temporarily | Storage cost/month, mean-time-to-diagnosis |
+| Fault Tolerance vs UX | Fail fast after 1 fallback | Domain tolerates inconsistent quality (e.g., support chatbot) | Fallback trigger rate, user satisfaction delta between tiers |
+| Idempotency vs Freshness | Cache writes only, short TTL for reads | Read-heavy reference data with low change rate | Cache hit rate, stale-response incident count |
+| Statelessness vs Context | Externalized state (Redis) | Sessions are short-lived and worker failure is rare | State-load p99 latency, session failure rate |
 
 ---
 

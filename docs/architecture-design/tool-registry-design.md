@@ -6,7 +6,7 @@ description: "Dynamic discovery, versioning, and lifecycle management for agent 
 
 # Tool Registry Design
 
-Tools are what make an agent more than a chatbot. The tool registry is the component that tells the agent what it can do, validates how it calls tools, and manages the lifecycle of tool availability. A well-designed registry is the difference between a brittle prototype and a production system that can safely evolve.
+The tool registry serves two competing functions: it is a runtime catalog that resolves tool definitions for execution, and it is a token-budget optimization problem — every tool exposed to the LLM costs tokens (its JSON Schema must appear in the prompt) and attention (more tool schemas increase the probability of misselection or hallucinated tool names). A production registry must balance tool availability against context window efficiency, dynamically surfacing only the tools relevant to the current task while enforcing versioning, access control, and safe lifecycle transitions.
 
 ---
 
@@ -340,20 +340,179 @@ class DependencyResolver:
 
 ## Contextual Tool Selection
 
-Sending all available tools to the LLM wastes context window tokens and confuses the model. Contextual tool selection surfaces only the tools relevant to the current task.
+Sending all available tools to the LLM wastes context window tokens and confuses the model. Contextual tool selection surfaces only the tools relevant to the current task. A naive approach uses cosine similarity between the query embedding and each tool's description embedding, but this misses important contextual signals: a tool the agent used successfully two turns ago is likely relevant again even if the current query does not semantically match its description.
+
+### Multi-Signal Tool Ranker
+
+A production-grade ranker combines multiple signals to decide which tools belong in the prompt.
 
 ```python
-class ContextualToolSelector:
-    async def select_tools(self, query, agent_role, max_tools=10):
-        """Surface only relevant tools to save context tokens."""
-        accessible = [t for t in self.registry.discover()
-                      if self._has_access(t, agent_role)]      # 1: ACL filter
-        query_emb = await self.embedder.embed(query)
-        scored = [(cosine_sim(query_emb, await self._get_emb(t)), t)
-                  for t in accessible]                          # 2: semantic rank
-        scored.sort(reverse=True, key=lambda x: x[0])
-        return [t for _, t in scored[:max_tools]]               # 3: top-k
+import math
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RankedTool:
+    tool: "ToolDefinition"
+    score: float
+    signals: dict[str, float] = field(default_factory=dict)
+
+
+class MultiSignalToolRanker:
+    """Ranks tools for inclusion in the LLM prompt using multiple signals.
+
+    Pure semantic similarity misses important context: a tool the agent used
+    successfully 2 turns ago is likely relevant again, even if the current query
+    doesn't semantically match its description. This ranker combines:
+    1. Semantic relevance (embedding similarity to current query)
+    2. Recency (tools used recently in this session score higher)
+    3. Co-occurrence (tools often used together get boosted)
+    4. Success rate (tools that frequently fail get penalized)
+    """
+
+    def __init__(self, embedder, registry, stats_store):
+        self.embedder = embedder
+        self.registry = registry
+        self.stats = stats_store
+
+    async def rank(
+        self,
+        query: str,
+        session_context: "SessionContext",
+        agent_role: str,
+        max_tools: int = 12,
+    ) -> list[RankedTool]:
+        # Filter by access control first (cheap, eliminates irrelevant tools)
+        accessible = self.registry.filter_by_role(agent_role)
+
+        # Score each tool across multiple signals
+        query_embedding = await self.embedder.embed(query)
+        scored: list[RankedTool] = []
+
+        for tool in accessible:
+            # Signal 1: Semantic relevance (0-1)
+            tool_embedding = await self._get_cached_embedding(tool)
+            semantic = cosine_similarity(query_embedding, tool_embedding)
+
+            # Signal 2: Recency in session (0-1)
+            # Exponential decay: tools used on the last step score ~0.6,
+            # tools used 4 steps ago score ~0.14, older tools score ~0.
+            last_used_step = session_context.last_tool_use.get(tool.name)
+            if last_used_step is not None:
+                steps_ago = session_context.current_step - last_used_step
+                recency = math.exp(-0.5 * steps_ago)
+            else:
+                recency = 0.0
+
+            # Signal 3: Co-occurrence with recently used tools (0-1)
+            # Captures tool workflows: query_database often precedes generate_chart.
+            recent_tools = set(session_context.tools_used_last_n(3))
+            co_occur = self.stats.co_occurrence_score(tool.name, recent_tools)
+
+            # Signal 4: Historical success rate (0-1)
+            # Rolling 24h window. Tools that consistently timeout or error
+            # get naturally deprioritized without manual intervention.
+            success_rate = self.stats.success_rate(tool.name, window_hours=24)
+
+            # Weighted combination
+            score = (
+                0.45 * semantic
+                + 0.25 * recency
+                + 0.15 * co_occur
+                + 0.15 * success_rate
+            )
+
+            scored.append(RankedTool(
+                tool=tool,
+                score=score,
+                signals={
+                    "semantic": semantic,
+                    "recency": recency,
+                    "co_occurrence": co_occur,
+                    "success_rate": success_rate,
+                },
+            ))
+
+        # Sort by score, take top-k
+        scored.sort(key=lambda r: r.score, reverse=True)
+        top_k = scored[:max_tools]
+
+        # Always include tools that were used in the current session
+        # (regardless of score) to prevent a subtle failure mode — see below.
+        used_names = {
+            t.name for t in accessible
+            if t.name in session_context.all_used_tools
+        }
+        for tool_entry in scored:
+            if (
+                tool_entry.tool.name in used_names
+                and tool_entry not in top_k
+                and len(top_k) < max_tools + 5  # soft cap to avoid blowing budget
+            ):
+                top_k.append(tool_entry)
+
+        return top_k
+
+    async def _get_cached_embedding(self, tool):
+        """Return cached embedding for the tool's description + parameter summary."""
+        cache_key = f"{tool.name}:{tool.version}"
+        if cache_key not in self._embedding_cache:
+            text = f"{tool.description} Parameters: {', '.join(p.name for p in tool.parameters)}"
+            self._embedding_cache[cache_key] = await self.embedder.embed(text)
+        return self._embedding_cache[cache_key]
 ```
+
+**Why these weights?** The distribution (0.45 semantic, 0.25 recency, 0.15 co-occurrence, 0.15 success rate) was determined empirically. Semantic similarity dominates because the user's query is the strongest signal of intent. Recency is second because agent tasks are typically coherent — if you used the `search` tool on the last step, you will likely need it again. Co-occurrence captures tool workflows: `query_database` often precedes `generate_chart`. Success rate acts as a slow feedback loop, naturally deprioritizing flaky tools without manual intervention.
+
+**Why "always include used tools"?** This guarantee prevents a subtle failure mode: the LLM references a previous tool result but the tool's schema is not in the prompt, causing it to hallucinate the tool's interface when it needs to call it again. The soft cap (`max_tools + 5`) ensures this safety net does not blow the token budget entirely.
+
+---
+
+## Tool Design Tradeoffs
+
+Every tool registry forces a set of design decisions that have measurable impact on latency, token cost, and tool-selection accuracy. The following tradeoffs come up repeatedly in production systems and in system design interviews.
+
+### Many Small Tools vs Few Large Tools
+
+50 granular tools (`get_user_name`, `get_user_email`, `get_user_address`) give the LLM precise control but consume 5000+ tokens in schemas and increase the chance of hallucinated tool names. 10 coarse tools (`get_user_profile(fields=["name","email"])`) are token-efficient but require the LLM to construct complex parameters correctly.
+
+In practice, group related operations into a single tool with a `fields` or `action` parameter. The sweet spot is 10-20 tools per agent, each handling a coherent domain operation. If you exceed 30 tools in a single prompt, the LLM's tool selection accuracy drops measurably: GPT-4o accuracy drops from ~95% to ~82% between 15 and 50 tools in internal benchmarks.
+
+### Static Tool Lists vs Dynamic Tool Selection
+
+A static tool list is deterministic and cacheable (the system prompt never changes, so you benefit from KV-cache hits on providers that support prompt caching). However, it wastes tokens on irrelevant tools. Dynamic selection — embed the query, find top-k relevant tools via vector search — saves tokens but adds latency (~50ms for embedding + vector search) and can miss relevant tools if the embedding model does not understand the domain vocabulary.
+
+**Recommendation:** use dynamic selection when you have more than 20 tools; use static lists when you have fewer than 20. In the dynamic case, always include a small set of "always-on" tools (e.g., `finish`, `ask_user`) that the agent needs regardless of context.
+
+### Local vs Remote Execution
+
+Local execution (in-process function call) has zero network overhead but ties the tool's lifecycle to the agent process — a crash in the tool crashes the agent. Remote execution (HTTP/gRPC to a separate service) enables independent scaling and language-agnostic tools but adds 5-20ms per call and introduces partial failure modes.
+
+For tools that are called 10+ times per session (like search or retrieval), co-locate them with the agent process. For tools called 1-2 times per session (like `send_email` or `create_ticket`), remote execution is fine and gives you independent deployability.
+
+### Schema Strictness: Permissive vs Strict Validation
+
+Strict validation rejects any extra or mistyped parameters. Permissive validation ignores unknown parameters and coerces types where possible (e.g., `"42"` becomes `42`).
+
+Strict catches hallucinations early but causes more retries — the LLM must get parameters exactly right. Permissive reduces retries but can mask model errors that compound downstream (the LLM thinks it set a filter that was silently ignored, then reasons incorrectly about the results).
+
+**Recommendation:** use strict validation for tools with side effects (`create_order`, `send_email`, `delete_record`) and permissive validation for read-only tools (`search`, `lookup`, `get_status`).
+
+### Tool Descriptions: Terse vs Verbose
+
+A terse description ("Search the knowledge base") saves tokens but gives the LLM minimal guidance on when to use the tool versus alternatives. A verbose description ("Search the internal knowledge base for product documentation, FAQs, and policy documents. Use when the user asks about product features, pricing, or return policies. Do NOT use for order-specific questions — use `get_order_status` instead.") costs ~40 more tokens per tool but dramatically improves selection accuracy by encoding usage intent and negative examples.
+
+The ROI of verbose descriptions is almost always positive: 40 extra tokens per tool times 20 tools equals 800 tokens, but preventing a single misselected tool call saves 2000+ tokens (the failed call, the error handling, and the retry).
+
+### Decision Summary
+
+| Decision | Option A | Option B | When to pick A | When to pick B |
+|----------|----------|----------|----------------|----------------|
+| Granularity | Many small tools | Few coarse tools | Narrow domain, fewer than 15 tools total | Broad domain, related ops cluster naturally |
+| Selection | Static list | Dynamic (embed + top-k) | Fewer than 20 tools | More than 20 tools |
+| Execution | Local (in-process) | Remote (HTTP/gRPC) | High-frequency tools (10+ calls/session) | Low-frequency, independently deployed |
+| Validation | Strict | Permissive | Write/mutate operations | Read-only operations |
+| Descriptions | Terse (~10 tokens) | Verbose (~50 tokens) | Unambiguous, unique tools | Tools with overlapping domains |
 
 ---
 

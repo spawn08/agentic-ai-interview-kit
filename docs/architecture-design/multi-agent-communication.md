@@ -6,7 +6,7 @@ description: "Message passing, event-driven architectures, and protocol design f
 
 # Multi-Agent Communication
 
-When a system has more than one agent, the agents need to talk to each other. The communication pattern you choose -- direct messaging, shared blackboard, event bus, or RPC -- shapes everything from latency to fault tolerance to debuggability. This page covers the core patterns, their trade-offs, and how to choose between them.
+Multi-agent communication is fundamentally different from microservice communication: agents produce non-deterministic outputs, conversations carry branching state that must be tracked across turns, and the cost of a single "message" (an LLM call at 2-5 seconds and thousands of tokens) is roughly 1000x more expensive than an HTTP request between services. These constraints make protocol design decisions -- direct messaging vs. shared blackboard vs. event bus vs. RPC -- far more consequential, because a poor choice compounds latency, cost, and debugging difficulty multiplicatively rather than additively.
 
 ---
 
@@ -358,6 +358,236 @@ graph TD
     Q4 -->|Yes| ORCH[Use Orchestrator + Events]
     Q4 -->|No| PUBSUB[Use Pub/Sub Event Bus]
 ```
+
+---
+
+## Multi-Agent Consensus Algorithm
+
+When multiple agents process the same query in a fan-out pattern, you get multiple answers with varying confidence levels. Naive majority voting ignores confidence, and picking the single highest-confidence response ignores consensus signal. The following algorithm combines confidence calibration with agreement-weighted voting to produce a single result with a composite confidence score.
+
+```python
+from dataclasses import dataclass, field
+from sklearn.isotonic import IsotonicRegression
+from numpy import dot
+from numpy.linalg import norm
+
+
+@dataclass
+class AgentResponse:
+    agent_id: str
+    content: str
+    confidence: float
+    embedding: list[float]
+    calibrated_confidence: float = 0.0
+
+
+@dataclass
+class ConsensusResult:
+    answer: str
+    confidence: float
+    strategy: str
+    agreement_ratio: float = 0.0
+    dissent: list[dict] = field(default_factory=list)
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    return float(dot(a, b) / (norm(a) * norm(b)))
+
+
+class ConfidenceCalibrator:
+    """Maps raw LLM confidence to empirical accuracy using isotonic regression.
+
+    Raw LLM confidence is unreliable. A model saying "I'm 90% confident" might
+    be correct only 70% of the time. Calibration learns this mapping from
+    historical (confidence, was_correct) pairs.
+    """
+
+    def __init__(self, calibration_data: dict[str, list[tuple[float, bool]]]):
+        self.models: dict[str, IsotonicRegression] = {}
+        for agent_id, data in calibration_data.items():
+            raw_scores = [d[0] for d in data]
+            correct = [1.0 if d[1] else 0.0 for d in data]
+            # Isotonic regression: monotone increasing mapping from raw -> calibrated
+            self.models[agent_id] = IsotonicRegression(
+                out_of_bounds="clip"
+            ).fit(raw_scores, correct)
+
+    def calibrate(self, raw_confidence: float, agent_id: str) -> float:
+        if agent_id in self.models:
+            return float(self.models[agent_id].predict([[raw_confidence]])[0])
+        return raw_confidence * 0.7  # default: assume 30% overconfidence
+
+
+class MultiAgentConsensus:
+    """Aggregates outputs from multiple agents using confidence-weighted voting.
+
+    When you fan out a task to 3 research agents, you get 3 different answers
+    with 3 different confidence scores. Naive majority voting ignores confidence.
+    This algorithm weights each agent's vote by calibrated confidence and agreement
+    with other agents, producing a single result with a composite confidence score.
+
+    Why calibrated confidence matters: LLMs are notoriously overconfident. An agent
+    reporting 0.95 confidence is often wrong 20% of the time. Calibration maps
+    raw confidence to empirical accuracy using historical data.
+    """
+
+    def __init__(self, calibrator: ConfidenceCalibrator):
+        self.calibrator = calibrator
+
+    async def aggregate(
+        self,
+        responses: list[AgentResponse],
+        strategy: str = "weighted_vote",
+    ) -> ConsensusResult:
+        if not responses:
+            raise ValueError("No responses to aggregate")
+        if len(responses) == 1:
+            return ConsensusResult(
+                answer=responses[0].content,
+                confidence=self.calibrator.calibrate(
+                    responses[0].confidence, responses[0].agent_id
+                ),
+                strategy="single_agent",
+                dissent=[],
+            )
+
+        # Step 1: Calibrate raw confidence scores
+        for r in responses:
+            r.calibrated_confidence = self.calibrator.calibrate(
+                r.confidence, r.agent_id
+            )
+
+        if strategy == "weighted_vote":
+            return self._weighted_vote(responses)
+        elif strategy == "best_of_n":
+            return self._best_of_n(responses)
+        elif strategy == "merge":
+            return await self._merge(responses)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+    def _weighted_vote(self, responses: list[AgentResponse]) -> ConsensusResult:
+        """Weighted voting: each agent's vote is weighted by calibrated confidence
+        multiplied by agreement with other agents.
+
+        Agreement bonus: if 3 of 4 agents agree, those 3 get an agreement boost.
+        This prevents a single high-confidence outlier from dominating.
+        """
+        # Cluster responses by semantic similarity
+        clusters = self._cluster_responses(responses)
+
+        best_cluster = None
+        best_score = -1.0
+
+        for cluster in clusters:
+            # Cluster score = sum of (calibrated_confidence * agreement_bonus)
+            agreement_bonus = len(cluster) / len(responses)
+            cluster_score = sum(
+                r.calibrated_confidence * (1 + agreement_bonus) for r in cluster
+            )
+            if cluster_score > best_score:
+                best_score = cluster_score
+                best_cluster = cluster
+
+        # Within winning cluster, pick the response with highest calibrated confidence
+        winner = max(best_cluster, key=lambda r: r.calibrated_confidence)
+        dissenting = [r for r in responses if r not in best_cluster]
+
+        composite_confidence = min(1.0, best_score / (len(responses) * 2))
+
+        return ConsensusResult(
+            answer=winner.content,
+            confidence=composite_confidence,
+            strategy="weighted_vote",
+            agreement_ratio=len(best_cluster) / len(responses),
+            dissent=[
+                {
+                    "agent": r.agent_id,
+                    "answer_summary": r.content[:100],
+                    "confidence": r.calibrated_confidence,
+                }
+                for r in dissenting
+            ],
+        )
+
+    def _cluster_responses(
+        self, responses: list[AgentResponse], threshold: float = 0.85
+    ) -> list[list[AgentResponse]]:
+        """Group responses by semantic similarity. Two responses are in the same
+        cluster if their cosine similarity exceeds the threshold."""
+        clusters: list[list[AgentResponse]] = []
+        for r in responses:
+            placed = False
+            for cluster in clusters:
+                if cosine_similarity(r.embedding, cluster[0].embedding) >= threshold:
+                    cluster.append(r)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([r])
+        return clusters
+
+    def _best_of_n(self, responses: list[AgentResponse]) -> ConsensusResult:
+        """Simply pick the highest-confidence response. Fast but ignores consensus."""
+        best = max(responses, key=lambda r: r.calibrated_confidence)
+        return ConsensusResult(
+            answer=best.content,
+            confidence=best.calibrated_confidence,
+            strategy="best_of_n",
+            agreement_ratio=0.0,
+            dissent=[],
+        )
+```
+
+The calibrator's default fallback (`raw * 0.7`) assumes 30% overconfidence, which is a conservative estimate based on published LLM calibration studies. In practice, calibrate per-agent and per-task-type: a code generation agent may be well-calibrated on syntax correctness but wildly overconfident on logical correctness.
+
+The clustering threshold of 0.85 controls what counts as "agreement." Too low (0.7) and semantically different answers get clustered together, inflating agreement. Too high (0.95) and minor phrasing differences split genuine agreement into separate clusters. Tune on your evaluation set.
+
+---
+
+## Communication Pattern Tradeoffs in Practice
+
+The patterns described above are not interchangeable. Each encodes a specific set of assumptions about failure modes, latency budgets, and operational cost. The following analysis covers the five most consequential tradeoff decisions in multi-agent system design.
+
+### Orchestrator vs Choreography: The Debuggability Tax
+
+Choreography (agents reacting to events independently) is elegant and decoupled, but debugging a failure requires reconstructing the event chain across multiple agents' logs. In a system with 5 agents processing an event cascade, a failure on agent 4 requires tracing back through 3 preceding event handlers to find the root cause -- and each handler may have transformed the payload, making it difficult to correlate upstream and downstream events. Orchestration makes the flow explicit and traceable: one coordinator knows the full execution history, every step is logged in sequence, and replaying a failed workflow is straightforward.
+
+The tradeoff: orchestrators are single points of failure and throughput bottlenecks. If the orchestrator goes down, all workflows halt. If it processes tasks sequentially, it becomes the latency ceiling. **Recommendation:** use orchestration for the primary workflow (debuggability > decoupling) and choreography for side effects (logging, analytics, notifications) where occasional missed events are tolerable.
+
+### Synchronous vs Asynchronous Agent Calls
+
+Synchronous (request-response) is simple and gives the caller immediate feedback, but it chains latencies: if Agent A calls Agent B which calls Agent C, total latency = A + B + C. With LLM calls averaging 2-5 seconds each, a 3-agent chain takes 6-15 seconds -- well beyond acceptable user-facing response times. Asynchronous (fire-and-forget with callbacks) breaks the latency chain but introduces complexity: you need correlation IDs to match callbacks to requests, timeout handlers for agents that never respond, and partial-result assembly when some agents complete and others do not.
+
+The decision depends on whether the caller needs the result to proceed. If yes, use synchronous with an aggressive timeout and a fallback (return a partial answer or a cached result). If no, use asynchronous and let results arrive when they are ready.
+
+### Shared State vs Message Passing: The Consistency Problem
+
+The blackboard pattern (shared state) is natural when agents build on each other's work, but concurrent writes create conflicts: Agent A writes research findings while Agent B simultaneously writes a contradictory finding to the same key. Without conflict resolution (last-write-wins, CRDTs, or optimistic locking with version checks), data corruption is inevitable. With message passing, each agent owns its state and conflicts are impossible -- but aggregating results requires an explicit merge step, and the merge logic itself can be complex.
+
+**Use shared state** when agents contribute to a single artifact (document, plan, analysis) and the write pattern is append-only or partitioned by key. **Use message passing** when agents perform independent work that gets merged at the end, or when agents are distributed across network boundaries where shared-state latency is unacceptable.
+
+### Fan-Out Parallelism: Latency vs Token Cost
+
+Running 5 research agents in parallel reduces wall-clock time from 5xT to T, but costs 5x the tokens. If each parallel agent uses 4K tokens at $2.50/1M (GPT-4o input), a 5-way fan-out costs ~$0.05 per invocation vs ~$0.01 sequential. At 10K daily requests, that is $400/day extra -- $146K/year in additional token spend for the latency improvement. The question is whether latency or cost is the binding constraint.
+
+For user-facing requests where latency directly impacts UX and conversion, parallelize aggressively. For background tasks (batch processing, offline analysis, pre-computation), serialize and save the token budget. For mixed workloads, use adaptive fan-out: start with 2 parallel agents and only fan out further if the first results are low-confidence (using the consensus algorithm above to decide).
+
+### Result Aggregation: Voting vs Merging vs Selecting
+
+When multiple agents produce answers, you need an aggregation strategy. **Voting** (majority wins) is simple but discards nuance -- the minority answer might be correct and more detailed. **Merging** (combine all outputs into a unified response) preserves information but requires a merge function, which often means another LLM call, adding latency and cost. **Selecting** (pick the best by a quality signal) is cheap but requires a reliable quality scorer, and quality scoring is itself a hard problem.
+
+The right choice depends on the task type: use voting for classification tasks where discrete agreement is meaningful, merging for research synthesis where multiple perspectives add value, and selecting for generation tasks where style consistency matters and blending outputs would produce an incoherent result.
+
+### Decision Summary
+
+| Tradeoff | Option A | Option B | Choose A When | Choose B When |
+|----------|----------|----------|---------------|---------------|
+| **Orchestration vs Choreography** | Orchestration (central coordinator) | Choreography (event-driven) | Primary workflows; debuggability is critical | Side effects; independent, loosely coupled agents |
+| **Sync vs Async** | Synchronous (request-response) | Asynchronous (fire-and-forget + callback) | Caller needs result to proceed; simple chains | Caller can continue without result; fan-out patterns |
+| **Shared State vs Message Passing** | Blackboard (shared store) | Message passing (agent-owned state) | Single shared artifact; append-only writes | Independent work; distributed agents; merge at end |
+| **Parallel vs Sequential Fan-Out** | Parallel (all agents at once) | Sequential (one at a time) | User-facing latency constraint | Background tasks; cost constraint |
+| **Voting vs Merging vs Selecting** | Voting / Selecting | Merging | Classification; generation with style needs | Research synthesis; multi-perspective analysis |
 
 ---
 

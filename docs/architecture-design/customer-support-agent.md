@@ -379,6 +379,356 @@ The blended cost per conversation ($0.01) is well under the $0.15 budget. This h
 
 ---
 
+## Data Layer Deep Dive
+
+### Database Selection Justification
+
+Each data store in the architecture was chosen for a specific reason tied to the workload it serves. The table below summarizes the selection rationale and the alternatives that were evaluated and rejected.
+
+| Store | Technology | Why This Choice | Alternative Considered | Why Not |
+|-------|-----------|----------------|----------------------|---------|
+| Session state | Redis | Sub-millisecond reads for real-time chat; built-in TTL handles session expiration without manual cleanup; pub/sub channel supports WebSocket event broadcasting across horizontally scaled workers | DynamoDB | Higher read latency (single-digit ms vs. sub-ms); provisioned capacity pricing is overkill for ephemeral session data that lives for minutes to hours |
+| Conversation history | PostgreSQL | ACID transactions required for SOC 2 and GDPR audit compliance; rich querying for analytics and reporting; JSONB columns for flexible tool result storage; row-level security (RLS) for multi-tenant isolation without separate databases | MongoDB | Weaker consistency guarantees make audit trails harder to defend during compliance audits; RLS enforcement is more complex, requiring application-level tenant filtering rather than database-enforced policies |
+| Knowledge base (vectors) | pgvector | Runs inside the existing PostgreSQL instance -- no separate managed service to operate; sufficient performance for knowledge bases under 1M documents; leverages existing PostgreSQL backup, monitoring, and access control infrastructure | Pinecone | Adds a separate managed service with its own authentication, networking, and billing; operational complexity is not justified at this scale; pgvector handles sub-100ms similarity search for the expected corpus size |
+| Analytics | ClickHouse | Columnar storage optimized for aggregation queries (cost rollups, usage pattern analysis, resolution rate calculations); handles high write throughput from streaming conversation events without impacting transactional workloads | PostgreSQL with materialized views | Works for initial scale, but analytics queries (scanning millions of rows for monthly rollups) compete with OLTP workload (conversation reads/writes) as volume grows; ClickHouse isolates analytical load entirely |
+
+### Schema Design
+
+The following schemas define the core data model. Each table includes its indexes with justification for why each index exists.
+
+#### conversations
+
+Tracks each customer support session from creation through resolution.
+
+```sql
+CREATE TABLE conversations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(64) NOT NULL,
+    tenant_id VARCHAR(64) NOT NULL,
+    channel VARCHAR(20) NOT NULL CHECK (channel IN ('web', 'mobile', 'api')),
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'escalated', 'resolved', 'abandoned')),
+    assigned_agent VARCHAR(20),
+    resolution_type VARCHAR(20),
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at TIMESTAMPTZ
+);
+
+-- Fast lookup when loading a returning customer's recent conversations
+CREATE INDEX idx_conversations_user ON conversations(user_id, created_at DESC);
+
+-- Dashboard queries: "show all active conversations for tenant X"
+CREATE INDEX idx_conversations_tenant_status ON conversations(tenant_id, status);
+
+-- Global conversation feed sorted by recency (admin dashboards, cleanup jobs)
+CREATE INDEX idx_conversations_created ON conversations(created_at DESC);
+```
+
+**Index rationale**:
+- `idx_conversations_user` -- The cross-session memory feature (described below) loads the last 3 conversations for a returning customer. This composite index on `(user_id, created_at DESC)` serves that query without a sort operation.
+- `idx_conversations_tenant_status` -- Multi-tenant dashboards filter by tenant and status constantly. Without this index, every dashboard load scans the full table.
+- `idx_conversations_created` -- The TTL cleanup job (see Key Queries below) scans for old abandoned conversations. A descending time index makes this scan efficient.
+
+#### messages
+
+Stores every turn of every conversation, including tool calls, token counts, and cost tracking.
+
+```sql
+CREATE TABLE messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL REFERENCES conversations(id),
+    role VARCHAR(20) NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+    content TEXT NOT NULL,
+    tool_calls JSONB,
+    tool_results JSONB,
+    model VARCHAR(50),
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    cost_usd NUMERIC(10, 6),
+    latency_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Primary access pattern: load all messages for a conversation in chronological order
+CREATE INDEX idx_messages_conversation ON messages(conversation_id, created_at);
+```
+
+**Index rationale**:
+- `idx_messages_conversation` -- Every agent turn starts by loading recent messages for the active conversation. This composite index serves the query `WHERE conversation_id = ? ORDER BY created_at` as an index-only scan, avoiding a heap lookup for ordering.
+
+#### knowledge_articles
+
+Stores the knowledge base articles with their vector embeddings for RAG retrieval.
+
+```sql
+CREATE TABLE knowledge_articles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id VARCHAR(64) NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    category VARCHAR(50),
+    embedding vector(1536),
+    chunk_index INTEGER DEFAULT 0,
+    source_url TEXT,
+    is_published BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- HNSW index for approximate nearest neighbor search over embeddings
+CREATE INDEX idx_articles_embedding ON knowledge_articles
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+
+-- Partial index: only published articles for a tenant (filters unpublished at index level)
+CREATE INDEX idx_articles_tenant_published ON knowledge_articles(tenant_id)
+    WHERE is_published = true;
+```
+
+**Index rationale**:
+- `idx_articles_embedding` -- The HNSW index enables sub-100ms approximate nearest neighbor search. Parameters `m = 16` and `ef_construction = 200` balance recall accuracy against index build time. At fewer than 1M documents, HNSW provides better query latency than IVFFlat while maintaining recall above 0.95.
+- `idx_articles_tenant_published` -- A partial index that only includes published articles. This means unpublished (draft or archived) articles are excluded at the index level, reducing index size and ensuring they never appear in retrieval results even without a WHERE clause in the query.
+
+### Key Queries
+
+These are the actual queries the system executes in production, not simplified examples.
+
+**1. Retrieve conversation history (cursor-based pagination)**
+
+Used by the agent to load recent messages and by the dashboard to display conversation history.
+
+```sql
+SELECT id, role, content, tool_calls, tool_results, model, created_at
+FROM messages
+WHERE conversation_id = $1
+  AND created_at < $2          -- cursor: created_at of last seen message
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Cursor-based pagination (using `created_at < $2` rather than `OFFSET`) avoids the performance degradation of large offsets and handles concurrent inserts correctly -- new messages arriving during pagination do not cause duplicates or skipped rows.
+
+**2. Semantic search over knowledge base (pgvector similarity with tenant filtering)**
+
+Used by the FAQ Agent to retrieve relevant articles for RAG.
+
+```sql
+SELECT id, title, content, category,
+       1 - (embedding <=> $1) AS similarity
+FROM knowledge_articles
+WHERE tenant_id = $2
+  AND is_published = true
+ORDER BY embedding <=> $1
+LIMIT 5;
+```
+
+The `<=>` operator computes cosine distance. The query filters to the tenant's published articles first (using the partial index), then performs approximate nearest neighbor search over the remaining set. The `1 - distance` conversion returns cosine similarity (higher is better) for use in confidence scoring downstream.
+
+**3. Cost rollup per tenant per day (analytics)**
+
+Used for billing dashboards and cost monitoring. Runs against ClickHouse in production, shown here in SQL for clarity.
+
+```sql
+SELECT tenant_id,
+       DATE_TRUNC('day', m.created_at) AS day,
+       COUNT(DISTINCT c.id) AS conversations,
+       SUM(m.tokens_in) AS total_tokens_in,
+       SUM(m.tokens_out) AS total_tokens_out,
+       SUM(m.cost_usd) AS total_cost
+FROM messages m
+JOIN conversations c ON m.conversation_id = c.id
+WHERE m.created_at >= $1 AND m.created_at < $2
+GROUP BY tenant_id, DATE_TRUNC('day', m.created_at)
+ORDER BY day DESC, total_cost DESC;
+```
+
+**4. Find conversations needing cleanup (TTL-based)**
+
+Used by a scheduled cleanup job that runs every hour to close abandoned conversations and free Redis session memory.
+
+```sql
+UPDATE conversations
+SET status = 'abandoned',
+    updated_at = now()
+WHERE status = 'active'
+  AND updated_at < now() - INTERVAL '2 hours'
+RETURNING id, session_id;
+```
+
+The `RETURNING` clause gives the cleanup job the session IDs it needs to delete from Redis in the same operation, avoiding a separate SELECT query.
+
+---
+
+## Agent Memory Architecture
+
+Memory management is one of the most critical design decisions in a multi-turn conversational agent. The customer support agent uses a hybrid memory model: short-term memory in Redis for the active session, long-term memory in PostgreSQL for persistence and cross-session context.
+
+### Memory Tiers
+
+```mermaid
+graph LR
+    subgraph "Short-Term Memory (Redis)"
+        SS[Session State<br/>Current intent, active plan]
+        RM[Recent Messages<br/>Last 10 turns]
+        TC[Tool Cache<br/>Recent API responses]
+    end
+
+    subgraph "Long-Term Memory (PostgreSQL)"
+        CH[Conversation History<br/>Full message log]
+        CS[Conversation Summaries<br/>Compressed context]
+        UP[User Patterns<br/>Past interaction history]
+    end
+
+    subgraph "Context Assembly"
+        CA[Context Window Builder<br/>Budget-based packing]
+    end
+
+    SS --> CA
+    RM --> CA
+    TC --> CA
+    CS --> CA
+    UP --> CA
+    CA --> LLM[LLM Call]
+```
+
+**Short-term memory (Redis)** holds the active session state -- the current intent classification, the agent's active plan (e.g., "looking up order, waiting for tool response"), and the last 10 messages in the conversation. This data is accessed on every turn (sub-millisecond reads are essential) and expires automatically via Redis TTL when the session ends.
+
+**Long-term memory (PostgreSQL)** holds the full conversation history, compressed summaries of completed conversations, and user interaction patterns. This data is accessed less frequently -- primarily at session start (to load cross-session context) and at session end (to persist the completed conversation).
+
+### Context Window Strategy
+
+The system uses a **budget-based context packing** approach. For each LLM call, the context window is allocated within a fixed token budget to balance completeness against cost.
+
+| Context Component | Token Budget | Source |
+|-------------------|-------------|--------|
+| System prompt + tool definitions | ~1,500 tokens (fixed) | Static configuration |
+| Retrieved knowledge base articles | ~2,000 tokens (up to 5 chunks x 400 tokens) | pgvector retrieval |
+| Recent conversation history | ~1,500 tokens (last 10 messages) | Redis |
+| Rolling summary of older history | ~500 tokens (if conversation > 10 turns) | PostgreSQL |
+| Response budget | ~1,000 tokens | Reserved for LLM output |
+| **Total per turn** | **~6,500 tokens** | |
+
+This budget keeps each turn well within GPT-4o-mini's 128K context limit while optimizing for cost -- paying for 6,500 tokens per turn rather than naively stuffing the full conversation history (which could grow to 50K+ tokens in long sessions).
+
+### Rolling Summary
+
+When a conversation exceeds 10 turns, the system compresses older messages into a rolling summary. This prevents unbounded context growth while preserving the information the agent needs.
+
+The summary is generated by GPT-4o-mini with a structured prompt that captures four elements:
+1. **Customer's issue** -- what the customer originally asked about
+2. **Actions taken** -- which tools were called and what data was retrieved
+3. **Current state** -- where the conversation stands (resolved? pending? escalated?)
+4. **Relevant data** -- order numbers, account details, or policy references discovered during the conversation
+
+The summary replaces messages 1 through N-10 in the context window. Only the most recent 10 messages are kept verbatim. This approach costs approximately $0.001 per summary (a short GPT-4o-mini call) but saves $0.01+ per turn in reduced context length for long conversations.
+
+### Cross-Session Memory
+
+For returning customers, the system provides continuity across sessions. At session start, the system loads the last 3 conversation summaries for the authenticated user from PostgreSQL:
+
+```sql
+SELECT summary, status, resolution_type, created_at
+FROM conversation_summaries
+WHERE user_id = $1
+ORDER BY created_at DESC
+LIMIT 3;
+```
+
+This enables responses like "I see you contacted us about order #12345 last week -- is this about the same issue?" Cross-session memory is loaded only for authenticated users and only if conversations exist within the last 30 days. The lookup is a simple indexed query on `user_id`, not an embedding-based search, because it retrieves the user's own history rather than searching for similar conversations.
+
+:::note Design Decision
+Cross-session memory is scoped to summaries, not full message histories. Loading full histories of prior conversations would bloat the context window and increase cost. Summaries provide sufficient context for continuity at a fraction of the token cost.
+:::
+
+---
+
+## Hallucination Mitigation
+
+In a customer support context, hallucinations are not just inaccurate -- they are actively harmful. A fabricated order number, an invented refund policy, or a hallucinated tracking link erodes customer trust and can create legal liability. The system employs five layers of defense against hallucinations.
+
+### Hallucination Prevention Pipeline
+
+```mermaid
+graph TB
+    LLM[LLM Response Generated] --> V1[Tool Result Validation<br/>Did the tool actually return this data?]
+    V1 -->|Pass| V2[Citation Verification<br/>Is the response grounded in retrieved chunks?]
+    V1 -->|Fail| REJECT[Reject and Regenerate]
+    V2 -->|Pass| V3[Confidence Scoring<br/>Is confidence above 0.6?]
+    V2 -->|Fail| FLAG[Flag as Ungrounded]
+    V3 -->|Pass| SEND[Send to Customer]
+    V3 -->|Fail| ESCALATE[Escalate to Human]
+    FLAG --> ESCALATE
+```
+
+### Layer 1: Fabricated Order Data Prevention
+
+The agent must never invent order details -- order numbers, tracking numbers, delivery dates, or refund amounts. The mitigation is structural: **all order data must originate from tool calls**.
+
+After the LLM generates a response, the system validates that every order-related claim corresponds to data returned by a tool call in the current turn. If the response references an order number that was not returned by `lookup_order` or `get_order_status`, the response is rejected and regenerated with an explicit instruction: "Only reference order data returned by the tools above."
+
+This validation is rule-based (regex extraction of order numbers and cross-referencing with tool results), not LLM-based, ensuring it cannot itself be fooled.
+
+### Layer 2: Policy Hallucination Prevention
+
+The FAQ Agent must not invent return policies, refund timelines, warranty terms, or any other policy information. The mitigation is prompt-level grounding.
+
+The system prompt includes an explicit constraint: **"Only answer based on the retrieved knowledge base articles. If the articles do not contain the answer, respond that you do not have that information and offer to connect the customer with a human agent."** Temperature is set to 0.1 to minimize creative generation and maximize extractive responses from the retrieved context.
+
+### Layer 3: Confidence Scoring
+
+Every agent response includes a confidence score derived from the LLM's self-assessment and the retrieval quality (average similarity score of retrieved chunks). Responses are routed based on confidence:
+
+| Confidence Range | Action |
+|-----------------|--------|
+| 0.6 -- 1.0 | Send response to customer |
+| 0.4 -- 0.6 | Send response with disclaimer: "Based on my understanding..." and suggest human agent option |
+| Below 0.4 | Do not send response; escalate to human agent |
+
+The 0.6 threshold was tuned on production data. Setting it higher (e.g., 0.8) caused 40% of routine FAQ questions to escalate unnecessarily, overwhelming the human agent queue. Setting it lower (e.g., 0.3) allowed confident-sounding but incorrect answers through, which generated customer complaints.
+
+### Layer 4: Citation Verification
+
+For FAQ responses, the system verifies that the response content is actually entailed by the retrieved knowledge base chunks. After generating a response, the system embeds the response and computes cosine similarity against each retrieved chunk. If the maximum similarity between the response embedding and all retrieved chunk embeddings falls below 0.5, the response is flagged as potentially ungrounded -- the agent may be generating information not present in the knowledge base.
+
+Flagged responses are either regenerated with a stricter prompt or escalated, depending on the confidence score from Layer 3.
+
+### Layer 5: Tool Result Validation
+
+Before incorporating tool results into a response, the system validates three conditions:
+
+1. **The tool was actually called** -- the tool call ID in the response matches a tool call that was dispatched and received a response. This prevents the LLM from fabricating tool results in its output.
+2. **The response schema matches** -- the tool result conforms to the expected JSON schema for that tool. Malformed or unexpected responses are rejected rather than passed to the LLM for interpretation.
+3. **Data consistency checks** -- basic sanity checks on the data: order dates are not in the future, refund amounts are not negative, tracking numbers match the expected format for the carrier. These checks catch corrupted or test data from upstream systems before it reaches the customer.
+
+:::warning Critical Design Principle
+Hallucination mitigation layers are additive, not alternative. No single layer catches all hallucination types. Tool result validation catches fabricated data, citation verification catches ungrounded policy claims, and confidence scoring catches the cases where the model is uncertain but generates a response anyway. Removing any layer creates a gap.
+:::
+
+---
+
+## Production Issues and Fixes
+
+The following table documents production issues observed in customer support agent deployments, their root causes, and the fixes applied. These are the issues that do not appear in architecture diagrams but dominate on-call rotations.
+
+| Issue | Symptoms | Root Cause | Fix |
+|-------|----------|-----------|-----|
+| Agent loops on ambiguous intent | Same classification repeated 3+ times; customer frustration rises; conversation exceeds 10 turns without progress | User query matches multiple intents with near-equal probability; the router oscillates between FAQ and Order agents each turn | Add a "confused" intent that triggers immediate escalation after 2 reclassifications; implement a priority ordering for tie-breaking (FAQ < Order < Return < Escalation) so ties resolve deterministically |
+| Stale knowledge base answers | Agent gives outdated policy information (e.g., old return window); customer complaints about incorrect information | Knowledge articles were updated in the CMS but the embedding index was not refreshed | Implement webhook-triggered re-indexing: CMS publishes an event on article update, the indexing service re-embeds and upserts the article within 5 minutes; add `updated_at` freshness check in retrieval to prefer recently updated articles |
+| PII leakage in logs | Customer PII (emails, phone numbers, addresses) found in observability logs during a compliance audit | Tool results containing PII were logged verbatim by the tracing middleware | Add PII scrubbing middleware to the logging pipeline; use regex-based redaction for emails, phone numbers, credit card numbers, and addresses before writing to any log sink; validate with automated PII scanning in CI |
+| Cost spike on long conversations | Monthly LLM cost 3x the projected budget | 5% of conversations exceed 20 turns, each turn hitting GPT-4o with a growing context window; these long conversations account for 40% of total token spend | Add a per-conversation cost limit ($0.50); after the limit is reached, switch to summary mode (compress history, use GPT-4o-mini) or escalate to a human agent; alert on conversations exceeding 15 turns |
+| WebSocket disconnection losing context | Customer reconnects after a network interruption; the agent has no memory of the prior conversation; customer must repeat their issue | Session state expired in Redis during the network interruption (TTL elapsed while the customer was disconnected) | Persist conversation checkpoints to PostgreSQL every 5 turns; on reconnect, attempt Redis recovery first, then fall back to PostgreSQL checkpoint; extend Redis TTL to 30 minutes for sessions with active WebSocket connections |
+| Escalation queue flooding | Human agents overwhelmed with escalated conversations; wait times exceed 30 minutes; customer satisfaction drops | Confidence threshold set too high (0.8), causing the agent to escalate routine FAQ questions that it could answer correctly | Tune the confidence threshold down to 0.6 based on production accuracy data; add a "suggest but do not escalate" tier for medium confidence (0.4--0.6) where the agent provides its best answer along with an option to speak with a human |
+| Semantic cache returning wrong answers | Customer receives an answer to a semantically similar but different question (e.g., asked about return policy for electronics, received answer about return policy for clothing) | Cosine similarity threshold for cache hits set too low (0.90), matching queries that are similar but not equivalent | Raise the similarity threshold to 0.95; add a category-matching constraint so cache hits only occur within the same intent category; log cache hit decisions for manual review during the first 2 weeks after threshold changes |
+
+:::tip Operational Readiness
+Before launching a customer support agent, build runbooks for each issue in this table. The first month of production will surface at least three of these problems. Having pre-written runbooks with specific metric thresholds and remediation steps reduces mean time to resolution from hours to minutes.
+:::
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

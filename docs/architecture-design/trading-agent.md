@@ -284,6 +284,344 @@ The infrastructure cost is negligible compared to trading capital. The critical 
 
 ---
 
+## Data Layer Deep Dive
+
+### Database Selection Justification
+
+| Store | Technology | Why This Choice | Alternative Considered | Why Not |
+|-------|-----------|-----------------|----------------------|---------|
+| Market data & trade history | TimescaleDB (PostgreSQL + time-series extension) | Time-series optimized queries (OHLCV data, candlestick aggregations), continuous aggregates for real-time analytics, compression for historical data (10x storage savings), native PostgreSQL compatibility for joins with trade metadata | InfluxDB | Purpose-built for time-series but lacks SQL joins -- correlating market data with trade metadata, agent decisions, and risk metrics requires relational queries |
+| Real-time market data & order state | Redis with Streams | Sub-ms reads for current positions, Redis Streams for ordered market data ingestion, pub/sub for price alerts and signal notifications | Apache Kafka | Better durability and replay, but adds operational complexity; Redis Streams sufficient for single-agent trading with < 10K messages/second |
+| Trade metadata, agent decisions, audit trail | PostgreSQL | ACID guarantees mandatory for financial records (every trade decision must be durable and auditable), JSONB for storing heterogeneous agent reasoning traces, row-level security for multi-strategy isolation | MongoDB | Flexible schema, but financial regulators require strong consistency and audit trails that PostgreSQL enforces natively |
+| Model artifacts & backtesting data | Object storage (S3) | Large datasets (years of tick data, trained model weights) cannot live in a database; versioned S3 buckets for model artifacts enable rollback | Database BLOBs | Too slow, bloats the database, complicates backups |
+
+### Schema Design
+
+#### 1. `trades` -- Executed Trade Records (Audit Trail)
+
+```sql
+CREATE TABLE trades (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id VARCHAR(64) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    side VARCHAR(4) NOT NULL CHECK (side IN ('buy', 'sell')),
+    order_type VARCHAR(10) NOT NULL CHECK (order_type IN ('market', 'limit', 'stop')),
+    quantity NUMERIC(18, 8) NOT NULL,
+    price NUMERIC(18, 8) NOT NULL,
+    filled_price NUMERIC(18, 8),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'submitted', 'filled', 'partially_filled', 'cancelled', 'rejected')),
+    exchange VARCHAR(30) NOT NULL,
+    exchange_order_id VARCHAR(128),
+    agent_reasoning JSONB,
+    signal_source VARCHAR(50),
+    risk_check_result JSONB,
+    slippage_bps NUMERIC(8, 2),
+    commission_usd NUMERIC(10, 4),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    filled_at TIMESTAMPTZ
+);
+CREATE INDEX idx_trades_strategy_time ON trades(strategy_id, created_at DESC);
+CREATE INDEX idx_trades_symbol_time ON trades(symbol, created_at DESC);
+CREATE INDEX idx_trades_status ON trades(status) WHERE status NOT IN ('filled', 'cancelled', 'rejected');
+```
+
+#### 2. `market_data` -- OHLCV Time-Series (TimescaleDB Hypertable)
+
+```sql
+CREATE TABLE market_data (
+    time TIMESTAMPTZ NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    open NUMERIC(18, 8) NOT NULL,
+    high NUMERIC(18, 8) NOT NULL,
+    low NUMERIC(18, 8) NOT NULL,
+    close NUMERIC(18, 8) NOT NULL,
+    volume NUMERIC(24, 8) NOT NULL,
+    source VARCHAR(30) NOT NULL
+);
+SELECT create_hypertable('market_data', 'time');
+CREATE INDEX idx_market_data_symbol_time ON market_data(symbol, time DESC);
+
+-- Continuous aggregate for 1-hour candles
+CREATE MATERIALIZED VIEW market_data_1h
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 hour', time) AS bucket,
+    symbol,
+    first(open, time) AS open,
+    max(high) AS high,
+    min(low) AS low,
+    last(close, time) AS close,
+    sum(volume) AS volume
+FROM market_data
+GROUP BY bucket, symbol;
+```
+
+**Why hypertable**: Automatic partitioning by time enables fast range queries and efficient compression of old data. TimescaleDB transparently manages the chunk boundaries so that queries like "give me the last 24 hours of AAPL data" only scan the relevant partition, not the entire table.
+
+**Why continuous aggregate**: Pre-computed hourly candles avoid re-scanning millions of tick records. Without continuous aggregates, every dashboard refresh or strategy evaluation that needs hourly candles would trigger a full scan of the raw tick data.
+
+#### 3. `positions` -- Current Portfolio State
+
+```sql
+CREATE TABLE positions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id VARCHAR(64) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    quantity NUMERIC(18, 8) NOT NULL DEFAULT 0,
+    avg_entry_price NUMERIC(18, 8),
+    current_price NUMERIC(18, 8),
+    unrealized_pnl NUMERIC(18, 4),
+    realized_pnl NUMERIC(18, 4) DEFAULT 0,
+    max_drawdown_pct NUMERIC(8, 4) DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(strategy_id, symbol)
+);
+CREATE INDEX idx_positions_strategy ON positions(strategy_id);
+```
+
+#### 4. `agent_decisions` -- Full Audit Trail of Agent Reasoning
+
+```sql
+CREATE TABLE agent_decisions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    strategy_id VARCHAR(64) NOT NULL,
+    decision_type VARCHAR(20) NOT NULL
+        CHECK (decision_type IN ('entry', 'exit', 'hold', 'rebalance', 'risk_override')),
+    symbol VARCHAR(20),
+    reasoning JSONB NOT NULL,
+    market_context JSONB,
+    risk_metrics JSONB,
+    confidence NUMERIC(3, 2),
+    was_executed BOOLEAN DEFAULT false,
+    was_overridden BOOLEAN DEFAULT false,
+    override_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_decisions_strategy_time ON agent_decisions(strategy_id, created_at DESC);
+CREATE INDEX idx_decisions_overridden ON agent_decisions(was_overridden) WHERE was_overridden = true;
+```
+
+### Key Queries
+
+**1. Portfolio P&L Calculation** -- current positions with unrealized gains:
+
+```sql
+SELECT
+    p.strategy_id,
+    p.symbol,
+    p.quantity,
+    p.avg_entry_price,
+    p.current_price,
+    p.unrealized_pnl,
+    p.realized_pnl,
+    (p.unrealized_pnl + p.realized_pnl) AS total_pnl
+FROM positions p
+WHERE p.strategy_id = 'momentum_v2'
+    AND p.quantity != 0
+ORDER BY ABS(p.unrealized_pnl) DESC;
+```
+
+**2. Trade History for Compliance Audit** -- all trades in a date range with full reasoning:
+
+```sql
+SELECT
+    t.id,
+    t.strategy_id,
+    t.symbol,
+    t.side,
+    t.quantity,
+    t.price,
+    t.filled_price,
+    t.slippage_bps,
+    t.agent_reasoning,
+    t.risk_check_result,
+    t.created_at,
+    t.filled_at
+FROM trades t
+WHERE t.created_at BETWEEN '2025-01-01' AND '2025-01-31'
+    AND t.status = 'filled'
+ORDER BY t.created_at;
+```
+
+**3. Market Data Retrieval** -- OHLCV for a symbol in a time range using hypertable:
+
+```sql
+SELECT
+    time,
+    symbol,
+    open,
+    high,
+    low,
+    close,
+    volume
+FROM market_data
+WHERE symbol = 'AAPL'
+    AND time >= now() - INTERVAL '7 days'
+ORDER BY time DESC;
+```
+
+**4. Drawdown Analysis** -- maximum drawdown over a rolling window:
+
+```sql
+SELECT
+    strategy_id,
+    symbol,
+    max_drawdown_pct,
+    unrealized_pnl,
+    realized_pnl,
+    updated_at
+FROM positions
+WHERE max_drawdown_pct > 5.0
+ORDER BY max_drawdown_pct DESC;
+```
+
+---
+
+## Agent Memory Architecture
+
+### Dual-Horizon Memory
+
+Trading agents require a dual-horizon memory model that balances speed of access against depth of context. Each horizon serves a distinct purpose in the decision cycle.
+
+- **Short-term (intraday)**: Current positions, recent price movements (last 100 ticks), pending orders, intraday P&L. All stored in Redis for sub-ms access. The agent checks this memory on every decision cycle (every few seconds to minutes depending on strategy frequency). This is the "working memory" that the agent uses to understand the immediate market state.
+- **Medium-term (days to weeks)**: Recent trade history, position performance trends, market regime indicators. Stored in PostgreSQL, loaded at strategy startup and refreshed periodically (every 5 minutes). This provides the agent with awareness of its own recent behavior -- whether it has been winning or losing, whether the current market regime matches its strategy's assumptions.
+- **Long-term (months)**: Historical performance metrics, backtesting results, model parameters, and calibration data. Stored in PostgreSQL and S3, loaded during strategy initialization. This is the "institutional memory" that informs strategy parameters and confidence thresholds.
+
+```mermaid
+graph LR
+    subgraph "Short-Term Memory (Redis)"
+        RT_Prices[Current Prices<br/>Last 100 Ticks]
+        RT_Positions[Active Positions<br/>Pending Orders]
+        RT_PnL[Intraday P&L<br/>Cash Balance]
+    end
+
+    subgraph "Medium-Term Memory (PostgreSQL)"
+        MT_Trades[Recent Trades<br/>Last 2 Weeks]
+        MT_Performance[Strategy Performance<br/>Win Rate, Sharpe]
+        MT_Regime[Market Regime<br/>Volatility, Trend]
+    end
+
+    subgraph "Long-Term Memory (PostgreSQL + S3)"
+        LT_Backtest[Backtesting Results<br/>Historical Models]
+        LT_Params[Strategy Parameters<br/>Calibration Data]
+        LT_History[Full Trade History<br/>Months of Records]
+    end
+
+    RT_Prices --> Agent[Trading Agent<br/>LLM Decision Cycle]
+    RT_Positions --> Agent
+    RT_PnL --> Agent
+    MT_Trades --> Agent
+    MT_Performance --> Agent
+    MT_Regime --> Agent
+    LT_Backtest --> Agent
+    LT_Params --> Agent
+    LT_History --> Agent
+
+    Agent -->|Every few seconds| RT_Prices
+    Agent -->|Every 5 minutes| MT_Trades
+    Agent -->|At startup| LT_Backtest
+```
+
+### Context Window Strategy
+
+Trading agents face a unique constraint -- decisions must be fast (< 1 second), but require significant market context. The context window is intentionally kept small to minimize inference latency:
+
+| Context Component | Approximate Tokens | Purpose |
+|---|---|---|
+| Market data summary (current prices, recent moves) | ~500 | What is happening right now |
+| Current positions and P&L | ~300 | What the agent currently holds |
+| Risk metrics (drawdown, exposure, correlation) | ~300 | Safety boundaries |
+| Strategy rules and constraints | ~500 | How the agent should behave |
+| Recent agent decisions (last 5) | ~400 | Avoid contradictory actions |
+| News/sentiment signals (if available) | ~500 | Fundamental catalysts |
+| **Total** | **~2,500** | Intentionally small for fast inference |
+
+The ~2,500 token context is deliberately constrained. Larger contexts would increase LLM latency and cost without proportional benefit -- the agent's value comes from interpreting signals, not from processing large volumes of raw data (that is the Feature Engine's job).
+
+### Decision Journaling
+
+Every agent decision (buy, sell, hold) is logged to the `agent_decisions` table with full context: what market data it observed, what risk metrics it evaluated, what reasoning it applied, and what action it took. This creates a complete audit trail that serves three purposes:
+
+1. **Compliance**: Regulators can reconstruct the agent's reasoning for any trade.
+2. **Debugging**: When a strategy underperforms, engineers can trace the agent's decision chain to identify where its reasoning went wrong.
+3. **Improvement**: Historical decision logs enable fine-tuning confidence calibration and identifying systematic biases in the agent's analysis.
+
+---
+
+## Hallucination Mitigation
+
+Trading is the **highest-stakes domain for hallucination** -- a hallucinated trade can lose real money. Every mitigation in this section exists because, without it, a specific category of LLM error could cause direct financial loss.
+
+### Price Hallucination
+
+The agent must NEVER fabricate price data. LLMs have stale price information from training data and may confidently state incorrect prices.
+
+**Mitigation**: All price data comes from market data feeds via tool calls. The agent's context includes only real prices sourced from Redis and TimescaleDB. The system prompt explicitly states: *"You do not know current prices from training data. ALL price information must come from the market_data tool."* As a cross-validation step, if the agent mentions a price in its reasoning, the execution layer checks it against the last known price in Redis. If the deviation exceeds a 5% tolerance, the signal is rejected and flagged.
+
+### Position Hallucination
+
+The agent claims to hold a position it does not, or states an incorrect position size. This could lead to incorrect sizing of new trades.
+
+**Mitigation**: Position state is authoritative from the `positions` table, updated exclusively by the execution engine (not the LLM). The LLM proposes trades; the execution engine validates proposals against actual positions before execution. The LLM never writes to position state.
+
+### Risk Metric Fabrication
+
+The agent claims risk metrics (Sharpe ratio, VaR, drawdown) that are calculated incorrectly or fabricated entirely.
+
+**Mitigation**: Risk metrics are computed by a deterministic calculation engine (not the LLM). The LLM receives pre-computed risk metrics as read-only context and interprets them, but never computes them. If the LLM's reasoning references a risk metric value that differs from the pre-computed value, the signal is flagged for review.
+
+### Order Fabrication
+
+The agent claims an order was placed when it was not, or reports incorrect fill information.
+
+**Mitigation**: The execution engine is the ONLY component that can place orders. The LLM generates a trade recommendation; the execution engine validates it (risk checks, position limits, market hours) and executes it. The LLM is informed of the result AFTER execution, never before. The flow is strictly unidirectional: LLM proposes, execution engine disposes.
+
+### Hindsight Bias
+
+The agent uses future data that would not have been available at decision time, producing unrealistically good backtesting results or referencing data it should not yet have.
+
+**Mitigation**: Strict temporal isolation -- the agent only receives data timestamped before the current decision time. Backtesting enforces this with point-in-time data snapshots: at decision time T, the agent sees only data with timestamps at or before T.
+
+### Confidence Calibration
+
+The agent expresses confidence levels that do not match historical accuracy. For example, the agent says "high confidence" but historical win rate for signals at that confidence level is only 45%.
+
+**Mitigation**: Track prediction accuracy over time by confidence bucket. If the agent's stated confidence consistently diverges from realized accuracy, recalibrate confidence thresholds. A rolling accuracy tracker compares the agent's confidence scores against actual trade outcomes and adjusts the minimum confidence threshold accordingly.
+
+### End-to-End Hallucination Guard Flow
+
+```mermaid
+graph LR
+    A[Market Data<br/>Authoritative Source] -->|Real prices via tool calls| B[Agent Reasoning<br/>LLM]
+    B -->|Trade proposal<br/>with rationale| C[Risk Validation<br/>Deterministic Engine]
+    C -->|Checks position limits<br/>verifies prices<br/>validates risk metrics| D[Execution Engine<br/>Order Placement]
+    D -->|Fill confirmation<br/>from exchange| E[Confirmation<br/>Back to Agent]
+    E -->|Updated positions<br/>and P&L| A
+
+    style A fill:#2d6a4f,color:#fff
+    style C fill:#e63946,color:#fff
+    style D fill:#1d3557,color:#fff
+```
+
+The LLM sits between two authoritative systems: it receives real data from the Market Data layer and its proposals are validated by the deterministic Risk Engine. The LLM can reason and propose, but it cannot read from or write to any authoritative state directly. This architectural constraint means that even a completely hallucinating LLM cannot cause financial harm -- its proposals will be rejected by the deterministic validation layer.
+
+---
+
+## Production Issues and Fixes
+
+| Issue | Symptoms | Root Cause | Fix |
+|-------|----------|-----------|-----|
+| Agent trades against the risk limit | Position exceeds maximum allocation | Risk check race condition -- two concurrent signals trigger buys before risk state updates | Serialize order submission through a single-threaded risk gate; use optimistic locking on position state |
+| Stale price data causing wrong decisions | Agent makes decisions based on prices from 5 minutes ago | Market data feed lagged, Redis not updated | Add staleness check: reject decisions if latest market data is > 30 seconds old; alert on feed lag |
+| Model drift after market regime change | Strategy performance degrades over weeks | Market conditions changed (volatility regime shift), agent's patterns no longer valid | Implement regime detection; monitor rolling Sharpe ratio; alert when it drops below threshold; switch to conservative strategy automatically |
+| Slippage exceeds estimates | Filled prices consistently worse than expected | Agent trading illiquid instruments or during high volatility | Add slippage monitoring; switch to limit orders when volatility is high; reduce position sizes for illiquid instruments |
+| Audit trail gaps | Compliance audit finds missing decision records | Agent decision logging failed silently during high-volume periods | Make decision logging synchronous (not async); use WAL (write-ahead log) pattern; verify log completeness with sequence numbers |
+| Cost runaway from LLM calls | Trading strategy becomes unprofitable due to inference costs | Agent making too many LLM calls per minute (every tick) | Throttle LLM calls to decision-relevant events only; use rule-based filters before calling LLM; cache recent analyses |
+| Flash crash behavior | Agent panic-sells entire portfolio in 30 seconds | Agent interpreting rapid price drops as sell signal without circuit breakers | Implement trading circuit breakers: max orders per minute, max portfolio turnover per hour, halt on > 5% portfolio loss in any hour |
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

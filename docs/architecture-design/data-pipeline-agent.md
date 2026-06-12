@@ -301,6 +301,327 @@ The dominant cost driver is transformation generation, especially when self-corr
 
 ---
 
+## Data Layer Deep Dive
+
+### Database Selection Justification
+
+| Store | Technology | Why This Choice | Alternative Considered | Why Not |
+|-------|-----------|----------------|----------------------|---------|
+| Pipeline metadata & query history | PostgreSQL | ACID guarantees for pipeline state, rich SQL querying for analyzing past queries, JSONB for heterogeneous query plans and results | MongoDB | Flexible schema for varied query results, but pipeline state management is inherently relational -- steps have ordering, dependencies, and foreign keys to data sources |
+| Execution state & caching | Redis | Sub-ms reads for real-time pipeline status, TTL for caching query results and schema metadata, pub/sub for streaming execution progress | Memcached | Simpler, but lacks pub/sub and persistence options needed for execution state recovery |
+| Data warehouses | Snowflake / BigQuery / Redshift | The agent queries these, not manages them. Requires read access to INFORMATION_SCHEMA for schema discovery; must understand each warehouse's SQL dialect differences | N/A | These are the user's existing warehouses -- the agent adapts to them |
+| Large result caching | S3 (Object Storage) | Large query results (millions of rows) cannot be held in Redis. Store result snapshots with presigned URLs for retrieval | Streaming results directly | Works for small results, but large results need pagination and caching |
+
+:::info Why PostgreSQL over MongoDB for pipeline state?
+You cannot lose a half-executed pipeline state. Pipeline steps have strict ordering, dependencies between sources and transforms, and foreign key relationships to data sources and schema caches. This is inherently relational. JSONB columns give you schema flexibility where you need it (execution plans, heterogeneous results) without giving up transactional guarantees where you cannot afford to.
+:::
+
+### Schema Design
+
+**1. pipeline_runs** -- tracks each data pipeline execution
+
+```sql
+CREATE TABLE pipeline_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(64) NOT NULL,
+    natural_language_query TEXT NOT NULL,
+    target_database VARCHAR(50) NOT NULL,
+    target_schema VARCHAR(100),
+    status VARCHAR(20) NOT NULL DEFAULT 'planning'
+        CHECK (status IN ('planning', 'validating', 'executing',
+                          'visualizing', 'completed', 'failed', 'cancelled')),
+    generated_sql TEXT,
+    sql_explanation TEXT,
+    execution_plan JSONB,
+    result_row_count INTEGER,
+    result_s3_key TEXT,
+    error_message TEXT,
+    tokens_used INTEGER DEFAULT 0,
+    cost_usd NUMERIC(10, 6) DEFAULT 0,
+    execution_time_ms INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+
+-- Fast lookup by user for query history display
+CREATE INDEX idx_pipeline_runs_user ON pipeline_runs(user_id, created_at DESC);
+
+-- Partial index for in-progress pipelines (monitoring dashboard)
+CREATE INDEX idx_pipeline_runs_status ON pipeline_runs(status)
+    WHERE status NOT IN ('completed', 'failed');
+```
+
+**2. schema_cache** -- cached database schema metadata
+
+```sql
+CREATE TABLE schema_cache (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    database_name VARCHAR(100) NOT NULL,
+    schema_name VARCHAR(100) NOT NULL,
+    table_name VARCHAR(200) NOT NULL,
+    column_name VARCHAR(200) NOT NULL,
+    data_type VARCHAR(100) NOT NULL,
+    is_nullable BOOLEAN,
+    is_primary_key BOOLEAN DEFAULT false,
+    foreign_key_ref TEXT,
+    column_description TEXT,
+    sample_values JSONB,
+    row_count_estimate BIGINT,
+    last_synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Upsert target: one row per column
+CREATE UNIQUE INDEX idx_schema_cache_unique
+    ON schema_cache(database_name, schema_name, table_name, column_name);
+
+-- Fast table-level schema retrieval
+CREATE INDEX idx_schema_cache_table
+    ON schema_cache(database_name, schema_name, table_name);
+```
+
+:::note Why cache schema metadata?
+INFORMATION_SCHEMA queries are slow on large warehouses (5-30 seconds on Snowflake with thousands of tables). The schema rarely changes, so caching with a TTL of 1 hour eliminates repeated expensive metadata queries. The `last_synced_at` column enables staleness detection and targeted invalidation.
+:::
+
+**3. query_history** -- past queries for learning and suggestion
+
+```sql
+CREATE TABLE query_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pipeline_run_id UUID REFERENCES pipeline_runs(id),
+    natural_language TEXT NOT NULL,
+    generated_sql TEXT NOT NULL,
+    target_database VARCHAR(100) NOT NULL,
+    was_executed BOOLEAN DEFAULT false,
+    was_corrected BOOLEAN DEFAULT false,
+    corrected_sql TEXT,
+    user_rating INTEGER CHECK (user_rating BETWEEN 1 AND 5),
+    embedding vector(1536),  -- pgvector for similarity search
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- HNSW index for fast approximate nearest neighbor search
+CREATE INDEX idx_query_history_embedding
+    ON query_history USING hnsw (embedding vector_cosine_ops);
+
+-- Filter by database before similarity search
+CREATE INDEX idx_query_history_database
+    ON query_history(target_database, created_at DESC);
+```
+
+:::note Why store embeddings of past queries?
+When a user asks a similar question to one that has been successfully answered before, the system retrieves previously successful SQL as few-shot examples for the LLM. This dramatically improves SQL generation accuracy for recurring query patterns and reduces the need for self-correction iterations.
+:::
+
+### Key Queries
+
+**1. Schema discovery** -- load all columns for a target table with relationships
+
+```sql
+SELECT
+    sc.column_name,
+    sc.data_type,
+    sc.is_nullable,
+    sc.is_primary_key,
+    sc.foreign_key_ref,
+    sc.column_description,
+    sc.sample_values
+FROM schema_cache sc
+WHERE sc.database_name = :database
+  AND sc.schema_name = :schema
+  AND sc.table_name = :table
+ORDER BY sc.is_primary_key DESC, sc.column_name;
+```
+
+**2. Similar past query lookup** -- pgvector similarity search for finding relevant query examples
+
+```sql
+SELECT
+    qh.natural_language,
+    qh.generated_sql,
+    qh.was_corrected,
+    COALESCE(qh.corrected_sql, qh.generated_sql) AS best_sql,
+    1 - (qh.embedding <=> :query_embedding) AS similarity
+FROM query_history qh
+WHERE qh.target_database = :database
+  AND qh.was_executed = true
+  AND qh.user_rating >= 3
+ORDER BY qh.embedding <=> :query_embedding
+LIMIT 3;
+```
+
+**3. Query success rate by database** -- analytics on which databases have highest correction rates
+
+```sql
+SELECT
+    qh.target_database,
+    COUNT(*) AS total_queries,
+    SUM(CASE WHEN qh.was_corrected THEN 1 ELSE 0 END) AS corrected_count,
+    ROUND(100.0 * SUM(CASE WHEN qh.was_corrected THEN 1 ELSE 0 END) / COUNT(*), 2)
+        AS correction_rate_pct,
+    AVG(qh.user_rating) FILTER (WHERE qh.user_rating IS NOT NULL) AS avg_rating
+FROM query_history qh
+WHERE qh.was_executed = true
+GROUP BY qh.target_database
+ORDER BY correction_rate_pct DESC;
+```
+
+**4. Stale schema detection** -- find tables not re-synced in over 1 hour
+
+```sql
+SELECT DISTINCT
+    sc.database_name,
+    sc.schema_name,
+    sc.table_name,
+    MAX(sc.last_synced_at) AS last_synced,
+    now() - MAX(sc.last_synced_at) AS staleness
+FROM schema_cache sc
+GROUP BY sc.database_name, sc.schema_name, sc.table_name
+HAVING MAX(sc.last_synced_at) < now() - INTERVAL '1 hour'
+ORDER BY staleness DESC;
+```
+
+---
+
+## Agent Memory Architecture
+
+The agent's primary memory challenge is fitting database schema information into the context window. A warehouse with 500 tables and 5,000 columns cannot fit in a single prompt. The memory architecture is designed around **session-scoped context with schema-aware packing**.
+
+### Schema-Aware Context Packing
+
+Rather than loading the entire database schema into every prompt, the agent selectively loads only the tables relevant to the current query.
+
+1. **User query arrives** -- "Show me monthly revenue by region"
+2. **Table identification** -- A lightweight classifier (embedding similarity against table descriptions) identifies relevant tables: `orders`, `customers`, `regions`
+3. **Selective schema loading** -- Only relevant table schemas are loaded into context (~500 tokens per table vs 50,000 for the full schema)
+4. **Dynamic expansion** -- If the agent needs additional tables mid-execution, it issues a tool call to load more schema context
+
+```mermaid
+graph LR
+    subgraph "Data Warehouse"
+        WH[INFORMATION_SCHEMA<br/>500 tables, 5000 columns]
+    end
+
+    subgraph "Schema Cache (PostgreSQL)"
+        SC[schema_cache table<br/>All columns cached<br/>TTL: 1 hour]
+    end
+
+    subgraph "Context Assembly"
+        CLS[Table Classifier<br/>Embedding similarity]
+        SEL[Selected Tables<br/>3-5 tables, ~1500 tokens]
+    end
+
+    subgraph "LLM Context Window"
+        SYS[System Prompt<br/>+ SQL dialect rules]
+        SCH[Relevant Schema<br/>3-5 table definitions]
+        FEW[Few-Shot Examples<br/>3 similar past queries]
+        USR[User Query]
+    end
+
+    WH -->|Sync every 1h| SC
+    SC -->|All table descriptions| CLS
+    CLS -->|Top matching tables| SEL
+    SEL --> SCH
+    SC -->|"pgvector search"| FEW
+    SYS --> SCH --> FEW --> USR
+```
+
+### Query Memory
+
+Past successful queries for the same database are embedded and stored in the `query_history` table. When a new query arrives, the top 3 most similar past queries are retrieved via pgvector similarity search and included as few-shot examples in the LLM prompt. This dramatically improves SQL generation accuracy for recurring query patterns -- the LLM sees concrete examples of what worked before on this specific database schema.
+
+### Execution Context
+
+During multi-step pipelines (query, validate, execute, visualize), intermediate results are stored in Redis with the `pipeline_run_id` as the key. Each step can access results from previous steps without re-querying the data warehouse.
+
+```
+Redis key pattern:
+  pipeline:{run_id}:plan      → JSON execution plan
+  pipeline:{run_id}:sql       → Generated SQL
+  pipeline:{run_id}:explain   → EXPLAIN output
+  pipeline:{run_id}:result    → Result metadata (row count, S3 key)
+  pipeline:{run_id}:progress  → Current step + status (pub/sub channel)
+```
+
+:::tip Memory budget per request
+A typical request consumes approximately 3,000--5,000 tokens of schema context (3-5 tables), 1,500 tokens of few-shot examples (3 past queries), and 500 tokens for the system prompt and user query -- well within the context window while preserving room for the LLM's reasoning and SQL generation.
+:::
+
+---
+
+## Hallucination Mitigation
+
+Hallucination mitigation is critical for data pipeline agents because hallucinated SQL can return wrong data that **looks correct**. A user trusting a fabricated number in a revenue report is far more dangerous than a query that simply fails.
+
+### Validation Pipeline
+
+Every generated SQL statement passes through a multi-stage validation pipeline before execution.
+
+```mermaid
+graph LR
+    NL[NL Query] --> GEN[SQL Generation<br/>LLM]
+    GEN --> AST[AST Parse<br/>sqlglot]
+    AST --> SV[Schema Validation<br/>Check tables/columns]
+    SV --> EXP[EXPLAIN<br/>Cost estimation]
+    EXP --> EXEC[Execute<br/>Read-only connection]
+    EXEC --> RV[Result Validation<br/>Cross-check response]
+    RV --> RESP[Response to User]
+
+    AST -- "DDL/DML detected" --> REJ1[Reject]
+    SV -- "Unknown column" --> REGEN[Re-generate<br/>with corrections]
+    EXP -- "Cost too high" --> WARN[Warn user<br/>suggest filters]
+    RV -- "Numbers mismatch" --> FLAG[Flag discrepancy]
+    REGEN --> GEN
+```
+
+### SQL Injection Prevention
+
+The agent generates SQL, but it **must** be read-only. The system parses the generated SQL's abstract syntax tree using [sqlglot](https://github.com/tobymao/sqlglot) before execution. Any query containing INSERT, UPDATE, DELETE, DROP, ALTER, GRANT, or TRUNCATE is rejected immediately.
+
+:::warning Why use a SQL parser, not regex?
+Regex-based validation can be bypassed with creative formatting, comments, or CTEs that obscure the true operation. AST-level parsing is immune to syntactic tricks because it understands the query's structure, not just its text.
+:::
+
+### Table and Column Hallucination
+
+The LLM may reference tables or columns that do not exist in the target database. Every table and column referenced in the generated SQL is validated against the `schema_cache`. If a referenced column does not exist, the system returns the error to the LLM along with the actual column list for that table and asks it to regenerate. This targeted feedback produces a correct query in a single retry in most cases.
+
+### Join Hallucination
+
+The agent may invent join conditions between tables that have no relationship. All join conditions in generated SQL are validated against foreign key metadata in `schema_cache`. Any join on columns without a documented foreign key relationship is flagged -- it may be valid (composite business keys are common in warehouses) but requires explicit user confirmation before execution.
+
+### Aggregation Errors
+
+The LLM may generate SQL with incorrect GROUP BY clauses, such as selecting non-aggregated columns not present in the GROUP BY. The system performs SQL syntax validation using the target database's dialect rules (via sqlglot dialect support) and runs EXPLAIN on the query before execution to catch semantic errors that syntax validation misses.
+
+### Result Fabrication
+
+If the query returns no results, the agent must report "no results found" rather than inventing data. The system compares the LLM's natural language response against the actual query result set. If the response mentions specific numbers, each number is verified to exist in the returned data. Any discrepancy is flagged to the user with both the LLM's claim and the actual data.
+
+### Schema Drift Handling
+
+The cached schema may become outdated after DDL changes in the warehouse. If a query fails with "column not found" or "table not found" errors, the system automatically invalidates the cache for the affected table, re-syncs from INFORMATION_SCHEMA, and retries the query with the updated schema -- without requiring user intervention.
+
+---
+
+## Production Issues and Fixes
+
+| Issue | Symptoms | Root Cause | Fix |
+|-------|----------|-----------|-----|
+| Agent generates valid but wrong SQL | Query executes successfully but returns incorrect data | Ambiguous natural language; wrong table or column interpretation | Add an "explain before execute" step: the agent explains what the SQL does in plain English, and the user confirms before execution proceeds |
+| Schema cache stale after DDL changes | Agent references dropped or renamed columns | Schema cache TTL too long; no invalidation on DDL events | Add a DDL webhook from the warehouse; invalidate affected tables immediately; reduce TTL to 15 minutes for frequently changing schemas |
+| Query timeout on large tables | Agent generates a full table scan on a billion-row table | No WHERE clause or missing partition filter | Add query cost estimation: run EXPLAIN first, warn the user if the estimated scan exceeds 1M rows, and suggest adding filters |
+| SQL dialect mismatch | Query fails with syntax error on Snowflake but works on PostgreSQL | LLM defaulting to PostgreSQL syntax | Include the target database dialect in the system prompt; use sqlglot to transpile between dialects; include dialect-specific examples in few-shot context |
+| Sensitive data exposure | Agent returns PII columns (email, SSN) in query results | No column-level access control in the agent | Maintain a column sensitivity registry; redact or mask sensitive columns in results; require explicit user confirmation to display PII |
+| Cost runaway on warehouse queries | $500 Snowflake bill from a single agent session | Agent running expensive queries without cost awareness | Set per-query cost limits in the warehouse (Snowflake resource monitors); estimate cost before execution; require approval for queries estimated above $1 |
+| Agent loops on ambiguous queries | Multiple failed SQL generations for vague requests like "show me the data" | No specific tables or metrics mentioned in the request | After 2 failed attempts, ask clarifying questions instead of retrying; present available tables and suggest specific queries the user might mean |
+
+:::caution The "valid but wrong SQL" problem
+This is the most dangerous production issue because there is no error signal -- the query runs, returns data, and the user trusts it. The only defense is an "explain before execute" step where the agent describes its interpretation in plain English ("This query joins the `orders` table with `customers` on `customer_id` and sums `order_total` grouped by month and region"). If the explanation does not match the user's intent, the user catches the error before execution.
+:::
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

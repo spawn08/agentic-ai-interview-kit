@@ -414,6 +414,237 @@ The $0.131 daily cost falls under the $0.15 budget, leaving headroom for usage s
 
 ---
 
+## Data Layer Deep Dive
+
+### Database Selection Justification
+
+| Store | Technology | Why This Choice | Alternative Considered | Why Not |
+|-------|-----------|-----------------|----------------------|---------|
+| Relational | PostgreSQL | ACID guarantees, JSONB for storing heterogeneous code snippets and AST metadata, full-text search for code search | MongoDB (flexible schema for code snippets) | Feedback and session management is inherently relational; joins across sessions, completions, and users are frequent |
+| Cache | Redis | Sub-ms reads for real-time code completion (latency is critical -- user expects < 500ms), caching recent completions, TTL for session expiration | In-memory only | Loses state on crash, no sharing across IDE instances |
+| Vector store | pgvector or Qdrant | Semantic code search across the repository, finding similar code patterns, retrieving relevant documentation. pgvector for codebases < 500K chunks; Qdrant for large monorepos with payload filtering (filter by language, file path, recency) | Tree-sitter-based AST search only | Works for structural queries but misses semantic similarity -- "find code that handles authentication" requires embeddings |
+| Object storage | S3 | Full repository indexing produces large amounts of data (AST dumps, symbol tables). Store in S3, index metadata in PostgreSQL | Git directly | Too slow for repeated traversal during indexing |
+
+### Schema Design
+
+#### 1. code_sessions -- active coding sessions
+
+```sql
+CREATE TABLE code_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(64) NOT NULL,
+    project_id VARCHAR(128) NOT NULL,
+    ide_type VARCHAR(30) NOT NULL CHECK (ide_type IN ('vscode', 'jetbrains', 'neovim', 'web')),
+    active_file TEXT,
+    cursor_position JSONB,
+    open_files TEXT[],
+    language VARCHAR(30),
+    status VARCHAR(20) DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_sessions_user_project ON code_sessions(user_id, project_id);
+CREATE INDEX idx_sessions_activity ON code_sessions(last_activity_at DESC);
+```
+
+#### 2. code_chunks -- indexed repository code
+
+```sql
+CREATE TABLE code_chunks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id VARCHAR(128) NOT NULL,
+    file_path TEXT NOT NULL,
+    chunk_type VARCHAR(30) NOT NULL CHECK (chunk_type IN ('function', 'class', 'module', 'block', 'comment')),
+    symbol_name TEXT,
+    content TEXT NOT NULL,
+    language VARCHAR(30) NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    embedding vector(1536),
+    ast_hash VARCHAR(64),
+    last_indexed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_chunks_embedding ON code_chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 200);
+CREATE INDEX idx_chunks_project_file ON code_chunks(project_id, file_path);
+CREATE INDEX idx_chunks_symbol ON code_chunks(project_id, symbol_name) WHERE symbol_name IS NOT NULL;
+```
+
+#### 3. completion_history -- past completions for learning
+
+```sql
+CREATE TABLE completion_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID REFERENCES code_sessions(id),
+    prompt_context TEXT NOT NULL,
+    completion TEXT NOT NULL,
+    model VARCHAR(50) NOT NULL,
+    accepted BOOLEAN,
+    edit_distance INTEGER,
+    latency_ms INTEGER NOT NULL,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_completions_session ON completion_history(session_id, created_at DESC);
+CREATE INDEX idx_completions_accepted ON completion_history(accepted, created_at DESC);
+```
+
+### Key Queries
+
+1. **Semantic code search** -- find functions similar to a query (pgvector similarity with language filter)
+2. **Symbol lookup** -- find all definitions and references of a symbol across the project
+3. **Completion acceptance rate** -- analytics on which types of completions users accept
+4. **Stale index detection** -- find files modified since last indexing
+
+---
+
+## Agent Memory Architecture
+
+The code assistant requires a **multi-level memory model with workspace awareness**. Unlike conversational chatbots that track a single thread, the code assistant needs three distinct memory scopes operating at different latency tiers.
+
+### Multi-Level Memory Hierarchy
+
+```mermaid
+graph TB
+    subgraph "Level 1: Immediate Context (in-editor)"
+        CF[Current File]
+        CP[Cursor Position]
+        RE[Recent Edits]
+        OT[Open Tabs]
+    end
+
+    subgraph "Level 2: Project Context (repository)"
+        FS[File Structure]
+        ST[Symbol Table]
+        IG[Imports Graph]
+        TF[Test Files]
+    end
+
+    subgraph "Level 3: User Context (cross-session)"
+        CP2[Coding Patterns]
+        PL[Preferred Libraries]
+        CM[Common Mistakes]
+        ARC[Accepted vs Rejected Completions]
+    end
+
+    subgraph "Storage Backends"
+        Redis2[Redis<br/>< 1ms access]
+        VS[Vector Store + PostgreSQL]
+        PG2[PostgreSQL]
+    end
+
+    CF --> Redis2
+    CP --> Redis2
+    RE --> Redis2
+    OT --> Redis2
+
+    FS --> VS
+    ST --> VS
+    IG --> VS
+    TF --> VS
+
+    CP2 --> PG2
+    PL --> PG2
+    CM --> PG2
+    ARC --> PG2
+
+    style Redis2 fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style VS fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style PG2 fill:#264653,stroke:#2a9d8f,color:#e9c46a
+```
+
+### Memory Scopes
+
+- **Immediate context (in-editor)**: current file, cursor position, recent edits, open tabs. Stored in Redis for < 1ms access. This is the highest-priority, lowest-latency tier -- every completion request reads from it.
+- **Project context (repository)**: file structure, symbol table, imports graph, test files. Indexed in the vector store and PostgreSQL. Updated incrementally on file save events. Queried during context building for both completions and agent tasks.
+- **User context (cross-session)**: coding patterns, preferred libraries, common mistakes, accepted vs rejected completions. Stored in PostgreSQL. Used to personalize suggestions over time -- if a user consistently rejects suggestions using a particular library, the system learns to avoid it.
+
+### Context Window Strategy for Code Completion
+
+Code completion has extreme latency requirements (< 500ms total). Context must be assembled in < 50ms:
+
+| Context Source | Token Budget | Purpose |
+|---------------|-------------|---------|
+| Current file content around cursor | ~2,000 tokens | Immediate syntactic and semantic context |
+| Imported/referenced files (follow imports) | ~1,500 tokens | Type signatures, function contracts |
+| Similar code from the repository (vector search) | ~1,000 tokens | Project-specific patterns and conventions |
+| Recent completions in this session | ~500 tokens | Continuity and consistency |
+| **Total** | **~5,000 tokens** | Small, fast model (GPT-4o-mini or Claude Haiku) |
+
+### Context Window Strategy for Complex Tasks
+
+Refactoring, debugging, and code review have more budget and less latency pressure:
+
+| Context Source | Token Budget | Purpose |
+|---------------|-------------|---------|
+| Full file under review | up to 8,000 tokens | Complete understanding of the file |
+| Related files (imports, tests, callers) | ~4,000 tokens | Cross-file dependencies and impact |
+| Project conventions (linting rules, style guide) | ~500 tokens | Consistency with existing codebase |
+| **Total** | **~12,500 tokens** | GPT-4o or Claude Sonnet |
+
+### Incremental Indexing
+
+The code assistant does not re-index the entire repository on every change. It watches for file system events (save, create, delete) and re-indexes only affected files. Symbol table updates are propagated to dependent files -- if a function signature changes, the indexer re-indexes all callers identified through the dependency graph. Full re-indexing is reserved for initial clone and branch switches.
+
+---
+
+## Hallucination Mitigation
+
+Code generation hallucinations are particularly dangerous because they produce code that looks plausible but is incorrect. The following categories and mitigations address the most common failure modes in production.
+
+### Hallucination Categories
+
+- **API hallucination**: The agent suggests calling functions or methods that do not exist in the codebase or imported libraries. Mitigation: validate all function calls in generated code against the symbol table. If a suggested function does not exist in the project or installed packages, flag it and suggest alternatives from the actual symbol table.
+- **Import hallucination**: The agent suggests importing modules that do not exist. Mitigation: validate import statements against installed packages (check `package.json`, `requirements.txt`, `go.mod`) and the project file structure.
+- **Type mismatch**: The agent generates code with wrong types (e.g., passing a string to a function expecting an integer). Mitigation: use type information from the AST and language server. When generating code, include type signatures of referenced functions in the context.
+- **Outdated API usage**: The agent suggests deprecated or removed API patterns from training data. Mitigation: include the project's dependency versions in context; prefer code patterns already used in the repository (retrieved via vector search) over patterns from training data.
+- **Fabricated test assertions**: When generating tests, the agent may assert against fabricated expected values. Mitigation: for unit test generation, run the code under test with sample inputs and use actual outputs as expected values rather than generating them.
+- **Code that compiles but is logically wrong**: The hardest category to detect. Mitigation: generate test cases alongside code changes; run the existing test suite after applying changes; use static analysis (linting, type checking) as a validation gate.
+
+### Validation Pipeline
+
+Every generated code block passes through a multi-stage validation pipeline before being presented to the developer:
+
+```mermaid
+graph LR
+    Gen[Code Generation] --> Syn[Syntax Check]
+    Syn --> Sym[Symbol Validation]
+    Sym --> Type[Type Check]
+    Type --> Test[Test Execution]
+    Test --> Decision{Pass All?}
+    Decision -->|Yes| Accept[Accept]
+    Decision -->|No| Reject[Reject + Diagnose]
+    Reject --> Gen
+
+    style Gen fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style Accept fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style Reject fill:#e76f51,stroke:#e9c46a,color:#f4a261
+```
+
+Each stage catches a different class of errors:
+- **Syntax Check**: catches malformed code, unclosed brackets, invalid syntax
+- **Symbol Validation**: catches references to non-existent functions, classes, or modules
+- **Type Check**: catches type mismatches, wrong argument counts, incompatible return types
+- **Test Execution**: catches logical errors by running existing and generated tests
+
+If any stage fails, the error is fed back to the generation step with diagnostic context, and the model retries with the failure information included.
+
+---
+
+## Production Issues and Fixes
+
+| Issue | Symptoms | Root Cause | Fix |
+|-------|----------|-----------|-----|
+| High completion rejection rate | > 70% of completions dismissed by users | Context window too small, missing relevant code context | Increase context retrieval to include imported files and recent edits; track acceptance by context type to identify what is missing |
+| Latency spikes on large files | Completion takes > 2s on files with 1000+ lines | Sending entire file to LLM, tokenization overhead | Truncate to 200 lines around cursor; use AST to identify the enclosing function/class and send only that |
+| Index staleness after branch switches | Agent suggests code from wrong branch | File system events not captured during git checkout | Hook into git post-checkout; trigger full re-index on branch switch; invalidate vector store entries for changed files |
+| Memory pressure from large monorepos | OOM errors during indexing, slow vector search | Indexing millions of files, vector store too large | Scope indexing to recently-modified files and files in open editor tabs; use tiered indexing (full for active dirs, metadata-only for others) |
+| Agent suggests patterns inconsistent with codebase | Generated code uses different naming conventions, frameworks | LLM falling back to training data instead of project-specific patterns | Increase weight of repository-retrieved examples in context; add project style guide to system prompt |
+| Completion inserts break existing tests | Code changes pass syntax check but break integration tests | No test-aware validation before suggesting | Run affected tests in background after completion is accepted; warn user if tests fail; suggest fixes |
+| Security vulnerabilities in generated code | Agent generates SQL injection, XSS-prone code | LLM not trained on secure coding practices for this stack | Add security linting (semgrep, bandit) as post-generation validation; reject completions with known vulnerability patterns |
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

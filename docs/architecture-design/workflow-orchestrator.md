@@ -359,6 +359,416 @@ The dominant cost is LLM API usage, which is why per-step and per-workflow budge
 
 ---
 
+## Data Layer Deep Dive
+
+### Database Selection Justification
+
+Each data store in the architecture was chosen for a specific reason tied to the workload it serves. The table below summarizes the selection rationale and the alternatives that were evaluated and rejected.
+
+| Store | Technology | Why This Choice | Alternative Considered | Why Not |
+|-------|-----------|----------------|----------------------|---------|
+| Workflow definitions, execution state, task metadata | PostgreSQL | ACID guarantees for workflow state -- a workflow with 50 steps must have exactly-once execution per step; losing state means re-executing completed steps or skipping steps entirely. JSONB columns for heterogeneous task parameters and results. Advisory locks for distributed coordination when needed | MongoDB | Flexible schema for varied task configurations, but workflow execution is fundamentally a state machine with ordering constraints and foreign key relationships between tasks -- this maps naturally to relational modeling, not document storage |
+| Active workflow execution state, distributed locking | Redis | Sub-millisecond reads for checking if a task is ready to execute; distributed locks for preventing duplicate task execution across workers; pub/sub for notifying workers when upstream tasks complete | ZooKeeper | Stronger consistency guarantees but significantly higher operational complexity; Redis distributed locks with Redlock are sufficient for workflow coordination at this scale, and the team already operates Redis for caching |
+| DAG storage | PostgreSQL (same instance) | Workflow DAGs are stored as adjacency lists (task_id, depends_on). PostgreSQL's recursive CTEs make topological sort queries possible directly in SQL, avoiding application-level graph traversal. Keeping DAGs in the same database as workflow state enables transactional consistency across DAG definition and execution state | Neo4j | Graph database is conceptually better for DAGs, but adds operational complexity for what amounts to a few hundred nodes per workflow -- PostgreSQL handles this fine with adjacency list representation and recursive queries |
+| Task artifacts | S3 (Object Storage) | Large intermediate outputs (data files, generated reports, model checkpoints) passed between tasks. S3 with presigned URLs decouples artifact size from database storage limits and network bandwidth between services | Redis / PostgreSQL passthrough | Not viable for large artifacts; Redis is for metadata and coordination, PostgreSQL is for structured state -- neither is designed for multi-megabyte binary blobs. S3 handles artifacts from kilobytes to gigabytes uniformly |
+
+### Schema Design
+
+The following schemas define the core data model. Each table includes its indexes with justification for why each index exists.
+
+#### workflows
+
+Stores workflow definitions including the DAG structure, trigger configuration, and execution policies.
+
+```sql
+CREATE TABLE workflows (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    dag_definition JSONB NOT NULL,         -- { "nodes": [...], "edges": [...] }
+    trigger_type VARCHAR(20) NOT NULL
+        CHECK (trigger_type IN ('manual', 'scheduled', 'event', 'api')),
+    trigger_config JSONB DEFAULT '{}',     -- cron expression, webhook URL, event filter
+    timeout_seconds INTEGER DEFAULT 3600,
+    max_retries INTEGER DEFAULT 3,
+    created_by VARCHAR(128) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Lookup workflows by creator for management UI
+CREATE INDEX idx_workflows_created_by ON workflows(created_by, created_at DESC);
+
+-- Filter workflows by trigger type for scheduler polling
+CREATE INDEX idx_workflows_trigger_type ON workflows(trigger_type)
+    WHERE trigger_type = 'scheduled';
+```
+
+**Index rationale**:
+- `idx_workflows_created_by` -- The workflow management UI lists all workflows owned by a user sorted by creation date. This composite index serves that query without a sort operation.
+- `idx_workflows_trigger_type` -- The schedule poller queries only scheduled workflows. A partial index reduces scan size by excluding manual, event, and API-triggered workflows.
+
+#### workflow_runs
+
+Tracks each execution instance of a workflow from creation through completion or failure.
+
+```sql
+CREATE TABLE workflow_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workflow_id UUID NOT NULL REFERENCES workflows(id),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'running', 'paused', 'completed',
+                          'failed', 'cancelled', 'timed_out')),
+    trigger_event JSONB,                   -- payload that triggered this run
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    error_message TEXT,
+    total_tasks INTEGER NOT NULL DEFAULT 0,
+    completed_tasks INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 1,    -- optimistic concurrency control
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Dashboard query: all runs for a workflow sorted by recency
+CREATE INDEX idx_workflow_runs_workflow ON workflow_runs(workflow_id, created_at DESC);
+
+-- Active run monitoring: find all currently executing workflows
+CREATE INDEX idx_workflow_runs_status ON workflow_runs(status)
+    WHERE status IN ('running', 'paused');
+
+-- Orphan detection: find running workflows with stale timestamps
+CREATE INDEX idx_workflow_runs_started ON workflow_runs(started_at)
+    WHERE status = 'running';
+```
+
+**Index rationale**:
+- `idx_workflow_runs_workflow` -- The run history page for a workflow loads recent runs. This composite index serves `WHERE workflow_id = ? ORDER BY created_at DESC` as an index-only scan.
+- `idx_workflow_runs_status` -- The monitoring dashboard filters for active workflows. A partial index on running and paused states avoids scanning completed and failed runs, which dominate the table over time.
+- `idx_workflow_runs_started` -- The orphan reaper process scans for running workflows whose `started_at` exceeds the timeout threshold. A partial index on running status keeps this scan efficient as the table grows.
+
+#### tasks
+
+Defines individual task nodes within a workflow, including their type, configuration, and dependencies.
+
+```sql
+CREATE TABLE tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workflow_id UUID NOT NULL REFERENCES workflows(id),
+    task_name VARCHAR(255) NOT NULL,
+    task_type VARCHAR(20) NOT NULL
+        CHECK (task_type IN ('llm_call', 'tool_call', 'human_approval',
+                             'conditional', 'parallel_group', 'sub_workflow')),
+    config JSONB NOT NULL DEFAULT '{}',    -- model, prompt template, tool config, etc.
+    dependencies UUID[] DEFAULT '{}',       -- array of task IDs this depends on
+    timeout_seconds INTEGER DEFAULT 300,
+    retry_policy JSONB DEFAULT '{"max_retries": 3, "backoff": "exponential", "base_delay_seconds": 2}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Load all tasks for a workflow (used during DAG construction)
+CREATE INDEX idx_tasks_workflow ON tasks(workflow_id);
+```
+
+**Index rationale**:
+- `idx_tasks_workflow` -- When a workflow run starts, the scheduler loads all tasks for the workflow to build the in-memory DAG. This index serves `WHERE workflow_id = ?` efficiently.
+
+#### task_runs
+
+Tracks execution instances of individual tasks within a workflow run, including input/output data and artifact references.
+
+```sql
+CREATE TABLE task_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workflow_run_id UUID NOT NULL REFERENCES workflow_runs(id),
+    task_id UUID NOT NULL REFERENCES tasks(id),
+    status VARCHAR(20) NOT NULL DEFAULT 'blocked'
+        CHECK (status IN ('blocked', 'ready', 'running', 'completed',
+                          'failed', 'skipped', 'timed_out')),
+    input_data JSONB,
+    output_data JSONB,
+    artifact_s3_keys TEXT[] DEFAULT '{}',   -- S3 keys for large artifacts
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    worker_id VARCHAR(128),                 -- which worker is executing this task
+    error_message TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Fast task dispatch: find all ready tasks for a workflow run
+CREATE INDEX idx_task_runs_ready ON task_runs(workflow_run_id, status)
+    WHERE status = 'ready';
+
+-- Worker crash recovery: find all tasks assigned to a specific worker
+CREATE INDEX idx_task_runs_worker ON task_runs(worker_id, status)
+    WHERE status = 'running';
+
+-- Join queries: look up task runs by task definition
+CREATE INDEX idx_task_runs_task ON task_runs(task_id);
+
+-- Stuck task detection: running tasks sorted by start time
+CREATE INDEX idx_task_runs_running ON task_runs(started_at)
+    WHERE status = 'running';
+```
+
+**Index rationale**:
+- `idx_task_runs_ready` -- The scheduler's hot loop queries for tasks in 'ready' state for a given workflow run. This partial index contains only ready tasks, keeping the index small as most tasks transition through ready quickly. This is the most frequently executed query in the system.
+- `idx_task_runs_worker` -- When a worker crashes, the recovery process must find all tasks assigned to that worker. The partial index on running status avoids scanning completed task history.
+- `idx_task_runs_task` -- Used for joining task_runs back to task definitions when loading execution state.
+- `idx_task_runs_running` -- The stuck task detector scans for running tasks whose `started_at` exceeds their configured timeout. Partial index on running status keeps this efficient.
+
+### Key Queries
+
+These are the actual queries the system executes in production, not simplified examples.
+
+**1. Get all ready tasks for a workflow run**
+
+Used by the scheduler to dispatch tasks whose dependencies are all completed. This is the most critical query in the system -- it runs every time a task completes to determine what can execute next.
+
+```sql
+SELECT tr.id, tr.task_id, t.task_name, t.task_type, t.config, tr.input_data
+FROM task_runs tr
+JOIN tasks t ON tr.task_id = t.id
+WHERE tr.workflow_run_id = $1
+  AND tr.status = 'ready'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(t.dependencies) AS dep_id
+      JOIN task_runs dep_tr ON dep_tr.task_id = dep_id
+          AND dep_tr.workflow_run_id = $1
+      WHERE dep_tr.status != 'completed'
+  );
+```
+
+The `NOT EXISTS` subquery ensures that every dependency of each candidate task has a corresponding task_run in 'completed' status. Tasks whose dependencies include any non-completed task_run are excluded. The partial index on `task_runs(workflow_run_id, status) WHERE status = 'ready'` makes the outer scan touch only ready tasks.
+
+**2. Workflow execution progress**
+
+Used by the monitoring dashboard to display a progress summary for each running workflow.
+
+```sql
+SELECT
+    tr.status,
+    COUNT(*) AS task_count,
+    MIN(tr.started_at) AS earliest_start,
+    MAX(tr.completed_at) AS latest_completion
+FROM task_runs tr
+WHERE tr.workflow_run_id = $1
+GROUP BY tr.status
+ORDER BY CASE tr.status
+    WHEN 'completed' THEN 1
+    WHEN 'running' THEN 2
+    WHEN 'ready' THEN 3
+    WHEN 'blocked' THEN 4
+    WHEN 'failed' THEN 5
+    WHEN 'skipped' THEN 6
+    WHEN 'timed_out' THEN 7
+END;
+```
+
+The `CASE` ordering presents statuses in a logical progression from done to pending. The dashboard uses this to render a progress bar and status breakdown without multiple queries.
+
+**3. Stuck task detection**
+
+Used by a background health-check process that runs every 30 seconds to find tasks that have been running longer than their configured timeout.
+
+```sql
+SELECT tr.id, tr.task_id, t.task_name, tr.worker_id, tr.started_at,
+       t.timeout_seconds,
+       EXTRACT(EPOCH FROM (now() - tr.started_at)) AS running_seconds
+FROM task_runs tr
+JOIN tasks t ON tr.task_id = t.id
+WHERE tr.status = 'running'
+  AND tr.started_at < now() - (t.timeout_seconds || ' seconds')::INTERVAL;
+```
+
+Tasks exceeding their timeout are marked as 'timed_out' and the workflow's error policy determines the next action. The partial index on `task_runs(started_at) WHERE status = 'running'` keeps this scan efficient across thousands of concurrent workflow runs.
+
+**4. Topological sort of workflow DAG**
+
+Used at workflow creation time to validate that the DAG is acyclic and to compute execution order. Uses a recursive CTE on the task dependency relationship.
+
+```sql
+WITH RECURSIVE topo AS (
+    -- Base case: tasks with no dependencies (entry points)
+    SELECT t.id, t.task_name, 0 AS depth, ARRAY[t.id] AS path
+    FROM tasks t
+    WHERE t.workflow_id = $1
+      AND (t.dependencies IS NULL OR t.dependencies = '{}')
+
+    UNION ALL
+
+    -- Recursive case: tasks whose dependencies are all in the visited set
+    SELECT t.id, t.task_name, topo.depth + 1, topo.path || t.id
+    FROM tasks t
+    JOIN topo ON topo.id = ANY(t.dependencies)
+    WHERE t.workflow_id = $1
+      AND t.id != ALL(topo.path)       -- cycle detection
+      AND NOT EXISTS (
+          SELECT 1 FROM unnest(t.dependencies) AS dep
+          WHERE dep != ALL(
+              SELECT id FROM topo
+          )
+      )
+)
+SELECT id, task_name, depth
+FROM topo
+ORDER BY depth, task_name;
+```
+
+If the number of rows returned is fewer than the total number of tasks in the workflow, the missing tasks are part of a cycle. The workflow is rejected at creation time with an error listing the unreachable tasks.
+
+---
+
+## Agent Memory Architecture
+
+The workflow orchestrator's memory model differs fundamentally from conversational agents. Instead of maintaining a conversation history, the orchestrator's memory is the workflow execution state itself -- which tasks have completed, what their outputs were, and which tasks are ready to run.
+
+### Memory Mode: Execution-Scoped with DAG Awareness
+
+The orchestrator does not maintain a free-form memory. Its memory is structured around the DAG execution state:
+
+1. **Which tasks have completed** -- stored in `task_runs.status`
+2. **What each completed task produced** -- stored in `task_runs.output_data`
+3. **Which tasks are now unblocked** -- derived from dependency resolution queries
+4. **What the accumulated context is** -- assembled from upstream task outputs along DAG edges
+
+This is fundamentally different from a chatbot's sliding-window memory. The orchestrator's memory is a directed graph of typed data flowing along explicit edges, not a linear sequence of messages.
+
+### State Propagation Through the DAG
+
+```mermaid
+graph TD
+    subgraph "DAG Execution with State Propagation"
+        A["Task A: Classify Document<br/>status: completed<br/>output: {type: 'invoice', confidence: 0.95}"]
+        B["Task B: Extract Fields<br/>status: completed<br/>output: {vendor: 'Acme', amount: 1250.00}"]
+        C["Task C: Validate Against Policy<br/>status: running<br/>input: merged(A.output, B.output)"]
+        D["Task D: Route for Approval<br/>status: blocked<br/>waiting on: C"]
+        E["Task E: Send Notification<br/>status: blocked<br/>waiting on: D"]
+
+        A --> C
+        B --> C
+        C --> D
+        D --> E
+    end
+
+    subgraph "State Store"
+        Redis_State["Redis: Hot Execution State<br/>workflow_run:abc123 = {<br/>  active_tasks: ['C'],<br/>  ready_tasks: [],<br/>  completed: ['A', 'B']<br/>}"]
+        PG_State["PostgreSQL: Durable State<br/>task_runs table with<br/>full input/output JSONB"]
+    end
+
+    C -.->|"checkpoint on complete"| PG_State
+    C -.->|"update hot state"| Redis_State
+```
+
+When a task completes, its output becomes available as input to downstream tasks. The orchestrator assembles each task's input by collecting the `output_data` from all upstream tasks (those listed in the task's `dependencies` array) and merging them into the task's `input_data` field. This means a task with three upstream dependencies receives a merged JSON object containing all three outputs.
+
+### Context Window for Orchestration Decisions
+
+When the orchestrator's LLM makes routing or strategy decisions, the context window is deliberately compact:
+
+| Context Component | Token Budget | Source |
+|-------------------|-------------|--------|
+| Workflow DAG structure (nodes, edges, types) | ~500 tokens | `workflows.dag_definition` |
+| Current execution state (task statuses) | ~500 tokens | `task_runs` status summary |
+| Recently completed task outputs | ~1,000 tokens | `task_runs.output_data` for last 3 completed tasks |
+| Pending and blocked tasks | ~500 tokens | `task_runs` WHERE status IN ('ready', 'blocked') |
+| System instructions (routing rules, error policies) | ~500 tokens | Static configuration |
+| **Total per orchestration decision** | **~3,000 tokens** | |
+
+This compact context window is possible because the orchestrator delegates actual work to task executors. The orchestrator only needs enough context to make routing and error-handling decisions -- it never needs the full content of every task output.
+
+### Checkpoint and Resume
+
+The orchestrator checkpoints after every task completion. The checkpoint is not an opaque blob -- it is the structured state in PostgreSQL (`workflow_runs` + `task_runs`).
+
+On crash recovery, the orchestrator:
+1. Loads the `workflow_run` record to determine the workflow and its current status
+2. Loads all `task_runs` for that run to reconstruct the execution state
+3. Identifies tasks in 'ready' status that were never dispatched (or tasks in 'running' that have exceeded their timeout)
+4. Resumes dispatching from exactly where it left off
+
+This is the key advantage of explicit state storage over in-memory execution -- you never re-execute a completed task, and you never lose track of where you are in the DAG.
+
+---
+
+## Hallucination Mitigation
+
+In a workflow orchestrator, hallucinations manifest differently than in conversational agents. The LLM is not generating customer-facing text -- it is making execution decisions. A hallucinated decision can skip required tasks, fabricate outputs, or route workflows incorrectly. The consequences are silent data corruption rather than visible bad responses.
+
+### Hallucination Prevention Pipeline
+
+```mermaid
+graph TB
+    START[Workflow Start] --> V1[DAG Validation<br/>Cycle detection, reachability check]
+    V1 --> V2[Task Readiness Check<br/>Deterministic dependency query]
+    V2 --> V3[Task Dispatch<br/>Assign to worker pool]
+    V3 --> V4[Task Execution<br/>Tool call / LLM call / API call]
+    V4 --> V5[Output Validation<br/>Schema check, non-empty, type match]
+    V5 --> V6[State Update<br/>Checkpoint to PostgreSQL]
+    V6 --> V7{More Tasks<br/>Ready?}
+    V7 -->|Yes| V2
+    V7 -->|No, all complete| DONE[Workflow Complete]
+    V7 -->|No, blocked| WAIT[Wait for Running Tasks]
+    WAIT --> V2
+```
+
+### Layer 1: Task Skip Hallucination
+
+**Risk**: The orchestrator's LLM decides to skip a required task, perhaps because it believes the task is unnecessary or its output can be inferred.
+
+**Mitigation**: DAG enforcement is structural, not LLM-decided. The orchestrator cannot skip a task unless the task is explicitly marked as optional in the workflow definition or a conditional edge evaluates to false (using the deterministic rule engine, not LLM judgment). All tasks in the DAG are mandatory by default. The LLM has no mechanism to remove a task from the execution plan -- it can only influence routing decisions at designated router nodes.
+
+### Layer 2: Dependency Resolution Hallucination
+
+**Risk**: The orchestrator's LLM believes a task's dependencies are satisfied when they are not -- for example, deciding that a validation task can run before the data extraction task has completed.
+
+**Mitigation**: Dependency checking is a deterministic SQL query, not an LLM decision. The query checks `SELECT FROM task_runs WHERE task_id IN (dependencies) AND status = 'completed'` -- if any dependency is not in 'completed' status, the task remains blocked. The LLM orchestrates high-level strategy; the database enforces execution order. There is no code path where the LLM can override a dependency check.
+
+### Layer 3: Output Fabrication
+
+**Risk**: The orchestrator's LLM fabricates a task output instead of actually executing the task -- for example, generating a plausible-looking JSON result without calling the underlying tool or API.
+
+**Mitigation**: Task outputs come from actual task execution results (tool calls, LLM responses, API calls), not from the orchestrator's decision-making LLM. The system validates that `task_run.output_data` was set by the task executor process, not by the orchestrator. Each task executor writes its output with a cryptographic attestation (a hash of the execution trace) that the orchestrator cannot forge. If `output_data` is present without a corresponding execution record, the task_run is flagged and the workflow pauses for investigation.
+
+### Layer 4: Incorrect Conditional Routing
+
+**Risk**: In conditional workflows (if-then-else branches), the orchestrator's LLM routes the workflow to the wrong branch -- for example, sending a low-risk document to the manual review path or skipping compliance checks for a high-value transaction.
+
+**Mitigation**: Conditional evaluation is deterministic wherever possible. Condition expressions are evaluated against task outputs using a rule engine that supports comparison operators, threshold checks, and pattern matching. Only genuinely ambiguous routing decisions (where rules cannot capture the logic) go to the LLM, and those decisions are logged with full context for audit. The rule engine handles the common cases; the LLM handles the edge cases.
+
+### Layer 5: Timeout Mismanagement
+
+**Risk**: The orchestrator's LLM decides to extend the timeout on a stuck task instead of failing it, effectively preventing the workflow from progressing through its error-handling path.
+
+**Mitigation**: Timeout enforcement is handled by a background worker process, not the LLM. When a task exceeds its configured `timeout_seconds`, the background process marks it as 'timed_out' regardless of what the orchestrator's LLM thinks. The LLM cannot modify timeout values at runtime -- they are set in the task definition and enforced by infrastructure. This separation of concerns ensures that a hallucinating LLM cannot keep a stuck workflow alive indefinitely.
+
+:::warning Critical Design Principle
+The orchestrator's LLM makes strategy decisions (which route to take at a router node, how to handle an ambiguous error). It does not make execution decisions (whether a task's dependencies are met, whether a task has timed out, whether a task should be skipped). Execution decisions are deterministic and enforced by code and database queries. This boundary is the primary defense against orchestration hallucinations.
+:::
+
+---
+
+## Production Issues and Fixes
+
+The following table documents production issues observed in workflow orchestrator deployments, their root causes, and the fixes applied. These are the issues that dominate on-call rotations but do not appear in architecture diagrams.
+
+| Issue | Symptoms | Root Cause | Fix |
+|-------|----------|-----------|-----|
+| Circular dependency in DAG causes infinite wait | Workflow run stays in 'running' state indefinitely; some tasks remain permanently 'blocked'; no error raised | A cycle was introduced in the DAG definition (Task A depends on Task C, which depends on Task B, which depends on Task A). The scheduler waits for dependencies that can never be satisfied | Validate DAG for cycles at workflow creation time using topological sort (the recursive CTE query above). Reject workflows with cycles before they can be saved. Add a runtime safety check: if no task transitions from 'blocked' to 'ready' for 5 minutes and tasks remain blocked, flag the workflow for investigation |
+| Task retry storm overwhelms downstream services | Downstream API returns 429 (rate limited) or 503; multiple tasks retrying simultaneously amplify the load; cascading failures across workflows sharing the same downstream service | A transient downstream failure triggers retries across dozens of concurrent workflows simultaneously. Linear or fixed-delay retries create thundering herd on recovery | Exponential backoff with jitter on all retries (`base_delay * 2^attempt + random(0, base_delay)`). After max retries, mark the task as failed and evaluate DAG continuation rules: fail-fast (terminate workflow) vs. best-effort (skip failed task if downstream tasks can proceed without its output). Add per-service circuit breakers shared across all workflows |
+| Parallel task resource contention | Worker pool saturated; task queue depth grows; scheduling latency exceeds SLA; some workflows starve while one workflow with a 50-task fan-out consumes all workers | A single workflow with a large parallel fan-out dispatches all its tasks simultaneously, consuming the entire worker pool and starving other workflows | Implement per-workflow concurrency limits (e.g., max 10 parallel tasks per workflow run). Prioritize tasks on the critical path of the DAG (longest remaining path to completion) over tasks on non-critical branches. Add a global fairness scheduler that round-robins across workflows rather than processing one workflow's queue exhaustively |
+| Workflow state corruption from concurrent updates | `completed_tasks` counter is incorrect (shows 12 but only 10 tasks are actually completed); workflow marked 'completed' prematurely; downstream systems receive incomplete results | Two task completions arrive simultaneously and both read the same `version` value before updating; one update overwrites the other (lost update problem) | Optimistic concurrency control using the `version` column: every update includes `WHERE version = $expected_version` and increments the version. If the update affects 0 rows, the operation retries by re-reading the current state. This serializes concurrent updates without database-level locks that would reduce throughput |
+| Long-running sub-workflow blocks parent | Parent workflow run exceeds its timeout because a sub-workflow is stuck or running slowly; the parent cannot proceed or fail gracefully | Sub-workflow timeout was not configured independently; it inherited the parent's remaining time budget, which was insufficient for the sub-workflow's complexity | Configure sub-workflow timeouts independently of the parent. The parent tracks the sub-workflow as a single task with its own timeout. If the sub-workflow times out, the parent's error policy handles it like any other timed-out task -- route to a timeout-handling branch, retry, or fail the parent workflow |
+| Large artifact transfer between tasks saturates network and database | PostgreSQL disk usage spikes; replication lag increases; task completion latency degrades from 100ms to 5+ seconds | Intermediate task outputs (generated reports, data files, model checkpoints) stored directly in `task_runs.output_data` as base64-encoded JSONB. A 50MB report encoded as base64 becomes 67MB of JSONB, bloating WAL writes and replication | Use S3 presigned URLs for artifact transfer. Task executors upload artifacts to S3 and store only the S3 key in `task_runs.artifact_s3_keys`. Downstream tasks download artifacts via presigned URLs. Set a size threshold (1MB): outputs below the threshold go in `output_data` JSONB; outputs above go to S3. This keeps PostgreSQL lean while preserving small outputs inline for query convenience |
+| Orphaned workflow runs after orchestrator crash | Workflow runs stuck in 'running' state with no progress; tasks remain in 'running' status indefinitely; no worker is processing them; manual intervention required to recover each stuck workflow | The orchestrator instance crashed (OOM, hardware failure, deployment) while workflows were in progress. No other instance picks up the orphaned workflows because there is no heartbeat or lease mechanism | Implement a background reaper process that runs every 60 seconds. It queries for `workflow_runs` in 'running' status whose last state change (max `task_runs.completed_at` or `workflow_runs.started_at`) is older than 5 minutes. Orphaned runs are re-assigned to an active orchestrator instance via leader election. The new orchestrator loads the full execution state from PostgreSQL and resumes from the last checkpoint. Add a heartbeat column to `workflow_runs` updated every 30 seconds by the owning orchestrator |
+
+:::tip Operational Readiness
+Before launching a workflow orchestrator, build runbooks for each issue in this table. The first month of production will surface at least three of these problems -- particularly the retry storm, concurrent state corruption, and orphaned workflow issues. Having pre-written runbooks with specific metric thresholds (queue depth > 1000, version conflict rate > 5%, orphan age > 5 minutes) and remediation steps reduces mean time to resolution from hours to minutes.
+:::
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

@@ -372,6 +372,283 @@ The most insidious failure mode is **hallucinated citations** -- where the agent
 
 ---
 
+## Data Layer Deep Dive
+
+### Database Selection Justification
+
+| Store | Technology | Why This Choice | Alternative Considered | Why Not |
+|-------|-----------|----------------|----------------------|---------|
+| Research sessions and citation graph | PostgreSQL | ACID guarantees for citation integrity (you cannot lose a citation link), rich querying for cross-referencing claims across sources, JSONB for heterogeneous source metadata | MongoDB | Schema flexibility is nice for varied source types, but citation graph queries are relational in nature -- joins across claims, sources, and citations map naturally to SQL |
+| Research progress state | Redis | Sub-ms reads for real-time progress updates, pub/sub for streaming progress to the UI | Polling PostgreSQL | Adds latency, database load for what is essentially a live status display |
+| Source embeddings | pgvector or Qdrant | Semantic search across previously retrieved sources, deduplication of similar sources. pgvector if running < 500K chunks; Qdrant if you need advanced payload filtering (e.g., filter by source type, date range, credibility score simultaneously) | Pinecone | Managed, but more expensive; research agent's vector store is transient per task, not a permanent index |
+| Raw source content | S3 (Object Storage) | PDFs, HTML snapshots, full articles are too large for database columns. Store raw content in S3, metadata and chunks in PostgreSQL/vector store | PostgreSQL TEXT columns | Works for small documents, but large PDFs bloat the database and slow backups |
+
+### Schema Design
+
+#### research_sessions -- tracks each research task
+
+```sql
+CREATE TABLE research_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(64) NOT NULL,
+    query TEXT NOT NULL,
+    depth_mode VARCHAR(20) NOT NULL CHECK (depth_mode IN ('quick', 'standard', 'deep')),
+    status VARCHAR(20) NOT NULL DEFAULT 'planning' CHECK (status IN ('planning', 'searching', 'analyzing', 'verifying', 'writing', 'completed', 'failed')),
+    plan JSONB,
+    findings JSONB DEFAULT '[]',
+    token_budget INTEGER NOT NULL DEFAULT 50000,
+    tokens_used INTEGER DEFAULT 0,
+    cost_usd NUMERIC(10, 6) DEFAULT 0,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX idx_sessions_user ON research_sessions(user_id, started_at DESC);
+CREATE INDEX idx_sessions_status ON research_sessions(status) WHERE status != 'completed';
+```
+
+#### sources -- raw source documents
+
+```sql
+CREATE TABLE sources (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES research_sessions(id),
+    url TEXT,
+    title TEXT,
+    source_type VARCHAR(30) NOT NULL CHECK (source_type IN ('web', 'academic', 'internal_kb', 'structured_data')),
+    raw_content_s3_key TEXT,
+    content_hash VARCHAR(64),
+    credibility_score NUMERIC(3, 2),
+    retrieved_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX idx_sources_dedup ON sources(session_id, content_hash);
+CREATE INDEX idx_sources_session ON sources(session_id);
+```
+
+#### claims -- atomic claims extracted from sources
+
+```sql
+CREATE TABLE claims (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES research_sessions(id),
+    claim_text TEXT NOT NULL,
+    source_id UUID NOT NULL REFERENCES sources(id),
+    chunk_index INTEGER,
+    confidence NUMERIC(3, 2),
+    verification_status VARCHAR(20) DEFAULT 'unverified' CHECK (verification_status IN ('unverified', 'verified', 'contradicted', 'unsupported')),
+    supporting_sources UUID[] DEFAULT '{}',
+    contradicting_sources UUID[] DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_claims_session ON claims(session_id);
+CREATE INDEX idx_claims_verification ON claims(verification_status) WHERE verification_status != 'verified';
+```
+
+#### citations -- links between report statements and source evidence
+
+```sql
+CREATE TABLE citations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES research_sessions(id),
+    report_section VARCHAR(50),
+    statement_text TEXT NOT NULL,
+    claim_id UUID REFERENCES claims(id),
+    source_id UUID NOT NULL REFERENCES sources(id),
+    source_quote TEXT,
+    page_number INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_citations_session ON citations(session_id);
+```
+
+### Key Queries
+
+**Get all verified claims for a session with their sources:**
+
+```sql
+SELECT c.claim_text, c.confidence, s.title, s.url, s.source_type, s.credibility_score
+FROM claims c
+JOIN sources s ON c.source_id = s.id
+WHERE c.session_id = :session_id
+  AND c.verification_status = 'verified'
+ORDER BY c.confidence DESC;
+```
+
+**Find contradicted claims -- claims where contradicting_sources is not empty:**
+
+```sql
+SELECT c.claim_text, c.confidence, c.contradicting_sources,
+       s.title AS original_source, s.url AS original_url
+FROM claims c
+JOIN sources s ON c.source_id = s.id
+WHERE c.session_id = :session_id
+  AND c.verification_status = 'contradicted'
+  AND array_length(c.contradicting_sources, 1) > 0;
+```
+
+**Citation completeness check -- find report statements without citation backing:**
+
+```sql
+SELECT ct.statement_text, ct.report_section
+FROM citations ct
+LEFT JOIN claims cl ON ct.claim_id = cl.id
+WHERE ct.session_id = :session_id
+  AND ct.claim_id IS NULL;
+```
+
+**Source diversity check -- count distinct source types per session:**
+
+```sql
+SELECT s.source_type, COUNT(DISTINCT s.id) AS source_count,
+       AVG(s.credibility_score) AS avg_credibility
+FROM sources s
+WHERE s.session_id = :session_id
+GROUP BY s.source_type
+ORDER BY source_count DESC;
+```
+
+---
+
+## Agent Memory Architecture
+
+The research agent's memory model differs fundamentally from a conversational chatbot. A chatbot maintains a running dialogue history across turns; a research agent accumulates evidence across multiple search-analyze cycles within a single task.
+
+### Memory Modes
+
+- **Task-scoped with progressive accumulation.** The research agent's memory grows during a single task, not across sessions. It accumulates findings, sources, and claims over multiple search-analyze cycles. When the task completes, its working memory is discarded; only the final report and citation graph persist in the database.
+
+### Working Memory
+
+The current research plan, active sub-questions, and recently retrieved chunks. Stored in Redis for fast access by the orchestrator. This is the agent's "scratchpad" -- the information it needs right now to decide what to do next. Working memory is updated at the end of each cycle and evicted when the task completes.
+
+### Episodic Memory
+
+Each search-analyze cycle produces a "research note" -- a structured summary of what was found, what was useful, and what gaps remain. These notes form the agent's memory of what it has already tried, preventing redundant searches. For example, if the agent searched for "transformer architecture performance benchmarks" in cycle 1 and found three relevant papers, the research note records this so cycle 2 does not repeat the same query.
+
+### Semantic Memory
+
+All retrieved source chunks are embedded and stored in the vector store. When the agent searches for new information, it first checks semantic similarity against already-retrieved chunks to avoid re-processing duplicate content. The deduplication threshold is cosine similarity > 0.92 -- chunks above this threshold are considered duplicates and skipped.
+
+### Context Window Strategy
+
+The research agent faces a unique challenge -- it must synthesize information from many sources, but the context window is limited. The allocation strategy per LLM call is:
+
+| Component | Token Allocation |
+|-----------|-----------------|
+| Research plan | ~500 tokens |
+| Current sub-question + retrieved chunks (top 5) | ~3,000 tokens |
+| Research notes from prior cycles (summarized) | ~1,500 tokens |
+| System prompt + tools | ~1,000 tokens |
+| **Total per step** | **~6,000 tokens** |
+
+The key insight is that research notes are incrementally summarized -- raw findings are processed into structured notes, which are later condensed into the final report sections. This prevents context window overflow while preserving the essential information from every cycle.
+
+### Memory Flow Across Research Cycles
+
+```mermaid
+graph TD
+    subgraph "Cycle 1"
+        S1[Search Sources] --> E1[Extract Chunks]
+        E1 --> A1[Analyze Findings]
+        A1 --> N1[Research Note 1]
+    end
+
+    subgraph "Cycle 2"
+        N1 --> WM2[Working Memory<br/>Plan + Note 1]
+        WM2 --> S2[Search Sources<br/>Dedup against Semantic Memory]
+        S2 --> E2[Extract Chunks]
+        E2 --> A2[Analyze Findings]
+        A2 --> N2[Research Note 2]
+    end
+
+    subgraph "Cycle 3"
+        N1 --> WM3[Working Memory<br/>Plan + Notes 1-2 Summarized]
+        N2 --> WM3
+        WM3 --> S3[Search Sources<br/>Dedup against Semantic Memory]
+        S3 --> E3[Extract Chunks]
+        E3 --> A3[Analyze Findings]
+        A3 --> N3[Research Note 3]
+    end
+
+    subgraph "Synthesis"
+        N1 --> SYN[Synthesize All Notes<br/>Into Report Sections]
+        N2 --> SYN
+        N3 --> SYN
+        SYN --> Report[Final Report]
+    end
+
+    subgraph "Persistent Stores"
+        E1 --> VS[(Vector Store<br/>Semantic Memory)]
+        E2 --> VS
+        E3 --> VS
+        N1 --> Redis[(Redis<br/>Working Memory)]
+        N2 --> Redis
+        N3 --> Redis
+    end
+
+    style Report fill:#264653,stroke:#2a9d8f,color:#e9c46a
+```
+
+---
+
+## Hallucination Mitigation
+
+Research agents face hallucination risks that are distinct from and more dangerous than those in conversational AI. A chatbot hallucination is usually obviously wrong to the user. A research agent hallucination -- a fabricated citation, an invented statistic, a misattributed claim -- can be invisible because it looks exactly like a real finding.
+
+### Citation Fabrication Prevention
+
+The biggest hallucination risk. The agent must not invent sources. Mitigation: every citation in the final report must map to an entry in the citations table, which itself must reference a real source with a verifiable URL. The verification pipeline checks that the source was actually retrieved and that the cited quote appears in the source content (fuzzy match with Levenshtein-based threshold of 0.85). If a citation cannot be traced back to a retrieved source, it is stripped from the report and the corresponding claim is flagged as unsupported.
+
+### Claim Verification Pipeline
+
+Each claim extracted from a source is cross-referenced against other sources:
+
+- Claims supported by 2+ independent sources are marked **verified**.
+- Claims with no corroboration from other sources are marked **unsupported** and flagged in the report with an explicit disclaimer.
+- Claims contradicted by other sources are marked **contradicted** and presented as contested findings with evidence from both sides.
+
+### Grounding Enforcement
+
+The synthesis agent (which combines findings into prose) receives only the structured claims and citations as input -- NOT the raw source text. This forces the agent to generate from verified claims rather than hallucinating from training data. The system prompt explicitly states: "Every statement in the report must be backed by a claim ID. Do not add information beyond what is in the provided claims."
+
+### Confidence Scoring
+
+Each section of the report receives a confidence score based on: number of supporting sources, source credibility scores, and claim verification status. Sections with confidence below 0.5 are flagged with a warning: "This finding has limited supporting evidence."
+
+### Anti-Plagiarism Check
+
+The report writer is instructed to synthesize, not copy. Cosine similarity between report sentences and source chunks is computed; any sentence with similarity > 0.95 to a source is flagged as potential plagiarism and rewritten. This ensures the report is original synthesis rather than copy-paste from sources.
+
+### Hallucination Mitigation Pipeline
+
+```mermaid
+graph LR
+    Source[Source Content] --> CE[Claim Extraction<br/>Extract atomic claims<br/>with source references]
+    CE --> CV[Cross-Verification<br/>Compare claims across<br/>independent sources]
+    CV --> Synth[Synthesis<br/>Generate prose from<br/>verified claims only]
+    Synth --> CitV[Citation Verification<br/>Verify every citation<br/>maps to real source]
+    CitV --> AP[Anti-Plagiarism<br/>Check similarity to<br/>source text]
+    AP --> Report[Final Report<br/>With confidence scores<br/>and flagged sections]
+
+    style Source fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style Report fill:#264653,stroke:#2a9d8f,color:#e9c46a
+```
+
+---
+
+## Production Issues and Fixes
+
+| Issue | Symptoms | Root Cause | Fix |
+|-------|----------|-----------|-----|
+| Research loops on broad topics | Agent keeps searching without converging; token spend climbs linearly without quality improvement | Query too broad, no stopping criteria beyond iteration cap | Implement convergence detection: if last 3 search cycles found < 5% new unique claims, stop and synthesize with available findings |
+| Source quality degradation | Report includes unreliable blog posts alongside academic papers; user trust erodes | No source credibility filtering; all sources treated as equally authoritative | Add credibility scoring: academic papers > established media > blogs; weight claims by source credibility in verification and synthesis |
+| Token budget exhaustion before synthesis | Agent spends entire budget on search and extraction, with no tokens remaining for report generation | No budget allocation per phase; search phase consumes tokens greedily | Reserve 30% of budget for synthesis and report writing; enforce phase-specific budget limits with hard caps per phase |
+| Duplicate sources inflating findings | Same information counted as corroboration from multiple sources; artificially high confidence scores | Same article retrieved from different URLs (mirrors, aggregators, syndication) | Content deduplication using content_hash on raw text; deduplicate before counting corroboration sources |
+| Contradictory findings without resolution | Report presents contradictions without analysis; user left to resolve conflicting information | Agent does not compare claims across sources; contradictions pass through silently | Add contradiction detection step: compare claims pairwise using NLI model (entailment/contradiction/neutral); present contradictions explicitly with evidence from both sides |
+| Stale academic paper references | Agent cites retracted or superseded papers; findings based on discredited research | No recency or retraction status checking for academic sources | Add retraction database check (Retraction Watch API); prefer recent publications; flag papers older than 5 years with a recency warning |
+| Slow deep research exceeding timeout | 15-minute research tasks timing out at the infrastructure level; users receive no results | Too many sequential search-analyze cycles; each cycle blocks on the previous one | Parallelize independent sub-question searches; set per-cycle time limit of 3 minutes; synthesize with whatever is available at timeout rather than failing |
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

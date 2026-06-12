@@ -279,6 +279,387 @@ At a SaaS pricing of $3-5 per million spans, the platform achieves healthy margi
 
 ---
 
+## Data Layer Deep Dive
+
+### Database Selection Justification
+
+| Database | Use Case | Why This Choice | Alternative Considered | Why Not the Alternative |
+|----------|----------|----------------|----------------------|------------------------|
+| **ClickHouse** | Logs, metrics, alert event history | Columnar storage for fast aggregation queries (99th percentile latency, error rate trends). Excellent compression ratio (10-20x for log data). MergeTree engine for time-series data with automatic TTL-based data eviction. Handles both structured queries and text search via `hasToken()` and `hasSubstring()` functions. | Elasticsearch | Good for full-text log search but expensive at scale -- ClickHouse handles both structured queries and text search with lower resource usage. Elasticsearch requires significantly more memory and CPU for equivalent query throughput on structured aggregations. |
+| **PostgreSQL** | Metadata, alert rules, dashboard definitions, user configuration | ACID guarantees for alert rule management -- cannot lose an alert configuration mid-update. Rich querying for rule evaluation. Schema enforcement for configuration integrity. Built-in audit trail via triggers. | Config files (YAML/JSON) | No audit trail, hard to manage across multiple instances, no version history, no transactional updates. A misconfigured YAML file can silently break alerting for all tenants. |
+| **Redis** | Real-time alert state, metric caching, live dashboard feeds | Sub-millisecond reads for current alert states. Sorted sets for top-N computations (top 10 slowest endpoints). Pub/sub for real-time dashboard updates without polling. Atomic counter increments for rate metrics. | Polling ClickHouse directly | Too slow for real-time dashboards (ClickHouse query latency is 100ms-2s, not sub-ms). Adds unnecessary query load to the analytical cluster. Cannot support push-based dashboard updates. |
+| **Object Storage (S3)** | Long-term log and trace archival | Cold storage for compliance -- retain logs for 90 days in hot storage, 1 year in cold. Glacier lifecycle policies for cost optimization. Virtually unlimited capacity at $0.023/GB/month (Standard) or $0.004/GB/month (Glacier). | Keeping everything in ClickHouse | Prohibitively expensive at petabyte scale. ClickHouse storage on SSDs costs 10-50x more per GB than S3. Older data is rarely queried and does not justify fast storage. |
+
+### Schema Design
+
+#### Logs Table (ClickHouse -- MergeTree)
+
+```sql
+CREATE TABLE logs
+(
+    timestamp       DateTime64(3),
+    service_name    LowCardinality(String),
+    log_level       LowCardinality(String),
+    trace_id        String,
+    span_id         String,
+    message         String,
+    attributes      Map(String, String),
+
+    -- Materialized columns for fast filtering
+    INDEX idx_trace_id trace_id TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_message message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (service_name, timestamp)
+TTL timestamp + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;
+```
+
+**Design choices:**
+- `ORDER BY (service_name, timestamp)` -- the most common query pattern is "show me logs for service X in the last N hours." Ordering by service name first clusters all logs for a service together, then ordering by timestamp within that cluster enables fast time-range scans. ClickHouse can skip entire granules that do not match the service name.
+- `LowCardinality(String)` for `service_name` and `log_level` -- these columns have few distinct values (tens of services, five log levels). LowCardinality uses dictionary encoding, reducing storage by 5-10x and speeding up filtering.
+- `PARTITION BY toYYYYMMDD(timestamp)` -- one partition per day. TTL drops entire partitions when they expire (90 days), which is an O(1) metadata operation rather than row-by-row deletion.
+- `bloom_filter` index on `trace_id` -- enables fast point lookups for trace correlation ("show me all logs for trace abc-123") without adding trace_id to the ORDER BY key.
+- `tokenbf_v1` index on `message` -- token-level bloom filter that accelerates `hasToken()` text search queries without the overhead of a full inverted index.
+- `Map(String, String)` for `attributes` -- flexible key-value storage for arbitrary metadata (user_id, request_id, deployment_version) without schema migration when new attributes are added.
+
+#### Metrics Table (ClickHouse -- AggregatingMergeTree)
+
+```sql
+CREATE TABLE metrics
+(
+    timestamp       DateTime,
+    metric_name     LowCardinality(String),
+    service_name    LowCardinality(String),
+    value           Float64,
+    labels          Map(String, String)
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (metric_name, service_name, timestamp)
+TTL timestamp + INTERVAL 90 DAY;
+
+-- Pre-aggregated rollups via materialized view
+CREATE MATERIALIZED VIEW metrics_1m_rollup
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMMDD(timestamp_bucket)
+ORDER BY (metric_name, service_name, timestamp_bucket)
+AS SELECT
+    toStartOfMinute(timestamp)    AS timestamp_bucket,
+    metric_name,
+    service_name,
+    avgState(value)               AS avg_value,
+    maxState(value)               AS max_value,
+    minState(value)               AS min_value,
+    quantileState(0.95)(value)    AS p95_value,
+    quantileState(0.99)(value)    AS p99_value,
+    countState()                  AS sample_count
+FROM metrics
+GROUP BY metric_name, service_name, timestamp_bucket;
+```
+
+**Design choices:**
+- `AggregatingMergeTree` for the materialized view -- stores partially aggregated states (not final values) so that ClickHouse can merge states from multiple parts efficiently. This enables 1-minute rollups to be queried over arbitrary time ranges with sub-second latency.
+- The raw `metrics` table uses `MergeTree` (not AggregatingMergeTree) to preserve individual data points for ad-hoc analysis and precise percentile calculations over short time windows.
+- Materialized view runs automatically on insert -- every metric written to the raw table is simultaneously aggregated into the rollup. No separate batch job required.
+
+#### Alert Rules Table (PostgreSQL)
+
+```sql
+CREATE TABLE alert_rules (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                  VARCHAR(255) NOT NULL,
+    query                 TEXT NOT NULL,
+    condition             VARCHAR(20) NOT NULL CHECK (condition IN ('above', 'below', 'anomaly')),
+    threshold             DOUBLE PRECISION NOT NULL,
+    window_minutes        INTEGER NOT NULL CHECK (window_minutes BETWEEN 1 AND 1440),
+    severity              VARCHAR(20) NOT NULL CHECK (severity IN ('critical', 'warning', 'info')),
+    notification_channels JSONB NOT NULL DEFAULT '[]',
+    is_active             BOOLEAN NOT NULL DEFAULT true,
+    last_triggered_at     TIMESTAMPTZ,
+    created_by            VARCHAR(255) NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_alert_rules_active ON alert_rules (is_active) WHERE is_active = true;
+CREATE INDEX idx_alert_rules_severity ON alert_rules (severity);
+```
+
+**Design choices:**
+- PostgreSQL for ACID guarantees -- an alert rule update (change threshold + change notification channel) must be atomic. A partial update could cause alerts to fire to the wrong channel or with the wrong threshold.
+- `CHECK` constraints on `condition` and `severity` -- enforce valid values at the database level, not just the application level. Prevents invalid alert rules from being created via API bugs.
+- `JSONB` for `notification_channels` -- allows flexible channel configuration (Slack, PagerDuty, email, webhooks) without a separate join table. Supports queries like "find all rules that notify the #incidents Slack channel."
+- Partial index on `is_active = true` -- the alert evaluation engine only queries active rules. The partial index keeps the index small and fast even as deactivated rules accumulate.
+
+#### Alert Events Table (ClickHouse)
+
+```sql
+CREATE TABLE alert_events
+(
+    timestamp          DateTime64(3),
+    rule_id            UUID,
+    rule_name          LowCardinality(String),
+    severity           LowCardinality(String),
+    value              Float64,
+    threshold          Float64,
+    status             LowCardinality(String),  -- 'firing' or 'resolved'
+    notification_sent  Bool,
+
+    INDEX idx_rule_id rule_id TYPE bloom_filter(0.01) GRANULARITY 1
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMMDD(timestamp)
+ORDER BY (severity, timestamp)
+TTL timestamp + INTERVAL 365 DAY;
+```
+
+**Design choices:**
+- ClickHouse (not PostgreSQL) for alert events -- alert history is append-only, high-volume, and queried analytically ("how many critical alerts fired last month?", "what is the mean time to resolution?"). ClickHouse handles this pattern orders of magnitude better than PostgreSQL.
+- `ORDER BY (severity, timestamp)` -- the most common query is "show me recent critical alerts." Ordering by severity first clusters critical alerts together for fast retrieval.
+- 365-day TTL -- alert history is kept longer than raw logs (90 days) because it is lower volume and valuable for trend analysis and compliance audits.
+
+### Key Queries
+
+#### 1. Log Search with Full-Text Filtering
+
+```sql
+-- Find error logs containing "timeout" for the payment service in the last hour
+SELECT
+    timestamp,
+    log_level,
+    trace_id,
+    message,
+    attributes['request_id'] AS request_id
+FROM logs
+WHERE service_name = 'payment-service'
+  AND timestamp >= now() - INTERVAL 1 HOUR
+  AND log_level = 'ERROR'
+  AND hasToken(message, 'timeout')
+ORDER BY timestamp DESC
+LIMIT 100;
+```
+
+`hasToken()` splits the message into tokens by non-alphanumeric characters and checks for an exact token match. It leverages the `tokenbf_v1` bloom filter index to skip granules that definitely do not contain the token, making it significantly faster than `LIKE '%timeout%'` which must scan every row.
+
+#### 2. Percentile Latency Calculation
+
+```sql
+-- Calculate p50, p95, p99 latency for each service over the last 24 hours
+SELECT
+    service_name,
+    quantile(0.50)(value) AS p50_ms,
+    quantile(0.95)(value) AS p95_ms,
+    quantile(0.99)(value) AS p99_ms,
+    count()               AS request_count
+FROM metrics
+WHERE metric_name = 'http_request_duration_ms'
+  AND timestamp >= now() - INTERVAL 24 HOUR
+GROUP BY service_name
+ORDER BY p99_ms DESC;
+```
+
+ClickHouse's `quantile()` function uses the t-digest algorithm for approximate percentile calculation with high accuracy (< 1% error at the extremes). For pre-aggregated data from the materialized view, `quantileMerge()` combines the stored quantile states.
+
+#### 3. Error Rate Trend
+
+```sql
+-- Error rate per 5-minute bucket for the last 6 hours
+SELECT
+    toStartOfFiveMinutes(timestamp) AS bucket,
+    service_name,
+    countIf(log_level = 'ERROR') AS error_count,
+    count()                       AS total_count,
+    round(countIf(log_level = 'ERROR') / count() * 100, 2) AS error_rate_pct
+FROM logs
+WHERE timestamp >= now() - INTERVAL 6 HOUR
+GROUP BY bucket, service_name
+ORDER BY bucket ASC, error_rate_pct DESC;
+```
+
+Time-bucketed aggregation using `toStartOfFiveMinutes()` aligns all timestamps to 5-minute boundaries for consistent trend visualization. The `countIf()` function avoids a separate subquery or CASE statement, keeping the query plan simple and fast.
+
+#### 4. Alert Rule Evaluation
+
+```sql
+-- Check if the average error rate over the last 5 minutes exceeds the threshold
+-- This query is run by the alert evaluation engine every 60 seconds for each active rule
+SELECT
+    avg(value) AS current_value
+FROM metrics
+WHERE metric_name = 'http_error_rate'
+  AND service_name = 'payment-service'
+  AND timestamp >= now() - INTERVAL 5 MINUTE;
+
+-- The alert engine compares current_value against the rule's threshold:
+-- If condition = 'above' AND current_value > threshold -> fire alert
+-- If condition = 'below' AND current_value < threshold -> fire alert
+-- If condition = 'anomaly' -> compare against rolling 7-day baseline +/- 3 std deviations
+```
+
+The alert evaluation engine runs on a 60-second loop, querying ClickHouse for each active rule's metric over its configured time window. For the `anomaly` condition, it computes the rolling baseline from the `metrics_1m_rollup` materialized view (7-day average and standard deviation for the same hour-of-day) and fires when the current value deviates by more than 3 standard deviations.
+
+---
+
+## Agent Memory Architecture
+
+The observability agent operates in an event-driven mode with anomaly context -- unlike conversational agents, it does not maintain dialogue history. Instead, it processes continuous streams of metrics, logs, and traces to detect anomalies and investigate their root causes.
+
+### Memory Tiers
+
+```mermaid
+graph LR
+    subgraph "Short-Term Memory (Redis)"
+        A1[Current Alert States]
+        A2[Recent Metric Values<br/>Last 5 Minutes]
+        A3[Active Investigation<br/>Context]
+    end
+
+    subgraph "Medium-Term Memory (PostgreSQL)"
+        B1[Baseline Metric Values<br/>Rolling 7-Day Averages]
+        B2[Recent Incident History<br/>Last 30 Days]
+        B3[Service Dependency<br/>Graph]
+    end
+
+    subgraph "Long-Term Memory (ClickHouse)"
+        C1[Historical Anomaly<br/>Patterns]
+        C2[Seasonal Baselines<br/>Day-of-Week, Hour-of-Day]
+        C3[Capacity Planning<br/>Data]
+    end
+
+    subgraph "Anomaly Memory (Vector Store)"
+        D1[Embedded Past Anomalies<br/>+ Resolutions]
+        D2[Similarity Search<br/>for New Anomalies]
+    end
+
+    A1 --> B1
+    A2 --> B1
+    B2 --> C1
+    D1 --> D2
+```
+
+**Short-term memory (Redis)** holds the data needed for the current evaluation cycle. Current alert states (firing, resolved, silenced) are stored as Redis hashes keyed by rule ID. Recent metric values for the last 5 minutes are stored in sorted sets keyed by metric name and service, enabling the alert engine to evaluate rules without querying ClickHouse for small time windows. Active investigation context -- when the agent is analyzing an anomaly, the intermediate findings (which services are affected, what metrics have been checked, what hypotheses have been tested) are stored in Redis with a 30-minute TTL.
+
+**Medium-term memory (PostgreSQL)** holds reference data that changes slowly. Rolling 7-day baseline averages for each metric and service are recomputed hourly by a background job that queries the ClickHouse rollup table. Recent incident history (last 30 days of alert events with their resolutions) is stored here so the agent can reference "the last time this alert fired, the root cause was X." The service dependency graph (which services call which other services, derived from trace data) is materialized as an adjacency list table, updated daily.
+
+**Long-term memory (ClickHouse)** holds the historical data used for trend analysis and capacity planning. Historical anomaly patterns -- all past anomalies with their timestamps, affected services, root causes, and resolutions -- are queried when the agent needs to understand seasonal patterns ("does this metric always spike on Monday mornings?"). Seasonal baselines use same-day-of-week and same-hour-of-day averages computed from 90 days of history, providing more accurate thresholds than simple rolling averages.
+
+**Anomaly memory (Vector Store)** is the key differentiator from rule-based alerting. Past anomalies and their resolutions are embedded as vectors (using the anomaly description, affected metrics, root cause, and resolution steps as input text) and stored in a vector store. When a new anomaly occurs, the agent embeds the current anomaly description and retrieves the top-K most similar past anomalies. This enables the agent to suggest root causes based on historical patterns: "A similar anomaly occurred on March 15 when a database connection pool was exhausted -- the symptoms (rising latency + connection timeout errors) match the current anomaly."
+
+### Context Window Strategy for Anomaly Investigation
+
+The agent assembles a context window of approximately 5,000 tokens when investigating an anomaly:
+
+| Context Component | Token Budget | Content |
+|-------------------|-------------|---------|
+| System instructions | ~400 | Role definition, output format, evidence requirements |
+| Current anomaly description | ~300 | Which metric, which service, how far from baseline, when it started |
+| Affected service's recent metrics | ~800 | Last 30 minutes of key metrics (latency, error rate, throughput, CPU, memory) |
+| Service dependency graph | ~500 | Upstream and downstream services, recent health status of each |
+| Similar past incidents | ~1,500 | Top 3 similar past anomalies with their root causes and resolutions |
+| Recent deployments | ~500 | Deployments to the affected service or its dependencies in the last 2 hours |
+| Response budget | ~1,000 | Reserved for the agent's analysis, root cause hypothesis, and recommended actions |
+
+This fixed budget ensures consistent inference latency and cost regardless of anomaly complexity. If additional context is needed (e.g., more past incidents), the agent issues a follow-up retrieval with a refined query rather than expanding the context window.
+
+---
+
+## Hallucination Mitigation
+
+Observability agents face unique hallucination risks because fabricated or inaccurate outputs can trigger unnecessary incident responses, page on-call engineers at 3 AM, or mask real issues behind false diagnoses. The mitigation strategy treats every agent output as a claim that must be backed by evidence.
+
+### Mitigation Strategies
+
+**Root cause fabrication** -- the agent suggests a root cause not supported by the data. This is the highest-risk hallucination because it sends engineering teams investigating the wrong direction during an outage. **Mitigation:** every root cause claim must reference specific metrics or log entries with precise values and timestamps. The agent cites the evidence: "Service X error rate increased from 0.1% to 5.2% at 14:32 UTC (metric: `http_error_rate`, source: ClickHouse query `metrics WHERE service_name='X' AND timestamp >= '2024-01-15 14:30:00'`)" -- never "the service seems to be having issues." Claims without cited evidence are stripped from the output by a post-processing validation step.
+
+**Metric hallucination** -- the agent reports metric values that do not match the data. For example, it claims "latency is 450ms" when the actual p99 is 1,200ms. **Mitigation:** all metric values are computed by querying ClickHouse, never generated by the LLM. The LLM receives pre-computed metrics in its context and interprets and explains them. The response generation pipeline includes a verification step that cross-references any numeric values in the agent's output against the metrics provided in the context. Mismatched values are flagged and corrected.
+
+**False correlation** -- the agent claims causation when there is only temporal correlation. For example, "Service A's latency spike caused Service B's errors" when both were independently affected by a network issue. **Mitigation:** the agent explicitly distinguishes between "correlated" (happened at the same time) and "caused by" (there is a known dependency path). Only claim causation when the service dependency graph shows a direct relationship between the two services AND the timing is consistent with the dependency direction (upstream failure precedes downstream failure). When the dependency graph does not show a direct link, the agent reports: "Service A and Service B both experienced degradation starting at 14:30 UTC. No direct dependency exists between them -- investigate a shared dependency (database, network, cloud provider)."
+
+**Alert fatigue generation** -- the agent creates too many low-value alerts during cascading failures or noisy periods. **Mitigation:** alert deduplication groups related alerts by time window (alerts within 5 minutes of each other for the same service are grouped) and by service dependency (if Service A depends on Service B, and both are alerting, the root cause alert on Service B suppresses the symptom alert on Service A). Alerts are silenced during known maintenance windows configured in the alert_rules table. A minimum severity threshold prevents the agent from creating info-level alerts during an active incident when only critical and warning alerts are actionable.
+
+**Stale baseline comparisons** -- the agent compares current metrics against outdated baselines. For example, using a pre-Black Friday traffic baseline during Black Friday, causing every metric to appear anomalous. **Mitigation:** seasonal baseline detection uses same-day-of-week and same-hour-of-day baselines from the last 4 weeks, not just simple rolling averages. The baseline selection logic checks for known events (holidays, sales events, maintenance windows) stored in a calendar table and adjusts accordingly. When a baseline shift is detected (sustained metric change for more than 1 hour that is not an anomaly), the system flags the shift and prompts an operator to confirm the new baseline.
+
+### Hallucination Prevention Pipeline
+
+```mermaid
+graph LR
+    A[Event Stream] --> B[Anomaly Detection]
+    B --> C[Evidence Collection]
+    C --> D[Root Cause Analysis<br/>LLM with Evidence Context]
+    D --> E[Evidence Verification]
+    E --> F{All Claims<br/>Backed by Data?}
+    F -->|Yes| G[Response Generation]
+    F -->|No| H[Strip Unsupported<br/>Claims]
+    H --> G
+    G --> I[Output to<br/>Dashboard/Alert]
+```
+
+The pipeline ensures that no LLM-generated claim reaches the end user without passing through the Evidence Verification stage. The Evidence Verification step checks: (1) every metric value cited in the analysis matches a value from the pre-computed context, (2) every causal claim references a path in the service dependency graph, (3) every temporal claim ("started at 14:32") matches the anomaly detection timestamp within a 1-minute tolerance.
+
+---
+
+## Production Issues and Fixes
+
+### Issue 1: Alert Storm from Cascading Failures
+
+**Symptom:** A database outage causes 15 dependent services to fail simultaneously. The alert engine fires 47 separate alerts within 2 minutes, overwhelming the on-call engineer's phone with notifications.
+
+**Root cause:** Each service has independent alert rules that evaluate in isolation -- the alert engine has no concept of dependency relationships between services.
+
+**Fix:** Alert correlation engine that groups alerts by time window and service dependency. When multiple alerts fire within a 5-minute window, the engine traverses the service dependency graph to identify the root service (the one with no upstream alerts also firing). All related alerts are grouped into a single incident with the root cause alert as the primary and dependent alerts listed as symptoms. The on-call engineer receives one notification: "Database X is down (affecting 15 downstream services)" instead of 47 separate pages.
+
+### Issue 2: ClickHouse Query Timeouts on Large Time Ranges
+
+**Symptom:** Dashboard queries for 30-day trends timeout after 30 seconds. Users report that the "Monthly Overview" dashboard is unusable.
+
+**Root cause:** Dashboard queries hit the raw metrics table, scanning billions of rows for a 30-day aggregation. The query planner cannot optimize this because the data volume exceeds available memory for in-flight processing.
+
+**Fix:** Route dashboard queries through pre-aggregated materialized views. The `metrics_1m_rollup` view reduces 30 days of raw data (billions of rows) to approximately 43,200 rows per metric per service (one row per minute). For 30-day dashboards, add a `metrics_1h_rollup` view that further aggregates to hourly granularity. Limit ad-hoc query time ranges to 7 days against raw data; longer ranges must use rollup tables. Add a query rewrite layer that automatically redirects queries to the appropriate rollup level based on the requested time range.
+
+### Issue 3: Agent Misidentifies Root Cause During Multi-Service Outages
+
+**Symptom:** During a complex outage involving 4 services, the agent confidently identifies Service C as the root cause. The engineering team spends 45 minutes investigating Service C before discovering the actual root cause is a configuration change in Service A.
+
+**Root cause:** The agent committed to a single root cause hypothesis based on which service had the most dramatic metric change, not which service failed first or which is upstream of the others.
+
+**Fix:** Present multiple hypotheses ranked by evidence strength rather than committing to a single root cause. The agent now outputs a ranked list: "Hypothesis 1 (confidence: high): Service A configuration change at 14:28 UTC -- 3 minutes before downstream failures began. Hypothesis 2 (confidence: medium): Service C connection pool exhaustion -- may be a symptom of Service A's failure." The ranking considers: temporal ordering (which service degraded first), dependency direction (upstream failures rank higher), and evidence specificity (a known deployment event ranks higher than a metric anomaly without explanation).
+
+### Issue 4: Log Ingestion Lag Causing Delayed Alerting
+
+**Symptom:** Alerts fire 5-10 minutes after the actual incident begins. Post-incident analysis shows that logs arrived in ClickHouse with a 5-minute delay during peak traffic.
+
+**Root cause:** Kafka consumer lag increases during traffic spikes because the Span Processor cannot keep up with the ingestion rate. The alert evaluation engine queries ClickHouse, which only contains delayed data.
+
+**Fix:** Monitor ingestion lag as its own metric. Add a dedicated metric `ingestion_lag_seconds` computed as the difference between the current wall-clock time and the newest timestamp in ClickHouse for each service. Alert when `ingestion_lag_seconds` exceeds 60 seconds. For the alert evaluation engine, switch latency-sensitive alerts (critical severity) to evaluate against Redis counters (updated in real-time by the Collector, before Kafka) rather than ClickHouse. Redis-based evaluation adds no more than 2 seconds of detection latency.
+
+### Issue 5: Dashboard Query Load Affecting Alert Evaluation
+
+**Symptom:** During business hours, when many users are viewing dashboards, alert evaluation latency increases from 2 seconds to 15 seconds. Some alert evaluation cycles are skipped entirely because the previous cycle has not completed.
+
+**Root cause:** Dashboard queries and alert evaluation queries compete for the same ClickHouse resources (CPU, memory, I/O). A heavy dashboard query (e.g., 30-day cost attribution breakdown) consumes resources that delay alert queries.
+
+**Fix:** Separate ClickHouse clusters for dashboards and alerting. The alerting cluster is a smaller, dedicated 2-shard cluster that receives the same data via Kafka (dual-write) but serves only alert evaluation queries. The dashboard cluster is the larger 4-shard cluster that handles all user-facing queries. This provides resource isolation -- a runaway dashboard query cannot affect alert latency. The alerting cluster is sized for the known, predictable workload of evaluating N alert rules every 60 seconds, while the dashboard cluster is sized for variable user-driven query patterns.
+
+### Issue 6: Agent Recommends Scaling a Service Already at Maximum
+
+**Symptom:** During a latency spike, the agent recommends "scale payment-service from 8 to 16 replicas." The service is already at 16 replicas (the auto-scaler hit the maximum), and the recommendation wastes investigation time.
+
+**Root cause:** The agent's context did not include current resource allocation or cloud provider limits. It generated a plausible-sounding recommendation without verifying feasibility.
+
+**Fix:** Include current resource allocation in the anomaly investigation context: current replica count, auto-scaler min/max configuration, current CPU/memory utilization per replica, and cloud provider quota limits. Before generating a scaling recommendation, the agent checks: (1) is the service already at its auto-scaler maximum? (2) does the cloud provider quota allow additional instances? (3) is the bottleneck actually CPU/memory (which scaling fixes) or something else (database connections, external API rate limits) that scaling will not help? The agent now responds: "payment-service is already at maximum replicas (16/16). CPU utilization is 45% per replica -- scaling is unlikely to help. The bottleneck appears to be database connection pool saturation (active connections: 95/100)."
+
+### Issue 7: False Anomaly Detection After Service Migration (Baseline Shift)
+
+**Symptom:** After migrating the search service from an older runtime to a new one, the agent fires continuous "latency anomaly" alerts for 3 days. The new runtime has 20% lower baseline latency, which the agent interprets as an anomaly compared to the old baseline.
+
+**Root cause:** The agent's baseline is a rolling 7-day average that still includes data from the old runtime. The lower latency consistently falls outside the expected range (old baseline minus 3 standard deviations), triggering the anomaly detector.
+
+**Fix:** Detect baseline shifts -- sustained metric changes lasting more than 1 hour that move in a consistent direction. When a shift is detected, the system: (1) checks for recent deployment or migration events in the service's event log, (2) if a deployment is found, automatically flags the baseline as "shifting" and suppresses anomaly alerts for that metric for 4 hours while the new baseline establishes, (3) after 4 hours, recomputes the baseline using only post-migration data. If no deployment event is found (organic baseline shift), the system creates a notification for an operator to review and confirm the new baseline before suppressing anomaly detection.
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

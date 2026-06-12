@@ -310,6 +310,398 @@ The cost justification is straightforward: if the agent reduces mean time to res
 
 ---
 
+## Data Layer Deep Dive
+
+### Database Selection Justification
+
+Each data store in the architecture was chosen for a specific reason tied to the workload it serves. The table below summarizes the selection rationale and the alternatives that were evaluated and rejected.
+
+| Store | Technology | Why This Choice | Alternative Considered | Why Not |
+|-------|-----------|----------------|----------------------|---------|
+| Deployment records, incident history, audit trail | PostgreSQL | ACID guarantees for deployment state -- cannot lose track of a half-completed rollout; JSONB for heterogeneous infrastructure state (different cloud resources have different attributes); row-level security for multi-team isolation | MongoDB | Flexible schema for varied infra configs, but deployment state machines are inherently sequential and relational -- steps depend on prior steps; MongoDB's eventual consistency is unacceptable for deployment state where a missed step means a broken rollout |
+| Real-time infrastructure state and alert deduplication | Redis | Sub-millisecond reads for current service health status; TTL for auto-expiring transient alerts without manual cleanup; sorted sets for priority-based alert queues that surface critical alerts first | In-memory only | Loses state during agent restart; misses alerts that arrive during a restart window; no persistence means an agent crash during an incident causes total context loss |
+| Infrastructure metrics | TimescaleDB | Purpose-built time-series queries on CPU, memory, latency, and error rates; continuous aggregates for dashboards without expensive re-computation; hypertables with automatic partitioning by time | Prometheus | Good for metrics collection and alerting, but lacks SQL joins -- correlating metrics with deployment events and incidents requires relational queries that Prometheus cannot express; TimescaleDB enables queries like "show error rate around the time of each deployment" |
+| Deployment artifacts and logs | Object Storage (S3) | Terraform state files, deployment logs, and rollback snapshots are large and append-heavy; S3 scales independently of the database; versioned buckets provide audit trail for every artifact revision | Database storage (PostgreSQL large objects) | Logs and artifacts are too large for database storage; a single deployment log can exceed 100MB; S3 scales to petabytes without affecting database query performance |
+
+### Schema Design
+
+The following schemas define the core data model. Each table includes its indexes with justification for why each index exists.
+
+#### deployments
+
+Tracks each deployment through its lifecycle, including rollback capability and health check results.
+
+```sql
+CREATE TABLE deployments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    service_name VARCHAR(128) NOT NULL,
+    environment VARCHAR(20) NOT NULL CHECK (environment IN ('production', 'staging', 'development')),
+    version VARCHAR(64) NOT NULL,
+    previous_version VARCHAR(64),
+    strategy VARCHAR(20) NOT NULL CHECK (strategy IN ('rolling', 'blue-green', 'canary')),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'in_progress', 'succeeded', 'failed', 'rolled_back')),
+    initiated_by VARCHAR(128) NOT NULL,
+    approval_status VARCHAR(20) DEFAULT 'pending'
+        CHECK (approval_status IN ('pending', 'approved', 'rejected', 'auto_approved')),
+    health_check_result JSONB DEFAULT '{}',
+    rollback_triggered BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ
+);
+
+-- Deployment history for a service in a specific environment, most recent first
+CREATE INDEX idx_deployments_service_env ON deployments(service_name, environment, created_at DESC);
+
+-- Find all deployments that were rolled back (rollback rate analysis)
+CREATE INDEX idx_deployments_rollback ON deployments(rollback_triggered, created_at DESC)
+    WHERE rollback_triggered = true;
+
+-- Active deployments that have not yet completed (in-progress monitoring)
+CREATE INDEX idx_deployments_active ON deployments(status, created_at)
+    WHERE status IN ('pending', 'in_progress');
+```
+
+**Index rationale**:
+- `idx_deployments_service_env` -- The Diagnosis Agent queries deployment history for a specific service and environment when correlating incidents with recent changes. The composite index on `(service_name, environment, created_at DESC)` serves this query as an index-only scan with no sort required.
+- `idx_deployments_rollback` -- Rollback rate analysis requires scanning only deployments that triggered rollbacks. The partial index avoids scanning the vast majority of successful deployments.
+- `idx_deployments_active` -- The agent monitors in-progress deployments for health check failures. The partial index covers only active deployments, which are typically fewer than 1% of all records.
+
+#### incidents
+
+Tracks incident lifecycle from alert to resolution, including whether the agent resolved it automatically.
+
+```sql
+CREATE TABLE incidents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    service_name VARCHAR(128) NOT NULL,
+    severity VARCHAR(10) NOT NULL CHECK (severity IN ('critical', 'high', 'medium', 'low')),
+    alert_source VARCHAR(50) NOT NULL,
+    description TEXT NOT NULL,
+    root_cause TEXT,
+    resolution_steps JSONB DEFAULT '[]',
+    auto_resolved BOOLEAN DEFAULT false,
+    resolution_time_ms BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at TIMESTAMPTZ
+);
+
+-- Incident history for a service, most recent first (used by Diagnosis Agent)
+CREATE INDEX idx_incidents_service ON incidents(service_name, created_at DESC);
+
+-- MTTR analysis by severity (aggregate queries for dashboards)
+CREATE INDEX idx_incidents_severity ON incidents(severity, resolved_at)
+    WHERE resolved_at IS NOT NULL;
+
+-- Find unresolved incidents (active incident monitoring)
+CREATE INDEX idx_incidents_unresolved ON incidents(created_at DESC)
+    WHERE resolved_at IS NULL;
+```
+
+**Index rationale**:
+- `idx_incidents_service` -- The Similar Incident Retriever queries past incidents for a specific service to find resolution patterns. This composite index serves that lookup efficiently.
+- `idx_incidents_severity` -- MTTR dashboards group by severity and filter to resolved incidents. The composite index with a filter on resolved incidents avoids scanning open incidents that have no resolution time.
+- `idx_incidents_unresolved` -- The agent continuously monitors unresolved incidents. The partial index covers only open incidents, which are a small fraction of the total.
+
+#### infrastructure_state
+
+Captures the current and desired state of every managed resource for drift detection.
+
+```sql
+CREATE TABLE infrastructure_state (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    resource_type VARCHAR(64) NOT NULL,
+    resource_id VARCHAR(256) NOT NULL,
+    cloud_provider VARCHAR(20) NOT NULL CHECK (cloud_provider IN ('aws', 'gcp', 'azure', 'on_prem')),
+    region VARCHAR(50) NOT NULL,
+    current_state JSONB NOT NULL DEFAULT '{}',
+    desired_state JSONB NOT NULL DEFAULT '{}',
+    drift_detected BOOLEAN DEFAULT false,
+    last_synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Lookup by resource identifier (unique constraint on cloud resource)
+CREATE UNIQUE INDEX idx_infra_resource ON infrastructure_state(cloud_provider, resource_id);
+
+-- Find all resources with drift (drift detection dashboard)
+CREATE INDEX idx_infra_drift ON infrastructure_state(drift_detected, last_synced_at)
+    WHERE drift_detected = true;
+
+-- Stale resources that have not synced recently (sync health monitoring)
+CREATE INDEX idx_infra_stale ON infrastructure_state(last_synced_at)
+    WHERE last_synced_at < now() - INTERVAL '1 hour';
+```
+
+**Index rationale**:
+- `idx_infra_resource` -- Each cloud resource is uniquely identified by provider and resource ID. The unique index enforces this constraint and serves direct lookups when the agent needs current state for a specific resource.
+- `idx_infra_drift` -- The drift detection dashboard shows only resources that have drifted. The partial index avoids scanning the majority of resources that are in sync.
+- `idx_infra_stale` -- Resources that have not synced recently may indicate a connectivity issue with the cloud provider. This index supports the sync health monitoring query.
+
+#### runbook_executions
+
+Records every automated runbook execution for audit and effectiveness analysis.
+
+```sql
+CREATE TABLE runbook_executions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID NOT NULL REFERENCES incidents(id),
+    runbook_name VARCHAR(128) NOT NULL,
+    steps_executed JSONB NOT NULL DEFAULT '[]',
+    outcome VARCHAR(20) NOT NULL CHECK (outcome IN ('success', 'failure', 'partial', 'aborted')),
+    was_manual_override BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Execution history for a specific incident (audit trail)
+CREATE INDEX idx_runbook_incident ON runbook_executions(incident_id, created_at);
+
+-- Runbook effectiveness analysis (success rate per runbook)
+CREATE INDEX idx_runbook_name_outcome ON runbook_executions(runbook_name, outcome);
+```
+
+**Index rationale**:
+- `idx_runbook_incident` -- The audit trail requires loading all runbook executions for a given incident. The composite index serves this join efficiently.
+- `idx_runbook_name_outcome` -- Runbook effectiveness queries group by runbook name and count outcomes. This composite index enables an index-only scan for the aggregation.
+
+### Key Queries
+
+These are the actual queries the system executes in production, not simplified examples.
+
+**1. Deployment history with rollback rate**
+
+Used by the operations dashboard to track deployment reliability per service.
+
+```sql
+SELECT service_name,
+       environment,
+       COUNT(*) AS total_deployments,
+       COUNT(*) FILTER (WHERE rollback_triggered = true) AS rollbacks,
+       ROUND(
+           100.0 * COUNT(*) FILTER (WHERE rollback_triggered = true) / COUNT(*),
+           2
+       ) AS rollback_rate_pct
+FROM deployments
+WHERE created_at >= now() - INTERVAL '30 days'
+GROUP BY service_name, environment
+ORDER BY rollback_rate_pct DESC;
+```
+
+This query uses PostgreSQL's `FILTER` clause to count rollbacks within the same aggregation pass, avoiding a self-join. The 30-day window keeps the scan bounded. Services with high rollback rates are flagged for deployment pipeline review.
+
+**2. Mean time to resolution (MTTR) by service**
+
+Used by the SRE dashboard to track incident resolution performance and identify services that consistently take longer to resolve.
+
+```sql
+SELECT service_name,
+       severity,
+       COUNT(*) AS incident_count,
+       ROUND(AVG(resolution_time_ms) / 1000.0, 1) AS avg_mttr_seconds,
+       ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY resolution_time_ms) / 1000.0, 1) AS p50_mttr_seconds,
+       ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY resolution_time_ms) / 1000.0, 1) AS p95_mttr_seconds,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE auto_resolved = true) / COUNT(*), 1) AS auto_resolve_pct
+FROM incidents
+WHERE resolved_at IS NOT NULL
+  AND created_at >= now() - INTERVAL '90 days'
+GROUP BY service_name, severity
+ORDER BY avg_mttr_seconds DESC;
+```
+
+MTTR is reported as both p50 (typical) and p95 (worst case). The `auto_resolve_pct` column shows how effective the agent is at resolving incidents for each service -- a low percentage indicates the agent lacks runbooks for that service's failure modes.
+
+**3. Infrastructure drift detection**
+
+Used by the agent to identify resources whose current state has diverged from the desired state.
+
+```sql
+SELECT resource_type,
+       resource_id,
+       cloud_provider,
+       region,
+       current_state,
+       desired_state,
+       last_synced_at,
+       now() - last_synced_at AS time_since_sync
+FROM infrastructure_state
+WHERE drift_detected = true
+ORDER BY last_synced_at ASC;
+```
+
+Resources are ordered by sync time (oldest first) so that the longest-standing drifts are addressed first. The agent compares `current_state` and `desired_state` JSONB fields to generate a diff that describes exactly what changed.
+
+**4. Runbook effectiveness (auto-resolution rate)**
+
+Used by the platform team to evaluate which runbooks are working and which need revision.
+
+```sql
+SELECT r.runbook_name,
+       COUNT(*) AS total_executions,
+       COUNT(*) FILTER (WHERE r.outcome = 'success') AS successes,
+       COUNT(*) FILTER (WHERE r.outcome = 'failure') AS failures,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE r.outcome = 'success') / COUNT(*), 1) AS success_rate_pct,
+       ROUND(AVG(i.resolution_time_ms) FILTER (WHERE r.outcome = 'success') / 1000.0, 1) AS avg_resolution_seconds
+FROM runbook_executions r
+JOIN incidents i ON r.incident_id = i.id
+WHERE r.created_at >= now() - INTERVAL '30 days'
+GROUP BY r.runbook_name
+ORDER BY total_executions DESC;
+```
+
+Runbooks with a success rate below 70% are flagged for review. The join with incidents provides resolution time context -- a runbook that succeeds but takes 30 minutes is less valuable than one that resolves in 2 minutes.
+
+---
+
+## Agent Memory Architecture
+
+Memory management in a DevOps agent differs fundamentally from conversational agents. The agent does not maintain a dialogue with a user -- it maintains operational context about infrastructure, active incidents, and ongoing deployments. Its memory model is optimized for operational awareness rather than conversational continuity.
+
+### Memory Tiers
+
+```mermaid
+graph LR
+    subgraph "Short-Term Memory (Redis)"
+        AD[Active Deployments<br/>In-progress rollouts]
+        AI[Active Incidents<br/>Unresolved alerts]
+        PA[Pending Alerts<br/>Priority queue]
+    end
+
+    subgraph "Medium-Term Memory (PostgreSQL)"
+        DH[Deployment History<br/>Last 30 days]
+        SH[Service Health Baselines<br/>Normal metric ranges]
+        OC[On-Call Schedules<br/>Current rotation]
+    end
+
+    subgraph "Long-Term Memory (PostgreSQL + Vector Store)"
+        IP[Incident Patterns<br/>Historical resolutions]
+        RE[Runbook Effectiveness<br/>Success/failure scores]
+        IT[Infrastructure Topology<br/>Service dependency graph]
+        VS[Vector Index<br/>Semantic incident search]
+    end
+
+    subgraph "Context Assembly"
+        CW[Context Window Builder<br/>~4,000 tokens]
+    end
+
+    AD --> CW
+    AI --> CW
+    PA --> CW
+    DH --> CW
+    SH --> CW
+    IP --> CW
+    VS --> CW
+    CW --> LLM[Diagnosis Agent LLM Call]
+```
+
+**Short-term memory (Redis)** holds the agent's immediate operational awareness: deployments currently in progress (service, version, strategy, current step), active incidents that have not yet been resolved, and the pending alert queue ordered by severity. This data changes on every agent cycle (every few seconds) and requires sub-millisecond reads. Redis TTLs auto-expire completed deployments and resolved incidents after 1 hour, keeping the working set small.
+
+**Medium-term memory (PostgreSQL)** holds context that changes daily or weekly: the deployment history for the last 30 days (used to correlate incidents with recent changes), service health baselines (normal CPU, memory, error rate, and latency ranges for each service -- used to determine whether current metrics are anomalous), and the current on-call schedule (who to page when escalation is needed). This data is queried at the start of each incident diagnosis, not on every agent cycle.
+
+**Long-term memory (PostgreSQL + vector store)** holds institutional knowledge: historical incident patterns (how past incidents of each type were resolved), runbook effectiveness scores (which runbooks succeed and which fail for each service), and the infrastructure topology graph (service dependencies, cloud resource relationships). The vector store indexes resolved incidents as embeddings, enabling semantic similarity search when a new incident occurs.
+
+### Context Window Strategy
+
+The Diagnosis Agent operates with a compact context window of approximately 4,000 tokens per LLM call. DevOps diagnosis does not require large context windows -- the agent needs structured data (metrics, service names, error codes), not lengthy prose.
+
+| Context Component | Token Budget | Source |
+|-------------------|-------------|--------|
+| System rules + safety constraints | ~1,000 tokens (fixed) | Static configuration |
+| Current infrastructure state | ~800 tokens (affected services, current metrics) | Redis + TimescaleDB |
+| Active incidents | ~500 tokens (correlated alerts, timeline) | Redis |
+| Recent deployments | ~500 tokens (last 3 deployments for affected services) | PostgreSQL |
+| Retrieved runbooks + similar incidents | ~1,200 tokens (top 3 matches) | Vector store + PostgreSQL |
+| **Total per diagnosis** | **~4,000 tokens** | |
+
+This budget is deliberately conservative. DevOps diagnosis is data-driven, not conversational -- the agent needs structured metrics and logs, not long text passages. Keeping the context window small reduces cost per diagnosis to approximately $0.05 and reduces latency to under 3 seconds.
+
+### Incident Pattern Matching (Episodic Memory)
+
+Past incidents serve as the agent's episodic memory. When an incident is resolved, it is embedded as a vector using a combination of: alert types, error messages, affected services, time-of-day patterns, metric anomalies, and the resolution that was applied. This embedding captures the "shape" of the incident, not just its keywords.
+
+When a new incident occurs, the agent retrieves the top 5 most similar past incidents from the vector store. Each retrieved incident includes: the root cause, the resolution steps, whether the resolution was automated or manual, and the resolution time. If a past incident with a similarity score above 0.85 was auto-resolved successfully, the agent has strong evidence that the same runbook will work again.
+
+This is the DevOps equivalent of an experienced SRE who says "I have seen this exact pattern before -- last time it was a connection pool leak and we fixed it by restarting pgbouncer." The vector store encodes that experience for every incident the team has ever resolved.
+
+---
+
+## Hallucination Mitigation
+
+In a DevOps context, hallucinations are not merely inaccurate -- they are operationally dangerous. A hallucinated shell command can delete production data. A fabricated health status can cause the agent to declare an outage resolved while it is still active. A made-up runbook step can worsen an incident. The system employs five layers of defense, each targeting a specific hallucination category.
+
+### Hallucination Prevention Pipeline
+
+```mermaid
+graph TB
+    ALERT[Alert Received] --> IC[Incident Classification<br/>LLM categorizes incident type]
+    IC --> RR[Runbook Retrieval<br/>Vector search for matching runbook]
+    RR --> CV[Command Validation<br/>Whitelist check + AST parse]
+    CV -->|Valid| BRA[Blast Radius Analysis<br/>Dependency graph check]
+    CV -->|Invalid command| REJECT[Reject Command<br/>Log and alert]
+    BRA -->|Low blast radius| HAG[Human Approval Gate<br/>Auto-approved for Tier 1]
+    BRA -->|High blast radius| HUMAN[Require Human Approval]
+    HAG --> EXEC[Execution<br/>Deterministic runbook engine]
+    HUMAN -->|Approved| EXEC
+    HUMAN -->|Denied| ABORT[Abort and Log]
+    EXEC --> PRHC[Post-Resolution Health Check<br/>Verify metrics returned to baseline]
+    PRHC -->|Healthy| RESOLVED[Mark Incident Resolved]
+    PRHC -->|Not healthy| ESCALATE[Escalate to On-Call]
+```
+
+### Layer 1: Command Hallucination Prevention
+
+The agent generates shell commands that do not exist or have incorrect flags -- for example, `kubectl delete namespace production` when the intended command was `kubectl rollout restart`. The mitigation is structural: **validate all generated commands against a whitelist of allowed commands; parse the command AST; reject unknown commands**.
+
+The whitelist is maintained as a configuration file that maps each allowed command to its permitted flags, argument patterns, and target scope. For example, `kubectl rollout restart` is allowed for any deployment in any namespace, but `kubectl delete` is only allowed for pods (not deployments, namespaces, or persistent volume claims). Commands that do not appear in the whitelist are rejected outright. Commands that appear but with disallowed flags are rejected with a specific explanation ("flag --force is not permitted for kubectl delete"). No unvalidated command is ever executed.
+
+### Layer 2: Infrastructure State Fabrication Prevention
+
+The agent claims a service is healthy when it is not, or reports metrics that do not match reality. The mitigation is architectural: **all infrastructure state comes from monitoring tools (Prometheus, CloudWatch), never from LLM inference**. The LLM interprets state, it does not generate state.
+
+When the Diagnosis Agent reports "service-api error rate is 12%," the system verifies this claim against the actual Prometheus metric. If the LLM's claim does not match the monitoring data (within a 5% tolerance for timing differences), the claim is flagged and the raw monitoring data is used instead. The LLM's role is to correlate and interpret metrics, not to report them -- it says "the error rate spike correlates with the deployment," but the actual error rate value is always sourced from the monitoring system.
+
+### Layer 3: Runbook Hallucination Prevention
+
+The agent invents resolution steps that are not in any approved runbook -- for example, suggesting "restart the database primary" when no such runbook exists. The mitigation is constraint-based: **resolution steps must match a retrieved runbook entry; free-form commands require human approval**.
+
+The Runbook Engine stores every approved runbook as a parameterized template with specific steps, preconditions, and rollback procedures. When the Diagnosis Agent recommends a remediation, the system verifies that the recommendation maps to an existing runbook by name and that the parameters are within the runbook's defined bounds. If the agent suggests a remediation that does not match any runbook, the suggestion is logged but not executed -- it is included in the escalation report for the on-call engineer to evaluate manually.
+
+### Layer 4: Blast Radius Underestimation Prevention
+
+The agent claims a change is safe when it affects critical services or a large percentage of traffic. The mitigation is graph-based: **dependency graph analysis before any change -- check upstream and downstream services, number of affected users**.
+
+Before executing any remediation, the Safety Gate traverses the service dependency graph to determine the full blast radius. A pod restart for a service with 50 replicas has a blast radius of 2% (1/50). A pod restart for a service with 2 replicas has a blast radius of 50%. The same action requires different approval tiers depending on context. Changes affecting more than 5% of traffic require human approval regardless of the action type. The dependency graph also checks downstream services: restarting a database connection pooler that serves 10 upstream services has a blast radius that includes all 10 services, not just the pooler itself.
+
+### Layer 5: False All-Clear Prevention
+
+The agent declares an incident resolved when it is not -- for example, the error rate dropped temporarily due to reduced traffic, not because the fix worked. The mitigation is temporal: **post-resolution health check -- verify metrics have returned to baseline, not just that the error stopped; wait for 2 consecutive health check intervals before marking resolved**.
+
+The Cooldown Monitor runs health checks at 2-minute intervals after any remediation. It checks three conditions: (1) the error rate is within the service's baseline range, (2) latency has returned to baseline, and (3) no new alerts have fired for the affected service. All three conditions must be met for 2 consecutive intervals (4 minutes total) before the incident is marked as resolved. If any condition fails during the cooldown window, the incident remains open and the agent escalates to the on-call engineer with specific details about which metrics have not recovered.
+
+:::warning Critical Design Principle
+Hallucination mitigation in DevOps is not about content accuracy -- it is about operational safety. Every mitigation layer exists to prevent the agent from taking an action based on incorrect information. The LLM diagnoses and recommends; deterministic code validates and executes. This separation ensures that LLM reasoning errors remain in the analysis domain and never cause infrastructure changes.
+:::
+
+---
+
+## Production Issues and Fixes
+
+The following table documents production issues observed in autonomous DevOps agent deployments, their root causes, and the fixes applied. These are the issues that do not appear in architecture diagrams but dominate on-call rotations.
+
+| Issue | Symptoms | Root Cause | Fix |
+|-------|----------|-----------|-----|
+| Agent executes destructive command in wrong environment | Production database receives a command intended for staging; data loss or service disruption | Environment variable misconfiguration or agent context window containing mixed environment references; the LLM selects the wrong target | Add environment validation gate: every command must include an explicit environment parameter that is validated against the current incident's environment before execution; require confirmation prompt for any production command; add environment-specific command prefixes that are verified at the execution layer |
+| Alert storm overwhelms the agent | Hundreds of correlated alerts flood the agent simultaneously; diagnosis queue backs up; response time exceeds SLA; agent processes symptoms instead of root cause | A cascading failure triggers alerts from every downstream service; each alert is processed independently, consuming agent capacity on symptom alerts rather than the root cause | Implement alert deduplication with fingerprint-based grouping; add correlation window (group alerts from related services within a 5-minute window into a single incident); implement storm detection that triggers when more than 50 alerts arrive within 2 minutes -- suppress downstream noise and surface the highest-in-dependency-chain alert as the probable root cause |
+| Runbook steps executed in wrong order | A runbook step that depends on a prior step fails because the prior step has not completed; partial execution leaves infrastructure in an inconsistent state | Steps were dispatched concurrently for performance, but some steps have implicit ordering dependencies not captured in the runbook definition | Add step dependency validation to every runbook definition; execute steps atomically in dependency order -- each step must report completion before the next step begins; add a rollback procedure that unwinds completed steps if a subsequent step fails |
+| Agent triggers premature rollback | A canary deployment that is actually succeeding is rolled back; the new version never reaches full rollout | The agent checks health metrics too early in the canary window; initial metric noise (cold JVM, cache warming) is misinterpreted as a regression | Wait for the full health check window (configurable per service, default 5 minutes) before evaluating deployment health; ignore the first 2 minutes of metrics after a canary starts (warm-up period); require that error rate exceeds the baseline by more than 2 standard deviations (not just any increase) before triggering a rollback |
+| Infrastructure drift false positives | The drift detection dashboard shows hundreds of drifted resources; investigation reveals they are ephemeral differences (instance IDs, timestamps, auto-generated tags) | The JSONB diff between current and desired state flags every field difference, including fields that are expected to differ | Add tolerance thresholds for ephemeral state differences; maintain an exclusion list of fields that are expected to differ per resource type (e.g., `instance_id`, `creation_timestamp`, `auto_scaling_group_instance_list`); only flag drift on fields that represent intentional configuration (e.g., `instance_type`, `security_groups`, `iam_role`) |
+| Agent loops retrying a failed deployment | The agent retries a failed deployment indefinitely; each retry fails for the same reason; deployment pipeline is blocked; alerts continue firing | The retry logic has no upper bound; the underlying failure (e.g., insufficient cluster capacity, broken container image) is not transient and will never succeed on retry | Add a maximum retry limit of 3 attempts with exponential backoff (30 seconds, 2 minutes, 8 minutes); after 3 consecutive failures, mark the deployment as permanently failed and escalate to the on-call engineer with the specific failure reason from each attempt; add circuit breaker that blocks new deployments for the same service until the failure is investigated |
+| Stale on-call routing | Incidents are escalated to engineers who are no longer on-call; response time increases because the paged engineer must re-route the incident manually | The on-call schedule was cached at agent startup and not refreshed; schedule changes (swaps, overrides) are not reflected | Sync the on-call schedule from PagerDuty or OpsGenie every 5 minutes via API polling; cache the schedule in Redis with a 5-minute TTL; on cache miss, perform a synchronous API call to fetch the current on-call; log every escalation with the on-call engineer's name and the schedule version used |
+
+:::tip Operational Readiness
+Before launching an autonomous DevOps agent, build runbooks for each issue in this table. The first month of production will surface at least three of these problems. Start the agent in observation-only mode (diagnose and recommend, but do not execute) for the first 2 weeks. Graduate to auto-execution for Tier 1 actions only after validating that diagnosis accuracy exceeds 95% on historical incidents.
+:::
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

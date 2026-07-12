@@ -47,6 +47,8 @@ graph TD
 The simplest pattern. One agent sends a request to another and waits for a response.
 
 ```python
+import asyncio
+
 # AgentMessage: sender, recipient, content, message_id, correlation_id, message_type, ttl
 
 class DirectMessaging:
@@ -54,10 +56,10 @@ class DirectMessaging:
 
     async def send_and_wait(self, sender, recipient, content, timeout=30.0):
         msg = AgentMessage(sender, recipient, content, message_type="request")
-        future = create_future()
+        future = asyncio.get_event_loop().create_future()
         self._pending[msg.message_id] = future
         await self.transport.send(recipient, msg)
-        return await wait_for(future, timeout)  # raises TimeoutError
+        return await asyncio.wait_for(future, timeout)  # raises TimeoutError
 
     async def handle_incoming(self, msg):
         if msg.correlation_id in self._pending:
@@ -115,11 +117,15 @@ sequenceDiagram
 ### Implementation
 
 ```python
+import asyncio
+import time
+
+
 class Blackboard:
     # Shared state store + per-key subscriber callbacks
 
     async def write(self, key, value, author):
-        entry = {value, author, timestamp, version}
+        entry = {"value": value, "author": author, "timestamp": time.time()}
         await self.store.set(key, entry)
         for callback in self._subscribers.get(key, []):
             await callback(key, entry)       # notify watchers
@@ -134,7 +140,7 @@ class Blackboard:
         # Block until key is written, then return its value
         event = asyncio.Event()
         self.subscribe(key, lambda k, e: event.set())
-        await wait_for(event.wait(), timeout)
+        await asyncio.wait_for(event.wait(), timeout)
         return await self.read(key)
 ```
 
@@ -224,6 +230,9 @@ For most production multi-agent systems, the **hybrid approach** works best. Use
 When multiple agents need to react to the same event -- for example, a new customer message triggers both a classification agent and a sentiment analysis agent -- pub/sub is the natural pattern.
 
 ```python
+import asyncio
+
+
 class MultiAgentPubSub:
     async def fan_out(self, event, target_agents):
         await self.event_bus.publish(event)  # all subscribers receive it
@@ -239,7 +248,7 @@ class MultiAgentPubSub:
                     done.set()
 
         await self.event_bus.subscribe("*.complete", collect)
-        await wait_for(done.wait(), timeout)  # partial results on timeout
+        await asyncio.wait_for(done.wait(), timeout)  # partial results on timeout
         return responses
 ```
 

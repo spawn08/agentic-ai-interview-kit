@@ -407,6 +407,9 @@ Updates and deletes in vector stores are a non-trivial problem because HNSW inde
 3. **Index fragmentation.** Repeated inserts and deletes in an HNSW index can degrade recall because deleted nodes leave "holes" in the graph. Solution: periodically rebuild the index (pgvector: `REINDEX INDEX idx_chunks_embedding`; Qdrant: triggers optimization automatically).
 
 ```python
+from uuid import uuid4
+
+
 class VectorStoreUpdater:
     """Atomic-safe document update in a vector store."""
 
@@ -842,6 +845,8 @@ LIMIT 1;
 ```python
 import hashlib
 import json
+from uuid import uuid4
+
 
 def compute_idempotency_key(tool_name: str, parameters: dict) -> str:
     """Deterministic hash of tool name + canonicalized parameters."""

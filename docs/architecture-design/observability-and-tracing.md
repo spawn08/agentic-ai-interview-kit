@@ -144,6 +144,13 @@ AGENT_SPAN_ATTRIBUTES = {
 ### Setting Up OpenTelemetry
 
 ```python
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+
 def setup_tracing(service_name, otlp_endpoint):
     provider = TracerProvider(resource=Resource({"service.name": service_name}))
     provider.add_span_processor(BatchSpanProcessor(

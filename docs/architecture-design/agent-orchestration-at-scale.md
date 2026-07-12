@@ -78,6 +78,9 @@ The foundation of scalable agent orchestration is asynchronous, queue-based disp
 ### Implementation Pattern
 
 ```python
+from enum import IntEnum
+
+
 class Priority(IntEnum):
     HIGH = 0        # User-facing, real-time
     NORMAL = 1      # Standard agent tasks
@@ -225,6 +228,9 @@ graph LR
 ### Example Router
 
 ```python
+from enum import Enum
+
+
 class TaskComplexity(Enum):
     SIMPLE = "simple"       # FAQs, single-step lookups
     STANDARD = "standard"   # Multi-step, 1-3 tool calls
@@ -464,6 +470,11 @@ sequenceDiagram
 For interactive use cases, clients need results as they are produced, not after the entire agent loop completes.
 
 ```python
+import json
+
+from fastapi.responses import StreamingResponse
+
+
 @app.post("/agent/run-stream")
 async def run_agent_stream(request):
     async def event_stream():
@@ -482,25 +493,60 @@ For complex, multi-step agent orchestration -- especially when steps can run for
 ### Temporal Example
 
 ```python
+import asyncio
+from datetime import timedelta
+
+from temporalio import workflow
+from temporalio.common import RetryPolicy
+
+# Activities (call_llm, execute_tool) are defined elsewhere and registered
+# with the worker. Helpers parse_plan / synthesis_prompt live in the same module.
+with workflow.unsafe.imports_passed_through():
+    from activities import call_llm, execute_tool
+    from planning import parse_plan, synthesis_prompt
+
+
 @workflow.defn
 class AgentWorkflow:
+    def __init__(self) -> None:
+        self._approved = False
+
+    @workflow.signal
+    def approve(self) -> None:
+        """External signal a reviewer sends to unblock a gated step."""
+        self._approved = True
+
     @workflow.run
-    async def run(self, task):
-        # Step 1: LLM plans (durable activity with retry)
+    async def run(self, task: dict) -> str:
+        # Step 1: LLM plans (durable activity with automatic retry).
         plan = await workflow.execute_activity(
-            call_llm, args=[task.prompt, "gpt-4o"], timeout=30s, retries=3)
-        # Step 2: Execute each step; optionally wait for human approval
+            call_llm,
+            args=[task["prompt"], "gpt-4o"],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        # Step 2: Execute each step; optionally wait for human approval.
         results = []
         for step in parse_plan(plan):
             if step.requires_approval:
-                if not await workflow.wait_condition(self.approved, timeout=24h):
+                try:
+                    await workflow.wait_condition(
+                        lambda: self._approved, timeout=timedelta(hours=24)
+                    )
+                except asyncio.TimeoutError:
                     return "Cancelled: approval timeout."
             result = await workflow.execute_activity(
-                execute_tool, args=[step.tool_name, step.params], timeout=60s)
+                execute_tool,
+                args=[step.tool_name, step.params],
+                start_to_close_timeout=timedelta(seconds=60),
+            )
             results.append(result)
-        # Step 3: Synthesize results via LLM
+        # Step 3: Synthesize results via LLM.
         return await workflow.execute_activity(
-            call_llm, args=[synthesis_prompt(results), "gpt-4o"], timeout=30s)
+            call_llm,
+            args=[synthesis_prompt(results), "gpt-4o"],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
 ```
 
 ### Temporal vs. Prefect vs. Custom

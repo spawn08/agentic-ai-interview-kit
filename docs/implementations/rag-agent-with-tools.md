@@ -161,6 +161,7 @@ from __future__ import annotations
 
 import json
 import logging
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -244,7 +245,7 @@ async def web_search(state: RAGState) -> dict[str, Any]:
     logger.info("Web search fallback for: %s", state.query[:80])
     url = (
         "https://en.wikipedia.org/api/rest_v1/page/summary/"
-        + urllib.request.quote(state.query)
+        + urllib.parse.quote(state.query)
     )
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "RAGAgent/2.0"})

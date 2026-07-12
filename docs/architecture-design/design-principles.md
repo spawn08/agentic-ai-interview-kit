@@ -19,6 +19,11 @@ An agentic system is not a monolith. The LLM, the tool executor, the memory stor
 ### Example
 
 ```python
+import hashlib
+import json
+from abc import ABC, abstractmethod
+
+
 class ToolExecutor(ABC):
     async def execute(self, tool_name, parameters) -> dict: ...
 
@@ -95,7 +100,8 @@ class IdempotentToolExecutor:
         self._executor, self._cache = executor, cache
 
     async def execute(self, tool_name, parameters, idempotency_key=None):
-        key = idempotency_key or sha256(canonical_json(tool_name, parameters))
+        canonical = json.dumps({"tool": tool_name, "params": parameters}, sort_keys=True)
+        key = idempotency_key or hashlib.sha256(canonical.encode()).hexdigest()
         cached = await self._cache.get(key)
         if cached is not None:
             return cached

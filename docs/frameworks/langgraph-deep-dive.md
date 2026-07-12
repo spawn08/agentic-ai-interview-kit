@@ -250,20 +250,29 @@ result = app.invoke(None, config=config)
 LangGraph provides fine-grained streaming at multiple levels.
 
 ```python
-# Stream all events
-async for event in app.astream_events(
-    {"messages": [HumanMessage(content="Analyze this dataset")]},
-    config=config,
-    version="v2",
-):
-    kind = event["event"]
-    if kind == "on_chat_model_stream":
-        # Individual tokens from the LLM
-        print(event["data"]["chunk"].content, end="", flush=True)
-    elif kind == "on_tool_start":
-        print(f"\n--- Calling tool: {event['name']} ---")
-    elif kind == "on_tool_end":
-        print(f"\n--- Tool result: {event['data'].content[:50]} ---")
+import asyncio
+
+from langchain_core.messages import HumanMessage
+
+
+async def stream_events():
+    # Stream all events
+    async for event in app.astream_events(
+        {"messages": [HumanMessage(content="Analyze this dataset")]},
+        config=config,
+        version="v2",
+    ):
+        kind = event["event"]
+        if kind == "on_chat_model_stream":
+            # Individual tokens from the LLM
+            print(event["data"]["chunk"].content, end="", flush=True)
+        elif kind == "on_tool_start":
+            print(f"\n--- Calling tool: {event['name']} ---")
+        elif kind == "on_tool_end":
+            print(f"\n--- Tool result: {event['data'].content[:50]} ---")
+
+
+asyncio.run(stream_events())
 ```
 
 You can also stream node-level updates to see when each step completes:

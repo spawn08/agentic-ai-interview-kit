@@ -34,16 +34,30 @@ Before designing recovery strategies, categorize the errors your system will enc
 The standard pattern for transient failures. Exponential backoff prevents thundering herd; jitter prevents synchronized retries from multiple workers.
 
 ```python
-def retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=60.0, jitter=True):
-    # Decorator: retries on transient exceptions with exponential backoff
-    for attempt in range(max_retries + 1):
-        try:
-            return await func(*args, **kwargs)
-        except retryable_exceptions:
-            if attempt == max_retries: raise
-            delay = min(base_delay * (2 ** attempt), max_delay)
-            if jitter: delay *= (0.5 + random.random())
-            await asyncio.sleep(delay)
+import asyncio
+import functools
+import random
+
+
+def retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=60.0, jitter=True,
+                       retryable_exceptions=(Exception,)):
+    """Decorator: retry an async call on transient exceptions with backoff."""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except retryable_exceptions:
+                    if attempt == max_retries:
+                        raise
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    if jitter:
+                        delay *= (0.5 + random.random())
+                    await asyncio.sleep(delay)
+        return wrapper
+    return decorator
+
 
 # Usage
 class LLMClient:
@@ -337,6 +351,10 @@ Every external call needs a timeout. Without explicit timeouts, a hanging LLM ca
 ### Timeout Budget Pattern
 
 ```python
+import asyncio
+import time
+
+
 class TimeoutBudget:
     # Distributes a total timeout across sequential steps
     def __init__(self, total_seconds):
@@ -350,8 +368,8 @@ class TimeoutBudget:
 # Usage: split remaining budget across LLM + tool
 async def execute_agent_step(step, budget):
     if budget.remaining <= 0: raise TimeoutBudgetExhaustedError()
-    reasoning = await wait_for(llm.generate(step.prompt), budget.allocate(0.6))
-    result = await wait_for(tool.execute(step.tool, step.params), budget.allocate(0.4))
+    reasoning = await asyncio.wait_for(llm.generate(step.prompt), budget.allocate(0.6))
+    result = await asyncio.wait_for(tool.execute(step.tool, step.params), budget.allocate(0.4))
     return reasoning, result
 ```
 

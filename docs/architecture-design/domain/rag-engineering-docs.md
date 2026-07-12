@@ -271,6 +271,159 @@ For engineering firms, $0.06 per query is trivial compared to an engineer spendi
 
 ---
 
+## Data Model
+
+The corpus is modeled as **documents with an explicit revision history and provenance**, so that a citation can always be traced back to a specific revision, page, and verbatim span. The `is_current` flag drives version-aware retrieval, and the foreign key from a citation to a real chunk is what makes fabrication structurally impossible.
+
+```sql
+-- Logical document, independent of revision
+CREATE TABLE documents (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    doc_key        VARCHAR(80) NOT NULL,         -- stable external id, e.g. 'ASTM-A36'
+    title          TEXT NOT NULL,
+    doc_type       VARCHAR(30) NOT NULL CHECK (doc_type IN
+                     ('manual', 'specification', 'standard', 'blueprint', 'datasheet', 'filing')),
+    classification VARCHAR(20) NOT NULL DEFAULT 'unclassified'
+                     CHECK (classification IN ('unclassified', 'confidential', 'export_controlled')),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (doc_key)
+);
+
+-- Revision history with provenance and integrity data
+CREATE TABLE document_versions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    revision        VARCHAR(40) NOT NULL,        -- e.g. 'Rev C', '2021'
+    effective_date  DATE NOT NULL,
+    superseded_date DATE,                        -- NULL => still in force
+    is_current      BOOLEAN NOT NULL DEFAULT false,
+    source_uri      TEXT NOT NULL,               -- provenance: where the ingested file came from
+    checksum        VARCHAR(64) NOT NULL,        -- integrity of the ingested source
+    UNIQUE (document_id, revision)
+);
+-- Exactly one current revision per document (partial unique index)
+CREATE UNIQUE INDEX idx_one_current_rev ON document_versions(document_id) WHERE is_current;
+
+-- Retrievable chunks, each bound to a specific revision
+CREATE TABLE chunks (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    version_id   UUID NOT NULL REFERENCES document_versions(id) ON DELETE CASCADE,
+    chunk_type   VARCHAR(12) NOT NULL CHECK (chunk_type IN
+                   ('text', 'table', 'equation', 'figure', 'summary')),
+    section_path TEXT,                           -- 'Ch 3 > Structural Requirements > Load Combinations'
+    page_number  INTEGER,
+    content      TEXT NOT NULL,
+    content_hash VARCHAR(64) NOT NULL,           -- detect chunk drift; verify citation target unchanged
+    embedding    vector(1536),
+    token_count  INTEGER,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_chunks_embedding ON chunks USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
+CREATE INDEX idx_chunks_version ON chunks(version_id);
+
+-- Every citation attached to an answer must map to a real retrieved chunk
+CREATE TABLE answer_citations (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    answer_id     UUID NOT NULL,
+    chunk_id      UUID NOT NULL REFERENCES chunks(id),            -- FK => citation cannot be invented
+    version_id    UUID NOT NULL REFERENCES document_versions(id),
+    quoted_span   TEXT NOT NULL,                                  -- exact text the claim rests on
+    span_verified BOOLEAN NOT NULL DEFAULT false,                 -- span found verbatim in chunk.content
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_citations_answer ON answer_citations(answer_id);
+```
+
+---
+
+## Hallucination and Citation Integrity
+
+Incorrect information in an engineering RAG system can have safety and legal consequences, so citation integrity is enforced as a hard invariant rather than a best effort. Three rules are non-negotiable.
+
+1. **Every answer cites a retrieved chunk.** The generator may only assert claims that are backed by chunks in the assembled context. Each factual sentence carries a citation identifier; an answer containing an uncited claim is rejected and regenerated rather than shown.
+2. **Retrieval is version-aware.** By default the searcher filters to `document_versions.is_current = true`, so a superseded spec revision is never served silently. Older revisions are included only when the query explicitly asks for a specific version or an as-of date, and any non-current result is annotated with a warning.
+3. **Citations are validated before display.** After generation, every citation is checked: the `chunk_id` must belong to the set that was actually retrieved, the quoted span must appear verbatim in that chunk (guarded by `content_hash`), and the revision must satisfy the active version policy. If validation fails, the answer is refused or regenerated -- it is never displayed with an unverified citation.
+
+```mermaid
+graph LR
+    Gen[LLM Answer<br/>+ Citations] --> Grounded{Every claim<br/>cites a chunk?}
+    Grounded -->|No| Regen[Regenerate<br/>with grounding prompt]
+    Grounded -->|Yes| InSet{Chunk in<br/>retrieved set?}
+    InSet -->|No| Reject[Reject: fabricated citation]
+    InSet -->|Yes| Span{Span verbatim<br/>in chunk?}
+    Span -->|No| Reject
+    Span -->|Yes| Ver{Revision matches<br/>version policy?}
+    Ver -->|No| Reject
+    Ver -->|Yes| Show[Display with<br/>deep-link citations]
+    Regen --> Gen
+
+    style Gen fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style Show fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style Reject fill:#e76f51,stroke:#e9c46a,color:#f4a261
+```
+
+The post-generation validator makes the invariant concrete: a citation is only accepted if it maps to a chunk that was retrieved, quotes that chunk verbatim, and respects the version policy.
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass
+class Chunk:
+    id: str
+    version_id: str
+    content: str
+    is_current: bool
+
+
+@dataclass
+class Citation:
+    chunk_id: str
+    quoted_span: str
+
+
+class CitationError(Exception):
+    """Raised when an answer fails citation-integrity validation."""
+
+
+def validate_citations(citations, retrieved, allow_superseded=False):
+    """Reject answers whose citations are fabricated, off-corpus, or version-stale.
+
+    - every citation must map to a chunk that was actually retrieved
+    - the quoted span must appear verbatim in that chunk (no paraphrased 'evidence')
+    - non-current revisions are refused unless the caller explicitly opts in
+    Returns the validated citations, or raises CitationError.
+    """
+    by_id = {c.id: c for c in retrieved}
+    validated = []
+    for cit in citations:
+        chunk = by_id.get(cit.chunk_id)
+        if chunk is None:
+            raise CitationError(f"fabricated citation: {cit.chunk_id} not in retrieved set")
+        if cit.quoted_span not in chunk.content:
+            raise CitationError(f"unverifiable span for chunk {cit.chunk_id}")
+        if not chunk.is_current and not allow_superseded:
+            raise CitationError(f"stale revision cited: {chunk.version_id}")
+        validated.append(cit)
+    if not validated:
+        raise CitationError("answer has no grounded citations")
+    return validated
+```
+
+---
+
+## Failure Modes and Production Issues
+
+| Symptom | Root Cause | Fix |
+|---------|-----------|-----|
+| Citation fabrication (answer cites a page/section that does not support the claim, or an invented document) | The LLM produces a plausible-looking citation that is not grounded in the retrieved context | Enforce grounding with the `answer_citations` FK to `chunks`; run the post-generation validator so the quoted span must appear verbatim (`content_hash`); regenerate or refuse if any claim is uncited |
+| Version-mismatched retrieval (serves a superseded spec revision) | Retrieval was not filtered by `is_current`; multiple revisions of the same document share the index | Default the searcher to `is_current = true`; annotate any non-current hit with a warning; surface older revisions only on an explicit version or as-of query |
+| Chunk-boundary context loss (a table row or equation is split, and the answer misreads a value) | Fixed-size chunking cut a table or dropped the context around an equation | Keep table and equation chunks **atomic** (never split); store `section_path`; carry neighbor context for equations; use `content_hash` to confirm the cited chunk is whole |
+| Retrieval of the wrong document / standard (a question about ASTM A36 answered from ASTM A992) | The exact standard token was lost in pure semantic search, or query expansion pulled in an adjacent standard | Run hybrid search with a BM25 exact-match boost on standard identifiers; filter on `doc_key` metadata; rerank on the full query-document pair; require the standard's identifier token to appear in the cited chunk |
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

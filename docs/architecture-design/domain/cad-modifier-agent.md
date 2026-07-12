@@ -267,6 +267,120 @@ For an engineer whose time costs $60-100/hour, even a $1 session cost is trivial
 
 ---
 
+## Data Model
+
+The persistence layer must guarantee that every AI-initiated change is reversible and auditable. Geometry precision is preserved by storing coordinates as fixed-precision `NUMERIC` in meters (never floats), and version history is stored as delta snapshots rather than full model copies.
+
+### cad_sessions -- multi-turn modification session
+
+```sql
+CREATE TABLE cad_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id VARCHAR(64) NOT NULL,
+    model_id VARCHAR(128) NOT NULL,
+    source_format VARCHAR(10) NOT NULL CHECK (source_format IN ('dxf', 'step', 'ifc', 'dwg')),
+    unit VARCHAR(10) NOT NULL DEFAULT 'meter',
+    tolerance_mm NUMERIC(10, 6) NOT NULL DEFAULT 0.001,
+    status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'idle', 'closed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_cad_sessions_user_model ON cad_sessions(user_id, model_id);
+```
+
+### model_checkpoints -- delta snapshots for undo/redo
+
+```sql
+CREATE TABLE model_checkpoints (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES cad_sessions(id) ON DELETE CASCADE,
+    parent_checkpoint_id UUID REFERENCES model_checkpoints(id),
+    label VARCHAR(64) NOT NULL,             -- e.g. 'cp-23'
+    delta_uri TEXT NOT NULL,                -- object-store pointer to the delta snapshot
+    delta_bytes BIGINT NOT NULL,
+    element_count INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_checkpoints_session ON model_checkpoints(session_id, created_at DESC);
+```
+
+### operations -- parametric operations translated from NL
+
+```sql
+CREATE TABLE operations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES cad_sessions(id) ON DELETE CASCADE,
+    checkpoint_id UUID REFERENCES model_checkpoints(id),
+    instruction TEXT NOT NULL,              -- raw natural-language instruction
+    op_type VARCHAR(24) NOT NULL CHECK (op_type IN (
+        'translate', 'rotate', 'scale', 'mirror', 'extend', 'trim',
+        'fillet', 'chamfer', 'add', 'remove', 'copy', 'modify_param', 'align', 'distribute')),
+    params JSONB NOT NULL,                  -- exact numeric parameters, meters at 4 dp
+    risk_level VARCHAR(10) NOT NULL CHECK (risk_level IN ('low', 'medium', 'high', 'critical')),
+    affected_element_count INTEGER NOT NULL DEFAULT 0,
+    solver_iterations INTEGER,
+    status VARCHAR(20) NOT NULL DEFAULT 'proposed' CHECK (status IN (
+        'proposed', 'previewed', 'applied', 'rejected', 'rolled_back')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_operations_session ON operations(session_id, created_at DESC);
+CREATE INDEX idx_operations_applied ON operations(status) WHERE status = 'applied';
+```
+
+### cached_elements -- cached geometry and metadata per element
+
+```sql
+CREATE TABLE cached_elements (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES cad_sessions(id) ON DELETE CASCADE,
+    element_ref VARCHAR(64) NOT NULL,       -- native CAD id, e.g. 'wall_47'
+    element_type VARCHAR(32) NOT NULL,      -- wall, door, beam, pipe, ...
+    bbox_min JSONB NOT NULL,                -- [x, y, z] in meters
+    bbox_max JSONB NOT NULL,
+    centroid JSONB NOT NULL,
+    properties JSONB,                       -- area, volume, topology type, tolerances
+    embedding vector(768),                  -- element-description embedding for semantic lookup
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (session_id, element_ref)
+);
+CREATE INDEX idx_elements_type ON cached_elements(session_id, element_type);
+CREATE INDEX idx_elements_embedding ON cached_elements USING hnsw (embedding vector_cosine_ops);
+```
+
+### change_audit -- audit trail of applied changes
+
+```sql
+CREATE TABLE change_audit (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    operation_id UUID NOT NULL REFERENCES operations(id),
+    change_ref VARCHAR(64) NOT NULL,        -- e.g. 'ch-89'
+    from_checkpoint UUID REFERENCES model_checkpoints(id),
+    to_checkpoint UUID REFERENCES model_checkpoints(id),
+    validation_report JSONB NOT NULL,       -- per-check pass/fail: geometry, dims, structural, clearance
+    confirmed_by VARCHAR(64),               -- user id for high/critical typed confirmation
+    confirmation_type VARCHAR(20) CHECK (confirmation_type IN ('auto', 'click', 'typed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_audit_operation ON change_audit(operation_id);
+```
+
+---
+
+## Failure Modes / Production Issues
+
+In a domain where approximate answers are unacceptable, most production incidents come from silent geometric corruption rather than crashes. The failure modes below map directly to the validator gate, the constraint solver, and the checkpoint-before-execute invariant.
+
+| Symptom | Root Cause | Fix |
+|---------|-----------|-----|
+| Modified model fails to regenerate / rebuild after an operation | A parametric edit invalidated a downstream feature or broke a B-Rep face loop | Regenerate on the cloned state first; on regeneration error reject the operation and roll back to the pre-operation checkpoint before any commit; surface the failing feature to the user |
+| Dimensions drift by fractions of a millimeter over a session | Repeated float conversions between the model unit and internal representation accumulate rounding error | Store all coordinates as fixed-precision `NUMERIC` in meters at 4 dp; convert exactly once at parse and once at export; compare with `tolerance_mm`, never exact float equality |
+| Boolean / union produces non-manifold or self-intersecting geometry | Coincident faces or near-zero-thickness walls from a scaled or mirrored operation | Run manifold and self-intersection checks in the validator gate; snap near-coincident vertices within tolerance; reject and report the offending elements instead of committing |
+| A destructive change cannot be undone | Operation committed before a checkpoint was created, or the checkpoint delta was empty | Enforce the checkpoint-before-execute ordering; treat a missing or empty delta as a hard failure that blocks the commit |
+| Constraint solver never converges (hits the 50-iteration limit) | Over-constrained or cyclic constraint graph; conflicting dimensional constraints | Detect cycles before solving and cap traversal depth at 5; on non-convergence report the unsatisfied constraints with suggested parameter relaxations rather than applying a partial result |
+| Instruction applied to the wrong element | A natural-language reference resolved to the wrong candidate when several elements matched | Never guess on multiple matches -- raise an ambiguity error and open a clarification dialog; record the resolved `element_ref` in the audit trail |
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

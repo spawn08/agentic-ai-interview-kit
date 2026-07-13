@@ -1679,6 +1679,9 @@ Human evaluation remains the ground truth for hallucination measurement. Automat
 **Benchmarking and alerting:**
 
 ```python
+from collections import deque
+
+
 class HallucinationMonitor:
     """
     Tracks hallucination rate over time and alerts on regression.

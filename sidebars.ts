@@ -10,6 +10,7 @@ const sidebars: SidebarsConfig = {
       link: {type: 'generated-index', description: 'Prerequisite knowledge for understanding agentic AI.'},
       items: [
         'foundations/llm-fundamentals',
+        'foundations/reasoning-models',
         'foundations/prompting-techniques',
         'foundations/embeddings-and-vector-stores',
         'foundations/rag-basics',
@@ -25,9 +26,12 @@ const sidebars: SidebarsConfig = {
       items: [
         'core-concepts/what-are-agents',
         'core-concepts/tools-and-function-calling',
+        'core-concepts/model-context-protocol',
         'core-concepts/planning-and-reasoning',
         'core-concepts/memory-systems',
+        'core-concepts/context-engineering',
         'core-concepts/agent-architectures',
+        'core-concepts/agent-interop-protocols',
         'core-concepts/guardrails-and-safety',
       ],
     },

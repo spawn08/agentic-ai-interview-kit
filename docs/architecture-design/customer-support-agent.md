@@ -303,6 +303,40 @@ The Redis session store runs in cluster mode with 3 shards and 2 replicas per sh
 
 LLM API calls are distributed across multiple providers (OpenAI primary, Azure OpenAI fallback) with a combined rate limit of 10,000+ requests per minute and automatic failover.
 
+### Capacity Estimation
+
+Before committing to replica counts and provider quotas, size the system from first principles. The figures below are back-of-the-envelope estimates for the 5,000 concurrent-session peak -- treat them as planning numbers, not measured values.
+
+**Step 1 -- Request rate.** A "concurrent session" is a customer with an open chat, but most of that time is spent reading and typing, not waiting on the LLM. Assume each active session sends one turn every ~30 seconds.
+
+| Quantity | Estimate | Derivation |
+|----------|----------|-----------|
+| Peak concurrent sessions | 5,000 | Requirement |
+| Turns per session per minute | 2 | One turn every ~30s while active |
+| Fleet turn rate | 10,000 turns/min (~167/sec) | 5,000 x 2 |
+| Tokens per turn (in + out) | ~6,500 | Context budget table (Agent Memory) |
+| Aggregate token demand | ~65M TPM | 10,000 x 6,500 |
+| GPT-4o demand (40% order/return) | ~26M TPM | 0.40 x 65M |
+| GPT-4o-mini demand (60% FAQ) | ~39M TPM | 0.60 x 65M |
+
+**Step 2 -- TPM budget vs. provider quota.** The ~26M tokens-per-minute of GPT-4o demand exceeds any single deployment's quota (a typical Azure OpenAI GPT-4o deployment is provisioned in the low millions of TPM; OpenAI's top usage tier caps around 30M TPM). Applying a 1.5x safety headroom, the target is ~39M TPM -- which no single deployment satisfies. This is the concrete justification for the multi-provider LLM Gateway: spread GPT-4o traffic across the OpenAI account plus two or three Azure OpenAI deployments, each contributing a few million TPM. Prompt caching (see Cost Analysis) cuts billed input tokens on multi-turn conversations by ~40%, lowering effective GPT-4o demand from ~26M toward ~16M TPM and reclaiming quota headroom.
+
+**Step 3 -- Worker/replica count.** Workers are sized by concurrent in-flight LLM calls, not by total sessions. With a ~2-second LLM turn and a turn every ~30 seconds, each session is "in flight" only ~7% of the time:
+
+`concurrent in-flight ~= 5,000 x (2s / 30s) ~= 335 requests`
+
+At the auto-scaler's target of 10 concurrent (in-flight) sessions per worker, that is ~34 workers at the 5,000-session peak -- comfortably inside the 5--100 replica band defined above. The 100-replica ceiling covers ~1,000 in-flight requests (~14,000 sessions at the same duty cycle); semantic caching and tightened routing absorb the remainder of a 20,000-session Black Friday spike without raising the ceiling.
+
+**Step 4 -- Redis session memory.** Each session holds the last 10 messages, the current intent/plan, and a small tool-result cache -- roughly 10 KB per session:
+
+`5,000 sessions x 10 KB ~= 50 MB` at peak; `20,000 sessions x 10 KB ~= 200 MB` at Black Friday.
+
+Memory is therefore not the binding constraint. At ~4 Redis operations per turn, 10,000 turns/min is only ~670 ops/sec -- trivial for a single node. The 3-shard, 2-replica cluster is chosen for high availability and failover (a shard loss must not drop live sessions), not for memory capacity. The binding constraint on this system is LLM provider TPM, which is why the Bottleneck Analysis below leads with rate limits.
+
+:::info Illustrative figures
+These estimates assume a 30-second inter-turn interval and a ~6,500-token turn. Real traffic varies by hour and channel; instrument actual turn intervals and token counts in production and re-derive quotas quarterly. The method -- sessions -> turns/min -> TPM -> quota, then in-flight ratio -> replicas, then per-session size -> memory -- matters more than the exact numbers.
+:::
+
 ### Bottleneck Analysis
 
 | Component | Bottleneck | Mitigation |
@@ -365,6 +399,25 @@ The blended cost per conversation ($0.01) is well under the $0.15 budget. This h
 | Observability (Langfuse, Grafana) | $500 |
 | **Total monthly cost** | **$18,500** |
 
+### Prompt Caching
+
+The per-conversation costs above assume every turn re-sends the full input context. In practice a large, identical prefix is sent on every turn of a conversation: the system prompt, the tool definitions, and (within a topic) the retrieved knowledge base context -- the stable prefix described in the Context Window Strategy. Provider prompt caching bills that prefix at a steep discount after the first turn. Anthropic charges ~1.25x the base input rate to *write* a cache entry and ~0.1x to *read* it (a ~90% discount on cached tokens); OpenAI applies an automatic ~50% discount on cached input tokens for prefixes over 1,024 tokens. Only the stable prefix is cached -- the dynamic tail (the new user message, fresh tool results, the rolling summary) is billed normally.
+
+Savings scale with conversation length, because the prefix is re-read on every turn. Consider a mid-length order conversation on GPT-4o -- 6 turns, a ~3,000-token stable prefix (system prompt + tool definitions + retrieved policy context), ~500 dynamic input tokens per turn, and ~300 output tokens per turn. Using Anthropic-style cache pricing:
+
+| Item | Without caching | With prompt caching |
+|------|----------------|--------------------|
+| Stable prefix input | 3,000 x 6 = 18,000 tok @ $2.50/1M = $0.045 | 1 write ($0.0094) + 5 reads ($0.0038) = $0.013 |
+| Dynamic input | 500 x 6 = 3,000 tok @ $2.50/1M = $0.0075 | $0.0075 |
+| Output | 300 x 6 = 1,800 tok @ $10/1M = $0.018 | $0.018 |
+| **Total LLM cost** | **~$0.070** | **~$0.039** |
+
+Caching cuts the input portion by ~60% and the total by ~45% on this conversation, and it also lowers latency: the cached prefix skips re-encoding on the provider side, improving time-to-first-token on long prefixes.
+
+:::info Illustrative figures
+These numbers are illustrative and use Anthropic-style cache read/write multipliers; exact discounts and the minimum cacheable prefix length differ by provider and change over time. The savings are largest on the long-conversation tail -- the 5% of conversations exceeding 20 turns that the Production Issues section identifies as ~40% of token spend. Applied across the fleet, prompt caching trims the blended cost per conversation from ~$0.010 toward ~$0.007, extending the existing headroom under the $0.15 budget rather than replacing the estimate above. Typical short (2--3 turn) conversations see smaller absolute savings because the prefix is re-read fewer times.
+:::
+
 ---
 
 ## Failure Modes and Mitigations
@@ -376,6 +429,188 @@ The blended cost per conversation ($0.01) is well under the $0.15 budget. This h
 | Order API down | Cannot look up orders | Return cached data if available; apologize and create ticket |
 | Vector store slow | Slow FAQ responses | Cache top-100 FAQ answers; serve from cache on timeout |
 | Prompt injection | Unauthorized actions | Input filtering, tool sandboxing, least privilege |
+
+---
+
+## Saga and Compensating Transactions
+
+Several agent tools are not read-only -- `issue_refund`, `create_support_ticket`, and the outbound email/notification tool all mutate external systems. When a single turn triggers more than one write, partial failure becomes a first-class concern:
+
+- The refund succeeds but ticket creation fails, leaving money returned with no case tracking the follow-up.
+- A network timeout *after* a successful refund triggers a retry that issues the refund a second time.
+- The email confirmation fires before the refund is actually committed upstream, promising the customer something that did not happen.
+
+These are distributed-transaction problems. There is no two-phase commit spanning an internal refund service, a third-party ticketing SaaS, and an email provider, so the system relies on **sagas**: a sequence of local writes, each paired with a compensating action that semantically undoes it if a later step fails.
+
+### Idempotency vs. Compensation
+
+Two distinct mechanisms are needed, and conflating them is a common design error:
+
+- **Tool-level idempotency** protects a single write from being applied twice. Every write tool call carries an idempotency key derived from the saga id and step name; the downstream service (or the saga log's unique constraint) rejects a replay of the same key. This is what prevents a retry from double-issuing a refund.
+- **Workflow-level compensation** protects the *set* of writes from ending in a partially-applied state. If step 2 fails after step 1 committed, idempotency alone does not help -- step 1's effect must be actively reversed. That reversal is the compensating action.
+
+Idempotency makes each step safe to retry; compensation makes the whole workflow safe to abandon.
+
+### Compensating Action per Write Tool
+
+| Write tool | Forward effect | Compensating action | Notes |
+|-----------|---------------|--------------------|-------|
+| `issue_refund` | Credits the customer | `void_refund` / reversing adjustment | Reversal must itself be idempotent; if the refund already settled, book a balancing charge rather than deleting the record |
+| `create_support_ticket` | Opens a case | `close_ticket` with reason `saga_rollback` | Never hard-delete -- closing preserves the audit trail required for SOC 2 |
+| `send_email` / notification | Customer is notified | Send a correcting follow-up | Email cannot be "unsent"; prefer to defer side effects that cannot be compensated until the saga commits |
+
+The last row is the key principle: **order steps so that irreversible or hard-to-compensate actions run last**, after all reversible writes have succeeded. Customer-facing email is deferred until the refund and ticket are both committed.
+
+### Compensation Path
+
+```mermaid
+sequenceDiagram
+    participant RA as Return Agent
+    participant Saga as Saga Orchestrator
+    participant Log as Saga Log
+    participant Refund as Refund Service
+    participant Ticket as Ticketing System
+
+    RA->>Saga: Resolve return (refund + follow-up ticket)
+    Saga->>Log: record(step=refund, state=started)
+    Saga->>Refund: issue_refund(key=saga:refund)
+    Refund-->>Saga: {refund_id: rf_123}
+    Saga->>Log: record(step=refund, state=completed)
+
+    Saga->>Log: record(step=ticket, state=started)
+    Saga->>Ticket: create_support_ticket(...)
+    Ticket--xSaga: 503 Service Unavailable (retries exhausted)
+
+    Note over Saga,Log: forward step failed -> unwind in reverse order
+    Saga->>Log: record(step=refund, state=compensating)
+    Saga->>Refund: void_refund(rf_123)
+    Refund-->>Saga: reversed
+    Saga->>Log: record(step=refund, state=compensated)
+    Saga-->>RA: compensated -- no partial state left
+```
+
+### Saga / Compensation Log
+
+The saga log is the durable source of truth for in-flight and recoverable workflows. Every step transition is written *before* the side effect is attempted, so a worker crash mid-saga can be recovered by a background reconciler that scans for stuck states and either retries forward or drives compensation.
+
+```sql
+CREATE TABLE saga_log (
+    saga_id UUID NOT NULL,
+    step_name VARCHAR(40) NOT NULL,
+    tool VARCHAR(40) NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    state VARCHAR(20) NOT NULL
+        CHECK (state IN ('started', 'completed', 'compensating', 'compensated', 'failed')),
+    request JSONB,
+    response JSONB,
+    conversation_id UUID REFERENCES conversations(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (saga_id, step_name)
+);
+
+-- Tool-level idempotency: a given key applies its write exactly once, even across retries
+CREATE UNIQUE INDEX idx_saga_idempotency ON saga_log(idempotency_key);
+
+-- Recovery job: find sagas stuck mid-flight so a reconciler can resume or compensate them
+CREATE INDEX idx_saga_recovery ON saga_log(state, updated_at)
+    WHERE state IN ('started', 'compensating', 'failed');
+```
+
+The orchestrator itself is small -- it runs each step in order, records state, and unwinds completed steps in reverse when a forward step fails:
+
+```python
+import logging
+import uuid
+from dataclasses import dataclass, field
+from typing import Callable
+
+logger = logging.getLogger("saga")
+
+
+@dataclass
+class SagaStep:
+    name: str
+    action: Callable[[dict], dict]        # forward write; idempotent on ctx["idempotency_key"]
+    compensation: Callable[[dict], None]  # inverse write; must also be idempotent
+
+
+@dataclass
+class SagaLog:
+    saga_id: str
+    completed: list = field(default_factory=list)  # (step_name, result) in commit order
+
+    def record(self, step_name: str, result: dict) -> None:
+        self.completed.append((step_name, result))
+
+
+class Saga:
+    """Orchestrated saga: one coordinator runs steps in order and unwinds on failure."""
+
+    def __init__(self, steps: list[SagaStep]) -> None:
+        self.steps = steps
+        self._by_name = {step.name: step for step in steps}
+
+    def run(self, context: dict) -> dict:
+        log = SagaLog(saga_id=str(uuid.uuid4()))
+        for step in self.steps:
+            # idempotency key ties this write to (saga, step) so a retry cannot double-apply
+            context["idempotency_key"] = f"{log.saga_id}:{step.name}"
+            try:
+                result = step.action(context)
+            except Exception as exc:  # forward step failed after its own retries
+                logger.warning("saga %s failed at %s: %s", log.saga_id, step.name, exc)
+                self._compensate(log, context)
+                return {"status": "compensated", "saga_id": log.saga_id}
+            log.record(step.name, result)
+        return {"status": "committed", "saga_id": log.saga_id}
+
+    def _compensate(self, log: SagaLog, context: dict) -> None:
+        # unwind completed steps in reverse order
+        for step_name, result in reversed(log.completed):
+            try:
+                self._by_name[step_name].compensation({**context, "result": result})
+            except Exception as exc:
+                # compensation must never be silently dropped; hand off to the reconciler
+                logger.error("compensation for %s failed, needs reconciliation: %s", step_name, exc)
+
+
+def issue_refund(ctx: dict) -> dict:
+    # real impl passes ctx["idempotency_key"] to the refund provider
+    return {"refund_id": "rf_123", "amount": ctx["amount"]}
+
+
+def void_refund(ctx: dict) -> None:
+    logger.info("voiding refund %s", ctx["result"]["refund_id"])
+
+
+def create_support_ticket(ctx: dict) -> dict:
+    return {"ticket_id": "T-9876"}
+
+
+def close_ticket(ctx: dict) -> None:
+    logger.info("closing ticket %s with reason=saga_rollback", ctx["result"]["ticket_id"])
+
+
+saga = Saga([
+    SagaStep("refund", issue_refund, void_refund),
+    SagaStep("ticket", create_support_ticket, close_ticket),
+])
+outcome = saga.run({"amount": 49.99})
+```
+
+### Orchestrated Saga vs. Choreography
+
+| Approach | How it works | Use when |
+|----------|-------------|----------|
+| **Orchestrated saga** (used here) | A central coordinator -- the agent's tool-execution layer -- invokes each write, records state, and drives compensation on failure | A single agent turn triggers a small, known set of writes; you want one place to reason about ordering and rollback; failures must resolve within the conversation's latency budget |
+| **Choreography** | Each service emits events; downstream services react and emit compensating events; no central coordinator | Writes span many independent services and teams, the workflow is long-running/asynchronous, and you want to avoid a coordinator as a coupling point |
+
+For the customer support agent, the write set per turn is small and bounded (at most a refund, a ticket, and a notification), the workflow must complete inside the conversation, and the agent already acts as a natural orchestrator -- so an **orchestrated saga** is the right default. Choreography would add event-bus infrastructure and make it harder to give the customer a synchronous, coherent answer ("your refund is reversed and we've logged the issue"). Reserve choreography for the asynchronous back-office flows (fulfillment, settlement) that sit downstream of the conversation.
+
+:::warning Compensation is best-effort, not free
+A compensating action can itself fail (the refund provider is down when you try to void). Sagas guarantee *eventual* consistency, not atomicity: the saga log plus a reconciler that retries compensations out-of-band is mandatory. Design compensations to be idempotent and safe to run repeatedly, and alert when a saga sits in `compensating` or `failed` beyond an SLA.
+:::
 
 ---
 

@@ -181,7 +181,7 @@ The Risk Engine is the safety cornerstone. It is written in Rust for performance
 - **Concentration limits**: Maximum sector and correlation-based exposure.
 - **Circuit breaker**: If the risk engine detects anomalous behavior (e.g., 10 consecutive losing trades, unusual position size requests), it halts trading and alerts the operations team.
 
-For large orders (above a configurable notional threshold, e.g., $500K), the dual risk engine consensus is required: both the primary and secondary risk engines must independently approve the trade. The secondary engine runs on separate hardware with independently maintained rule sets, providing protection against a bug in a single risk engine implementation.
+For large orders (above a configurable notional threshold, e.g., $50K), the dual risk engine consensus is required: both the primary and secondary risk engines must independently approve the trade. The secondary engine runs on separate hardware with independently maintained rule sets, providing protection against a bug in a single risk engine implementation.
 
 ### 3. Kill Switch
 

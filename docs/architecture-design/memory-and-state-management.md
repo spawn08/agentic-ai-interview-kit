@@ -65,6 +65,9 @@ In a horizontally scaled system, agent workers are stateless. All state lives in
 ### Session State Schema
 
 ```python
+from typing import Any
+
+
 class SessionState:
     session_id: str
     user_id: str
@@ -155,6 +158,9 @@ For most production systems, **per-step checkpointing** is the right default. Th
 For interactive chat, the session typically lasts minutes to hours. Redis with TTL is the standard choice.
 
 ```python
+import redis
+
+
 class RedisSessionStore:
     def __init__(self, redis_url):
         self.client = redis.from_url(redis_url)
@@ -305,6 +311,9 @@ When multiple workers or agent branches update the same state concurrently, conf
 ### Optimistic Concurrency Example
 
 ```python
+import asyncio
+
+
 class OptimisticStateStore:
     async def update(self, session_id, updater_fn, max_retries=5):
         for attempt in range(max_retries):

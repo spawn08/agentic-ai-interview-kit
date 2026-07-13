@@ -205,6 +205,10 @@ The **Consensus Builder** applies resolution strategies in strict priority order
 3. **Cost-benefit analysis** -- for non-safety, non-compliance conflicts, weigh cost against benefit
 4. **Human escalation** -- if no strategy resolves the conflict with confidence above 0.7, route to a human expert
 
+:::info Consensus and deadlock handling
+When two verdicts sit at the **same priority tier** (e.g., two structural findings that contradict each other) the consensus builder applies confidence-weighted voting among the agents that touched the element, and records the winning verdict and its rationale. If the weighted vote is a tie, or resolution loops without converging, the conflict is a **deadlock**: the builder does not silently pick a side. After a bounded number of resolution attempts it stamps the session `awaiting_human` and hands both verdicts to the Escalation Manager. Every automatic resolution stores which strategy fired and the confidence, so the decision trail is auditable.
+:::
+
 ### Report Generation
 
 The report generator organizes all findings by severity (critical, major, minor) and by building system, generates an executive summary using an LLM (3-5 paragraphs suitable for a project manager), builds a compliance matrix showing which code sections were checked and their status, and produces prioritized recommendations. The report includes both structured data for the interactive dashboard and a document export for offline review.
@@ -287,6 +291,88 @@ Building codes vary by jurisdiction and are updated regularly. The standards dat
 | **Total per review** | **$0.46-1.12** | For a typical building design |
 
 For a design review that would take a team of specialists 2-4 hours ($500-1,500 in labor), an automated first-pass at $1 per review provides enormous ROI, especially when considering that it catches issues early in the design cycle where fixes are cheapest.
+
+---
+
+## Data Model
+
+The schema records not just findings but the **provenance of every verdict** -- which agent produced it, at what confidence, against which rule-set version -- and how each conflict was resolved. This is what lets a review be defended after the fact and what prevents a stale code version from silently corrupting a verdict.
+
+```sql
+-- One review of a specific design revision, pinned to a standards snapshot
+CREATE TABLE review_sessions (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id       VARCHAR(128) NOT NULL,
+    design_version   INTEGER NOT NULL,
+    jurisdiction     VARCHAR(80) NOT NULL,
+    rule_set_version VARCHAR(40) NOT NULL,       -- standards snapshot used for the whole review
+    status           VARCHAR(20) NOT NULL DEFAULT 'running'
+                       CHECK (status IN ('running', 'awaiting_human', 'complete', 'failed')),
+    started_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at     TIMESTAMPTZ,
+    UNIQUE (project_id, design_version)
+);
+
+-- Every agent verdict, stamped with confidence and the rule-set version it used
+CREATE TABLE agent_verdicts (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id       UUID NOT NULL REFERENCES review_sessions(id) ON DELETE CASCADE,
+    agent            VARCHAR(20) NOT NULL CHECK (agent IN
+                       ('structural', 'compliance', 'sustainability', 'cost', 'mep', 'constructability')),
+    element_id       TEXT NOT NULL,              -- BIM element the finding refers to
+    verdict          VARCHAR(12) NOT NULL CHECK (verdict IN ('pass', 'fail', 'flag')),
+    severity         VARCHAR(12) CHECK (severity IN ('critical', 'major', 'minor')),
+    code_section     VARCHAR(40),
+    rule_set_version VARCHAR(40) NOT NULL,       -- must match the session; detects version drift
+    confidence       NUMERIC(4,3) NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+    recommendation   TEXT,
+    degraded         BOOLEAN NOT NULL DEFAULT false,  -- true if agent ran reduced-scope after timeout
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_verdicts_session ON agent_verdicts(session_id);
+CREATE INDEX idx_verdicts_element ON agent_verdicts(session_id, element_id);
+
+-- Detected contradictions between two verdicts on the same element
+CREATE TABLE conflicts (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id    UUID NOT NULL REFERENCES review_sessions(id) ON DELETE CASCADE,
+    verdict_a     UUID NOT NULL REFERENCES agent_verdicts(id),
+    verdict_b     UUID NOT NULL REFERENCES agent_verdicts(id),
+    conflict_type VARCHAR(40) NOT NULL,          -- 'material_quantity', 'penetration', 'over_engineering'...
+    detected_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (verdict_a <> verdict_b)
+);
+
+-- How each conflict was resolved: which strategy fired, who decided, and why
+CREATE TABLE consensus_decisions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conflict_id         UUID NOT NULL REFERENCES conflicts(id) ON DELETE CASCADE,
+    resolution_strategy VARCHAR(20) NOT NULL CHECK (resolution_strategy IN
+                          ('safety', 'compliance', 'cost_benefit', 'human')),
+    winning_verdict     UUID REFERENCES agent_verdicts(id),
+    resolved_by         VARCHAR(20) NOT NULL CHECK (resolved_by IN ('auto', 'human')),
+    confidence          NUMERIC(4,3) CHECK (confidence BETWEEN 0 AND 1),
+    rationale           TEXT,
+    resolved_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX idx_consensus_one_per_conflict ON consensus_decisions(conflict_id);
+```
+
+Stamping `rule_set_version` on both the session and every individual verdict is what surfaces version drift: a verdict whose `rule_set_version` does not match its session is a red flag that an agent read a stale standards snapshot.
+
+---
+
+## Failure Modes and Production Issues
+
+In design review a missed critical defect is a safety and legal exposure, so the system is tuned to fail loud rather than approve on partial evidence.
+
+| Symptom | Root Cause | Fix |
+|---------|-----------|-----|
+| Conflicting reviewer-agent verdicts on the same element (both `fail`, contradictory fixes) | Agents optimize different objectives with no shared priority or tie-break | Persist both as a `conflicts` row; apply the priority hierarchy (safety > compliance > cost-benefit); confidence-weighted vote within a tier; escalate below 0.7 confidence |
+| Missed critical defect / false negative (real safety issue not flagged) | An agent timed out and ran reduced scope; the rule set did not cover the element | Never mark a session `complete` while a safety-relevant agent has `degraded = true`; require structural and compliance to complete at full scope; track recall against a labeled defect benchmark |
+| Over-flagging / false positives erode reviewer trust | Low-confidence verdicts posted verbatim; the same issue reported by multiple agents | Confidence-gate `fail` verdicts before surfacing; deduplicate on `element_id` + issue type; hold the false-positive rate under the 15% NFR target |
+| Consensus deadlock (agents cannot agree; resolution loops) | Two verdicts at equal priority and equal confidence; circular re-review | Bound resolution attempts; on deadlock set session `awaiting_human` and route both verdicts to the Escalation Manager -- never auto-pick silently |
+| Stale rule set (review used a superseded code) | Standards library updated but the session pinned an old snapshot, or verdicts read a different version than the session | Pin `rule_set_version` per session and stamp it on every verdict; reject reviews whose version is not the current jurisdiction release unless explicitly auditing; alert when a verdict's version diverges from its session |
 
 ---
 

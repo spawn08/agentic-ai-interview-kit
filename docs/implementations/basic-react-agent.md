@@ -83,6 +83,7 @@ Pydantic gives you runtime validation, serialization, and self-documenting schem
 
 import math
 import json
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -125,7 +126,7 @@ def wikipedia_search(query: str) -> str:
     """Search Wikipedia and return a brief summary for the given query."""
     url = (
         "https://en.wikipedia.org/api/rest_v1/page/summary/"
-        + urllib.request.quote(query)
+        + urllib.parse.quote(query)
     )
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "ReActAgent/2.0"})

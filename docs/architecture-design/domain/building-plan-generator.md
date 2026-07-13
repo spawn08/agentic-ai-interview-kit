@@ -259,6 +259,91 @@ The IFC (Industry Foundation Classes) output is the most important for professio
 
 ---
 
+## Data Model
+
+The persistence layer must make hard constraints and code citations auditable: every generated variant, every compliance result, and the exact code version it was checked against are stored so that a plan can be defended in a permit review. Geometry is stored in **integer millimeters** to eliminate floating-point unit drift.
+
+```sql
+-- The parsed project brief and the jurisdiction/code version it is bound to
+CREATE TABLE projects (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          TEXT NOT NULL,
+    building_type VARCHAR(40) NOT NULL CHECK (building_type IN
+                    ('residential_sf', 'residential_mf', 'commercial', 'mixed_use')),
+    jurisdiction  VARCHAR(80) NOT NULL,
+    code_version  VARCHAR(40) NOT NULL,          -- e.g. 'IBC-2021'; pinned per project
+    site_area_mm2 BIGINT NOT NULL CHECK (site_area_mm2 > 0),
+    budget_cents  BIGINT,
+    brief         JSONB NOT NULL,                -- rooms, adjacencies, hard/soft constraints
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Authoritative code database; citations are FK-validated against this table
+CREATE TABLE code_provisions (
+    code_section VARCHAR(40) NOT NULL,           -- e.g. 'IBC 1017.1'
+    code_version VARCHAR(40) NOT NULL,
+    title        TEXT NOT NULL,
+    limit_value  NUMERIC(12,3),
+    unit         VARCHAR(12),
+    PRIMARY KEY (code_section, code_version)
+);
+
+-- Each generated candidate, tagged with its generation cycle and feasibility
+CREATE TABLE plan_variants (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id       UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    generation_cycle INTEGER NOT NULL,           -- iterative refinement round
+    variant_index    INTEGER NOT NULL,           -- 1..N within a cycle
+    strategy         VARCHAR(20) NOT NULL CHECK (strategy IN ('grid', 'adjacency', 'llm')),
+    geometry         JSONB NOT NULL,             -- room polygons, dimensions in integer mm
+    objective_scores JSONB NOT NULL,             -- spatial_eff, circulation, adjacency, light, cost...
+    pareto_rank      INTEGER,
+    is_feasible      BOOLEAN NOT NULL DEFAULT false,   -- passed ALL hard constraints
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (project_id, generation_cycle, variant_index)
+);
+
+-- One row per code check; a stored citation must exist in code_provisions
+CREATE TABLE compliance_checks (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    variant_id     UUID NOT NULL REFERENCES plan_variants(id) ON DELETE CASCADE,
+    category       VARCHAR(20) NOT NULL CHECK (category IN
+                     ('egress', 'accessibility', 'zoning', 'fire', 'ventilation', 'structural')),
+    code_section   VARCHAR(40) NOT NULL,
+    code_version   VARCHAR(40) NOT NULL,
+    status         VARCHAR(12) NOT NULL CHECK (status IN ('pass', 'fail', 'warning')),
+    severity       VARCHAR(12) CHECK (severity IN ('critical', 'major', 'minor')),
+    measured_value NUMERIC(12,3),                -- e.g. travel distance in m
+    limit_value    NUMERIC(12,3),                -- code limit from code_provisions
+    detail         TEXT,
+    checked_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- reject hallucinated citations at write time: section+version must be real
+    FOREIGN KEY (code_section, code_version)
+        REFERENCES code_provisions(code_section, code_version)
+);
+CREATE INDEX idx_checks_variant ON compliance_checks(variant_id);
+CREATE INDEX idx_checks_open_critical ON compliance_checks(variant_id)
+    WHERE status = 'fail' AND severity = 'critical';
+```
+
+The composite foreign key from `compliance_checks` to `code_provisions` is deliberate: a finding can never reference a code section that does not exist in the pinned code version, which is the database-level guard against hallucinated citations. Export is blocked while any `critical` check on the chosen variant is `fail`.
+
+---
+
+## Failure Modes and Production Issues
+
+Because approximate answers are unacceptable in building-code compliance and structural safety, the system must treat validation as a hard gate rather than an advisory score.
+
+| Symptom | Root Cause | Fix |
+|---------|-----------|-----|
+| Code-compliance violation slips through (variant marked feasible but fails real permit review) | Compliance check ran on the LLM-rounded geometry or against a stale code version; a check was treated as advisory rather than blocking | Re-run the rule engine as a **hard gate** on final geometry; pin `code_version` per project; block export until every `critical` check is `pass`; never derive feasibility from soft objective scores |
+| Infeasible or unsafe layout (rooms overlap, no load path, egress dead-end) | GA crossover/mutation produced geometry that CSP repair missed; structural feasibility was skipped on timeout | Validate every offspring against hard constraints before it is scored; make structural feasibility a **blocking** stage, not optional; exclude `is_feasible = false` variants from the Pareto set |
+| Unit / dimension error (feet vs. meters, cm vs. mm drift) | Mixed unit systems across parser, optimizer, and exporter; floating-point accumulation | Store all geometry in **integer millimeters**; convert only at render/export; assert the 1cm tolerance in a validation gate before persistence |
+| Constraint conflict produces empty or degenerate result (setback vs. required area, egress vs. adjacency) | Over-constrained program with no feasible region; hard and soft constraints mislabeled | Detect infeasibility in the up-front area-fit sanity check; surface the conflicting constraint pair to the architect; relax only **soft** constraints, never hard ones |
+| Hallucinated code citation (report cites a section that does not exist or wrong jurisdiction) | LLM refiner or report generator invents an IBC section number | FK every `code_section` + `code_version` to `code_provisions` and drop any unmatched citation; the report generator quotes only rule-engine findings, never free-text code numbers |
+
+---
+
 ## Trade-offs & Alternatives
 
 | Decision | Rationale | Alternative | Why Not |

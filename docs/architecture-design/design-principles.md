@@ -19,6 +19,11 @@ An agentic system is not a monolith. The LLM, the tool executor, the memory stor
 ### Example
 
 ```python
+import hashlib
+import json
+from abc import ABC, abstractmethod
+
+
 class ToolExecutor(ABC):
     async def execute(self, tool_name, parameters) -> dict: ...
 
@@ -95,7 +100,8 @@ class IdempotentToolExecutor:
         self._executor, self._cache = executor, cache
 
     async def execute(self, tool_name, parameters, idempotency_key=None):
-        key = idempotency_key or sha256(canonical_json(tool_name, parameters))
+        canonical = json.dumps({"tool": tool_name, "params": parameters}, sort_keys=True)
+        key = idempotency_key or hashlib.sha256(canonical.encode()).hexdigest()
         cached = await self._cache.get(key)
         if cached is not None:
             return cached
@@ -332,9 +338,67 @@ graph TD
 
 ---
 
+## Prompt & KV Caching: The Biggest Lever for Static Prefixes
+
+Before you tune model selection, tune what you re-send. Every major provider now offers **prompt caching** (backed internally by the transformer's KV cache): Anthropic, OpenAI, and Gemini will cache a stable prefix -- the system prompt, tool definitions, and any long static context -- so that repeated calls sharing that prefix skip re-encoding it. For agents with a large static prefix plus repeated RAG context, this is the single biggest cost lever available: it attacks the *input* side of the bill, which the model router (below) does not touch. The two techniques compose -- cache the prefix, then route the completion.
+
+### How It Works
+
+The cache keys on an **exact, byte-stable prefix**. The rules that follow from that are simple but unforgiving:
+
+- **Front-load everything static.** Order the prompt as `system instructions -> tool definitions -> long static context (docs, schemas, few-shot examples) -> dynamic turn`. The cacheable region is the longest common prefix across calls, so anything dynamic placed early shrinks it to nothing.
+- **Keep it byte-stable.** A reordered tool list, a changed timestamp in the system prompt, or a reserialized JSON blob all change the bytes and produce a cache miss. Freeze serialization (`sort_keys=True`, fixed whitespace) for anything in the prefix.
+- **Respect the minimum.** Providers only cache prefixes above a size floor (on the order of ~1K tokens), so tiny prompts see no benefit.
+
+### Cost & Latency Impact
+
+| Provider | Activation | Cached-input pricing (illustrative, 2026) | Notes |
+|----------|-----------|-------------------------------------------|-------|
+| Anthropic | Explicit `cache_control` breakpoints | Cache **write ~1.25x**, cache **read ~0.1x** base input | 5-minute default TTL, 1-hour option |
+| OpenAI | Automatic for prefixes above the size floor | Cached input **~0.5x** base input | No config; matches on exact prefix |
+| Gemini | Explicit context caching + implicit caching | Cached tokens **heavily discounted** (~0.25x) + storage fee | Storage billed per token-hour |
+
+Beyond cost, cached prefixes cut **time-to-first-token (TTFT)** substantially, because the model skips prefill over the cached region -- the latency win is often more noticeable to users than the dollar win.
+
+### Illustrative Before / After
+
+Consider an agent with a **20K-token static prefix** (system prompt + tool definitions + retrieved RAG context) that makes **8 LLM calls per session**, at an illustrative **$3 per 1M input tokens**:
+
+- **Without caching:** 20K x 8 = 160K prefix input tokens/session -> **~$0.48/session** on the prefix alone.
+- **With caching (Anthropic-style):** first call writes at 1.25x (20K -> ~25K-equivalent), the next 7 calls read at 0.1x (20K -> ~2K-equivalent each) -> ~39K-equivalent tokens -> **~$0.12/session**.
+
+That is a **~75% cut on static-prefix input cost**, before any output-side routing savings, plus a materially lower TTFT on calls 2-8. Note this extends -- it does not replace -- the output-token routing savings quantified in the next section; they stack.
+
+### The Tradeoff: Edits Bust the Cache
+
+Because the cache keys on a prefix, **any change invalidates everything after the edit point**. If your context-engineering layer rewrites or compacts mid-conversation history that sits *inside* the cached region, you bust the cache for that call and pay full price to re-encode the entire suffix.
+
+```mermaid
+graph TD
+    A[Stable Prefix] --> B{Prefix bytes unchanged?}
+    B -->|Yes| C[Cache HIT: read at ~0.1-0.5x + low TTFT]
+    B -->|No: edit / compaction| D[Cache MISS from edit point]
+    D --> E[Re-encode full suffix at 1x + high TTFT]
+
+    style A fill:#2d6a4f,stroke:#1b4332,color:#d8f3dc
+    style C fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style D fill:#264653,stroke:#2a9d8f,color:#e9c46a
+    style E fill:#264653,stroke:#2a9d8f,color:#e9c46a
+```
+
+The design implication: treat the cached prefix as append-only. Never mutate earlier context; append new turns and only compact at a boundary you are willing to pay a one-time re-encode for. See [Context Engineering](../core-concepts/context-engineering.md) for how to structure context so compaction and cache boundaries align.
+
+:::warning
+Prompt caching and aggressive context compaction pull in opposite directions. A compaction pass that rewrites the middle of the window looks like a win on token count but can *increase* cost by busting the cache for every subsequent call in the session. Measure end-to-end billed tokens, not window size, before shipping a compaction strategy.
+:::
+
+---
+
 ## Critical Algorithm: Cost-Aware Adaptive Model Router
 
 The single most expensive mistake in agentic AI is routing every LLM call to the same frontier model. In a multi-step agent loop where each session triggers 5-15 LLM calls, sending every call to GPT-4o at ~$10/1M output tokens creates runaway costs. Most of those calls -- classification, parameter extraction, simple reformulation -- do not need frontier-level reasoning. An adaptive router that dispatches each step to the cheapest model meeting quality constraints can cut LLM spend by 60-80% without measurable quality loss on aggregate task completion.
+
+Tiering is not just "cheap vs frontier." Modern routers have **three tiers**: cheap chat models (GPT-4o-mini-class) for simple/latency-sensitive steps, frontier chat models (GPT-4o / Claude Sonnet) for the bulk of moderate-to-complex work, and a **reasoning tier** (o-series-style / extended-thinking models) reserved for the genuinely hard steps -- goal decomposition, multi-step planning, and hard multi-hop reasoning. The reasoning tier has a very different cost/latency profile: it emits thinking tokens, so it is both slower and more expensive per useful token, which is exactly why you gate it behind the classifier rather than defaulting to it.
 
 The naive approach breaks at roughly $5K/month in LLM spend. Below that threshold, the engineering cost of maintaining a router exceeds the savings. Above it, the router pays for itself within weeks.
 
@@ -352,6 +416,7 @@ class Complexity(Enum):
     MODERATE = "moderate"    # multi-step reasoning, tool selection
     COMPLEX = "complex"      # code generation, nuanced analysis
     CRITICAL = "critical"    # financial decisions, safety-critical outputs
+    REASONING = "reasoning"  # decomposition, planning, hard multi-hop reasoning
 
 
 @dataclass
@@ -362,6 +427,7 @@ class ModelConfig:
     quality_score: float          # 0.0 - 1.0, calibrated on eval set
     max_tokens: int
     latency_p50_ms: int
+    is_reasoning: bool = False     # o-series-style / extended-thinking model
 
 
 @dataclass
@@ -412,12 +478,26 @@ class AdaptiveModelRouter:
                 budget.remaining_usd, task.estimated_output_tokens
             )
 
+        # Reasoning tier: decomposition, planning, and hard multi-hop reasoning
+        # go to a dedicated reasoning model (o-series-style / extended-thinking).
+        # Its cost/latency profile is very different from chat models -- higher
+        # per-token cost and much higher latency (thinking tokens), but far
+        # stronger on multi-step logic. Simple and latency-sensitive steps stay
+        # on cheap chat models; only the genuinely hard steps pay this premium.
+        if complexity is Complexity.REASONING:
+            reasoning_models = [m for m in affordable if m.is_reasoning]
+            if reasoning_models:
+                return min(reasoning_models, key=lambda m: m.cost_per_1k_output)
+            # No reasoning model fits the budget -- fall through to the best
+            # affordable chat model under the REASONING quality floor below.
+
         # Quality constraint: model must meet minimum quality for this complexity tier
         quality_floor = {
             Complexity.SIMPLE: 0.5,      # FAQ, classification -- any model works
             Complexity.MODERATE: 0.7,    # multi-step reasoning, tool selection
             Complexity.COMPLEX: 0.85,    # code generation, nuanced analysis
             Complexity.CRITICAL: 0.95,   # financial decisions, safety-critical
+            Complexity.REASONING: 0.9,   # planning/decomposition fallback floor
         }
 
         qualified = [
@@ -478,6 +558,12 @@ class TokenBudget:
 ```
 
 The router's `quality_floor` mapping is the key design decision. Set thresholds too high and you waste budget on over-qualified models for simple tasks. Set them too low and complex reasoning tasks produce unreliable outputs. Calibrate by running an evaluation set against each model tier and measuring task completion accuracy. In practice, start with a conservative mapping (route everything to the frontier model), collect a labeled dataset of task-complexity pairs from production traces, then progressively lower thresholds as you gain confidence in each model tier's accuracy on your specific workloads.
+
+The `REASONING` tier is handled before the quality floor, not by it. When the classifier tags a step as decomposition/planning/hard-reasoning, the router prefers a model with `is_reasoning=True` even though its per-token cost sits well above the chat models -- for these steps, a cheap chat model does not merely produce a lower-quality answer, it produces a *wrong plan* that poisons every downstream step. The economics still favor selectivity: reasoning models are expensive and slow, so a well-tuned classifier routes only the small fraction of steps (typically the first planning call and occasional hard sub-problems) to the reasoning tier, keeping simple and latency-sensitive steps on cheap models. If no reasoning model fits the remaining budget, the router degrades gracefully to the best affordable chat model under a high (`0.9`) quality floor. For when a reasoning model is worth its latency and token premium -- and when extended thinking is wasted -- see [Reasoning Models](../foundations/reasoning-models.md).
+
+:::tip Interview Angle
+When asked "how do you decide which model handles each step?", name all three tiers and the gating logic. The strong answer is that cheap-vs-frontier is a *quality* decision made by a threshold, but chat-vs-reasoning is a *task-shape* decision (planning and decomposition vs execution) made before the threshold -- because a reasoning model's cost/latency profile only pays off on steps whose failure cascades.
+:::
 
 ---
 

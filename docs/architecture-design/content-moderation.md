@@ -582,16 +582,18 @@ In content moderation, "hallucination" manifests differently than in conversatio
 
 ### Moderation Hallucination Prevention Pipeline
 
+This pipeline routes on the **per-category violation score** (how strongly a model believes the content violates a specific policy), which is distinct from the **Confidence Router** described earlier -- that one routes on the agent's *decision confidence* (how sure the agent is of its chosen action, using the 0.95 / 0.7 bands). Here, a higher score means "more likely a violation," so high scores auto-reject and low scores auto-approve, with per-category thresholds for the safe band.
+
 ```mermaid
 graph TB
     Submit[Content Submission] --> DupCheck[Duplicate Check<br/>Content Hash + pHash]
     DupCheck -->|Known Rejected| AutoReject[Auto-Reject<br/>Cite Precedent]
     DupCheck -->|New Content| MultiModel[Multi-Model Classification<br/>Text + Image + Similarity]
-    MultiModel --> ConfRoute[Confidence Routing]
-    ConfRoute -->|Above 0.9| AutoAction[Auto-Approve or Auto-Reject<br/>Based on Policy]
-    ConfRoute -->|0.6 to 0.9| HumanReview[Queue for Human Review]
-    ConfRoute -->|Below 0.6| AutoApprove[Auto-Approve<br/>Low Risk]
-    AutoAction --> Log[Decision Logging<br/>Full Audit Trail]
+    MultiModel --> ViolationRoute[Per-Category Violation Score]
+    ViolationRoute -->|Score above 0.9| AutoReject[Auto-Reject<br/>High Violation Score]
+    ViolationRoute -->|Category threshold to 0.9| HumanReview[Queue for Human Review]
+    ViolationRoute -->|Below category threshold| AutoApprove[Auto-Approve<br/>Low Risk]
+    AutoReject --> Log[Decision Logging<br/>Full Audit Trail]
     HumanReview --> Log
     AutoApprove --> Log
     Log --> AppealPath[Appeal Handling<br/>Independent Review]
@@ -601,7 +603,7 @@ graph TB
 
 The agent flags benign content as harmful. This is the most visible hallucination type because affected users notice immediately and complain.
 
-**Mitigation**: Confidence thresholds per category. The system only auto-rejects content above 0.9 confidence. Content between 0.6 and 0.9 confidence is sent to human review. Content below 0.6 confidence is auto-approved. High-stakes categories (CSAM) use a lower auto-approve threshold (0.3) because the cost of a false negative is catastrophically higher than the cost of a false positive.
+**Mitigation**: Violation-score thresholds per category. The system only auto-rejects content above a 0.9 violation score. Content between the category's safe threshold and 0.9 is sent to human review. Content below the safe threshold is auto-approved. High-stakes categories (CSAM) use a much lower safe threshold (0.3) because the cost of a false negative is catastrophically higher than the cost of a false positive.
 
 | Category | Auto-Approve Below | Human Review | Auto-Reject Above |
 |----------|-------------------|--------------|-------------------|

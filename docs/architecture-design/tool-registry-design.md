@@ -155,6 +155,10 @@ When designing a tool registry for an interview, mention semver compatibility. I
 Before executing a tool call, validate the parameters against the tool's schema. This catches LLM hallucinations (inventing parameters, wrong types) before they reach the tool executor.
 
 ```python
+import jsonschema
+from jsonschema.exceptions import ValidationError
+
+
 class ToolCallValidator:
     def __init__(self, registry): ...
 

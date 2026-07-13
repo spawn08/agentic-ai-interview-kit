@@ -130,26 +130,33 @@ Follow the **single responsibility principle** for plugins. A `WeatherPlugin` sh
 Planners break down a high-level user goal into a sequence of plugin function calls. Modern Semantic Kernel uses **automatic function calling** rather than explicit planners.
 
 ```python
+import asyncio
+
 from semantic_kernel.connectors.ai.open_ai import OpenAIChatCompletion
 from semantic_kernel.connectors.ai.function_choice_behavior import FunctionChoiceBehavior
 from semantic_kernel.contents import ChatHistory
 
-# Configure automatic function calling
-settings = kernel.get_prompt_execution_settings_class("chat")()
-settings.function_choice_behavior = FunctionChoiceBehavior.Auto(
-    filters={"included_plugins": ["math", "text"]}
-)
 
-chat_history = ChatHistory()
-chat_history.add_user_message("What is 42 multiplied by 17, then summarize the result?")
+async def main():
+    # Configure automatic function calling
+    settings = kernel.get_prompt_execution_settings_class("chat")()
+    settings.function_choice_behavior = FunctionChoiceBehavior.Auto(
+        filters={"included_plugins": ["math", "text"]}
+    )
 
-# The kernel automatically routes to the right plugin functions
-result = await kernel.invoke_prompt(
-    prompt="{{$chat_history}}",
-    chat_history=chat_history,
-    settings=settings,
-)
-print(result)
+    chat_history = ChatHistory()
+    chat_history.add_user_message("What is 42 multiplied by 17, then summarize the result?")
+
+    # The kernel automatically routes to the right plugin functions
+    result = await kernel.invoke_prompt(
+        prompt="{{$chat_history}}",
+        chat_history=chat_history,
+        settings=settings,
+    )
+    print(result)
+
+
+asyncio.run(main())
 ```
 
 ### Step-by-Step Planner (Legacy)
@@ -157,17 +164,24 @@ print(result)
 For more explicit planning control, Semantic Kernel previously offered dedicated planner classes.
 
 ```python
+import asyncio
+
 from semantic_kernel.planners import SequentialPlanner
 
-planner = SequentialPlanner(kernel)
-plan = await planner.create_plan("Write a haiku about AI and translate it to French")
 
-# The plan is a sequence of steps using registered plugins
-for step in plan.steps:
-    print(f"Step: {step.plugin_name}.{step.name}")
+async def main():
+    planner = SequentialPlanner(kernel)
+    plan = await planner.create_plan("Write a haiku about AI and translate it to French")
 
-# Execute the plan
-result = await plan.invoke(kernel)
+    # The plan is a sequence of steps using registered plugins
+    for step in plan.steps:
+        print(f"Step: {step.plugin_name}.{step.name}")
+
+    # Execute the plan
+    result = await plan.invoke(kernel)
+
+
+asyncio.run(main())
 ```
 
 :::warning Planner Evolution
@@ -179,40 +193,41 @@ Explicit planners (SequentialPlanner, StepwisePlanner) are being phased out in f
 Semantic Kernel's memory system stores and retrieves information using vector embeddings, enabling RAG-style patterns.
 
 ```python
-from semantic_kernel.memory import SemanticTextMemory
-from semantic_kernel.connectors.memory.azure_cognitive_search import (
-    AzureCognitiveSearchMemoryStore,
-)
+import asyncio
+
+from semantic_kernel.memory import SemanticTextMemory, VolatileMemoryStore
 from semantic_kernel.connectors.ai.open_ai import OpenAITextEmbedding
 
 # Configure memory with an embedding model and a store
 embedding = OpenAITextEmbedding(ai_model_id="text-embedding-3-small")
 
 # In-memory store for development
-from semantic_kernel.memory import VolatileMemoryStore
 store = VolatileMemoryStore()
-
 memory = SemanticTextMemory(storage=store, embeddings_generator=embedding)
 
-# Save information
-await memory.save_information(
-    collection="company_docs",
-    id="doc1",
-    text="Semantic Kernel supports plugins, planners, and memory.",
-    description="SK overview",
-)
 
-await memory.save_information(
-    collection="company_docs",
-    id="doc2",
-    text="Plugins can be native Python functions or prompt templates.",
-    description="Plugin types",
-)
+async def main():
+    # Save information
+    await memory.save_information(
+        collection="company_docs",
+        id="doc1",
+        text="Semantic Kernel supports plugins, planners, and memory.",
+        description="SK overview",
+    )
+    await memory.save_information(
+        collection="company_docs",
+        id="doc2",
+        text="Plugins can be native Python functions or prompt templates.",
+        description="Plugin types",
+    )
 
-# Retrieve relevant information
-results = await memory.search("company_docs", "How do plugins work?", limit=2)
-for result in results:
-    print(f"[{result.relevance:.2f}] {result.text}")
+    # Retrieve relevant information
+    results = await memory.search("company_docs", "How do plugins work?", limit=2)
+    for result in results:
+        print(f"[{result.relevance:.2f}] {result.text}")
+
+
+asyncio.run(main())
 ```
 
 ## Building an Agent with Semantic Kernel

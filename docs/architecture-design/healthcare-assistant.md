@@ -308,16 +308,19 @@ Compared to the cost of a misdiagnosis (average malpractice claim: $300K+) or de
 
 ### Schema Design
 
-#### 1. `patient_sessions` -- Consultation Tracking with HIPAA Audit Fields
+#### 1. `consultation_sessions` -- Physician Review Tracking with HIPAA Audit Fields
+
+Each row is a physician's AI-assisted working session on one patient's chart -- not a patient-facing conversation. `physician_id` is the authenticated clinician; `patient_id` is the chart under review.
 
 ```sql
-CREATE TABLE patient_sessions (
+CREATE TABLE consultation_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    physician_id VARCHAR(64) NOT NULL,
     patient_id VARCHAR(64) NOT NULL,
-    session_type VARCHAR(30) NOT NULL CHECK (session_type IN ('symptom_check', 'medication_query', 'appointment', 'follow_up', 'triage')),
+    session_type VARCHAR(30) NOT NULL CHECK (session_type IN ('chart_review', 'encounter', 'consult', 'follow_up')),
     urgency_level VARCHAR(20) DEFAULT 'routine' CHECK (urgency_level IN ('routine', 'urgent', 'emergency')),
     status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'escalated', 'expired')),
-    triage_result JSONB,
+    differential_result JSONB,
     recommendations JSONB,
     escalated_to VARCHAR(100),
     consent_given BOOLEAN NOT NULL DEFAULT false,
@@ -326,22 +329,24 @@ CREATE TABLE patient_sessions (
     expires_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '30 minutes'),
     completed_at TIMESTAMPTZ
 );
-CREATE INDEX idx_sessions_patient ON patient_sessions(patient_id, created_at DESC);
-CREATE INDEX idx_sessions_urgency ON patient_sessions(urgency_level, status) WHERE status = 'active';
-CREATE INDEX idx_sessions_expiry ON patient_sessions(expires_at) WHERE status = 'active';
+CREATE INDEX idx_sessions_patient ON consultation_sessions(patient_id, created_at DESC);
+CREATE INDEX idx_sessions_urgency ON consultation_sessions(urgency_level, status) WHERE status = 'active';
+CREATE INDEX idx_sessions_expiry ON consultation_sessions(expires_at) WHERE status = 'active';
 ```
 
-**Why `consent_given` and `consent_timestamp`** -- HIPAA requires explicit consent before processing health information. The agent must verify consent before proceeding with any clinical interaction.
+**Why `consent_given` and `consent_timestamp`** -- HIPAA requires documented patient consent for AI-assisted analysis of their record. The clinician confirms consent is on file before the session proceeds; the field records that attestation.
 
 **Why `expires_at`** -- HIPAA requires automatic session termination after inactivity. The 30-minute default enforces this at the data layer, not just the application layer.
 
 #### 2. `messages` -- With PHI Handling
 
+The `role` reflects the physician-facing workflow: the clinician drives the session, the assistant responds, and `system` carries prompts. There is no patient participant.
+
 ```sql
 CREATE TABLE messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_id UUID NOT NULL REFERENCES patient_sessions(id),
-    role VARCHAR(20) NOT NULL CHECK (role IN ('patient', 'assistant', 'system', 'clinician')),
+    session_id UUID NOT NULL REFERENCES consultation_sessions(id),
+    role VARCHAR(20) NOT NULL CHECK (role IN ('physician', 'assistant', 'system')),
     content_encrypted BYTEA NOT NULL,
     content_hash VARCHAR(64) NOT NULL,
     contains_phi BOOLEAN DEFAULT false,
@@ -354,7 +359,7 @@ CREATE TABLE messages (
 CREATE INDEX idx_messages_session ON messages(session_id, created_at);
 ```
 
-**Why `content_encrypted` (BYTEA) instead of TEXT** -- All message content is encrypted at the application level using pgcrypto. The database never stores plaintext patient messages. Even a database breach does not expose raw patient communications.
+**Why `content_encrypted` (BYTEA) instead of TEXT** -- All message content is encrypted at the application level using pgcrypto. The database never stores plaintext clinical content. Even a database breach does not expose raw PHI or the physician's dictated notes.
 
 **Why `contains_phi` and `phi_categories`** -- Metadata tracking for compliance: the system knows which messages contain PHI (symptoms, medications, conditions) without decrypting them. This enables compliance queries like "how many messages contained medication information" without exposing the actual content.
 
@@ -393,7 +398,7 @@ CREATE INDEX idx_knowledge_drugs ON medical_knowledge USING gin(drug_names) WHER
 CREATE TABLE audit_log (
     id BIGSERIAL PRIMARY KEY,
     timestamp TIMESTAMPTZ NOT NULL DEFAULT now(),
-    actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('patient', 'agent', 'clinician', 'system', 'admin')),
+    actor_type VARCHAR(20) NOT NULL CHECK (actor_type IN ('physician', 'agent', 'system', 'admin')),
     actor_id VARCHAR(64) NOT NULL,
     action VARCHAR(50) NOT NULL,
     resource_type VARCHAR(50) NOT NULL,
@@ -416,8 +421,8 @@ REVOKE UPDATE, DELETE ON audit_log FROM app_role;
 **1. Session with consent verification** -- Load session only if consent is given:
 
 ```sql
-SELECT id, session_type, urgency_level, triage_result, recommendations
-FROM patient_sessions
+SELECT id, session_type, urgency_level, differential_result, recommendations
+FROM consultation_sessions
 WHERE id = $1
   AND consent_given = true
   AND status = 'active'
@@ -464,26 +469,26 @@ ORDER BY timestamp DESC;
 
 ### Memory Mode: Session-Scoped with Strict Isolation
 
-Unlike other agent systems, the healthcare assistant MUST NOT carry memory across sessions unless explicitly consented by the patient. HIPAA's minimum necessary rule means the agent should only access the data needed for the current interaction. Each session is an isolated context boundary.
+Unlike other agent systems, the healthcare assistant MUST NOT carry memory across sessions unless the patient's chart access is authorized for the current physician. HIPAA's minimum necessary rule means the agent should only access the data needed for the current chart review. Each session is an isolated context boundary scoped to one physician reviewing one patient.
 
 ### Within-Session Memory
 
 All within-session state is stored encrypted in Redis with a session TTL of 30 minutes maximum:
 
-- **Symptoms reported so far** -- accumulated symptom list with onset, severity, and duration
-- **Medications mentioned** -- current medications the patient has disclosed during this session
-- **Triage assessment in progress** -- running urgency classification and reasoning
-- **Questions asked and answers received** -- conversation state to avoid redundant questions
-- **Red flag detections** -- any emergency symptoms detected during the session
+- **Findings surfaced so far** -- the differential diagnoses and supporting evidence generated in this session
+- **Medications under review** -- the patient's active medication list pulled from the EMR for this session
+- **Analysis in progress** -- running diagnostic reasoning and confidence scoring
+- **Questions asked and answers received** -- the physician's follow-up questions and the agent's responses
+- **Red flag detections** -- any critical findings (e.g., contraindications) detected during the session
 
-### Cross-Session Memory (Only with Explicit Consent)
+### Cross-Session Memory (Only with Authorized Access)
 
-Cross-session data is loaded only after consent verification passes against PostgreSQL. This data reduces PHI exposure by storing summaries rather than raw messages:
+Cross-session data is loaded only after the physician's access authorization is verified against PostgreSQL. This data reduces PHI exposure by storing summaries rather than raw messages:
 
 - **Previous consultation summaries** -- not raw messages; summaries reduce PHI exposure while preserving clinical context
 - **Known conditions and medications** -- loaded from the patient profile in PostgreSQL, not from agent memory
 - **Allergy information** -- critical safety data loaded from the structured patient record
-- **All cross-session data lives in PostgreSQL, encrypted, and requires consent verification before loading**
+- **All cross-session data lives in PostgreSQL, encrypted, and requires access verification before loading**
 
 ### Context Window Strategy
 
@@ -491,9 +496,9 @@ Cross-session data is loaded only after consent verification passes against Post
 |---------|-------------|---------|
 | System prompt with medical guidelines | ~1,000 tokens | Defines agent role, constraints, and safety rules |
 | Retrieved clinical knowledge (top 3 guidelines) | ~2,000 tokens | Evidence base for the current consultation |
-| Current session symptoms and triage | ~800 tokens | Accumulated patient-reported information |
+| Current patient context and findings | ~800 tokens | Structured EMR data and differential generated so far |
 | Drug interaction warnings (if applicable) | ~500 tokens | Deterministic lookup results injected as context |
-| Response budget | ~700 tokens | Agent's reply to the patient |
+| Response budget | ~700 tokens | Agent's reply to the physician |
 | **Total** | **~5,000 tokens** | |
 
 **Key constraint**: NEVER include full patient history in context -- only what is relevant to the current consultation. This is both a performance optimization and a HIPAA compliance requirement (minimum necessary principle).
@@ -578,17 +583,13 @@ graph TB
 
 ## Hallucination Mitigation
 
-Healthcare is the HIGHEST SAFETY-CRITICALITY domain for AI systems. Hallucinations in this context are not merely inconvenient -- they can cause direct patient harm, delayed treatment, or dangerous drug interactions. Every mitigation strategy below is designed with the assumption that the system WILL hallucinate, and the architecture must catch it before it reaches the patient or physician.
+Healthcare is the HIGHEST SAFETY-CRITICALITY domain for AI systems. Hallucinations in this context are not merely inconvenient -- they can cause direct patient harm, delayed treatment, or dangerous drug interactions. Every mitigation strategy below is designed with the assumption that the system WILL hallucinate, and the architecture must catch it before a suggestion reaches the physician (and, through the physician, the patient). The unifying safeguard is that the assistant is a decision-*support* tool: nothing it produces is a decision, and nothing enters the medical record without explicit physician approval.
 
 ### Diagnostic Hallucination
 
-**Risk**: Agent suggests a diagnosis not supported by symptoms or clinical guidelines.
+**Risk**: Agent suggests a diagnosis not supported by the patient data or clinical guidelines.
 
-**Mitigation**: The agent NEVER diagnoses. It triages. The system prompt explicitly states:
-
-> "You are a triage assistant. You do not diagnose conditions. You assess symptom urgency and recommend appropriate care level (self-care, schedule appointment, urgent care, emergency)."
-
-All triage recommendations must map to a retrieved clinical guideline with evidence level A or B. If the agent cannot map a recommendation to a guideline, it defaults to "consult your physician."
+**Mitigation**: The agent produces a **differential** -- a ranked list of possibilities with probabilities, never a single definitive diagnosis -- and every diagnostic claim must cite either a specific patient data point (present in the patient context) or a retrieved clinical guideline with evidence level A or B. The Hallucination Guard removes any claim that cannot be grounded, replacing it with an explicit statement of uncertainty. Crucially, the differential is a *suggestion*: the physician reviews it and must approve, modify, or reject each item before it is documented. If the agent cannot ground a possibility, it states "insufficient data to confirm" and recommends the specific test needed to narrow the differential.
 
 ### Drug Interaction Hallucination
 
@@ -598,19 +599,15 @@ All triage recommendations must map to a retrieved clinical guideline with evide
 
 ### Dosage Hallucination
 
-**Risk**: Agent provides specific dosage information that is incorrect.
+**Risk**: Agent recommends a dosage that is incorrect or unsafe for this patient.
 
-**Mitigation**: The agent NEVER provides specific dosages. The system prompt enforces:
-
-> "Do not provide specific medication dosages. Direct the patient to their prescribing physician or pharmacist for dosage information."
-
-This is a hard constraint -- even if the knowledge base contains dosage information. Dosages depend on patient-specific factors (weight, renal function, age, comorbidities) that the triage agent is not qualified to assess.
+**Mitigation**: Dosage recommendations are permitted but tightly constrained. Every dosage must cite the specific guideline it comes from (e.g., ATA initial-dosing for levothyroxine) and is run through deterministic patient-specific checks -- renal/hepatic function, age, allergies, and drug interactions from the validated interaction database. If the patient-specific data needed to size a dose is missing, the agent presents the guideline range and flags the gap rather than committing to a number. Every dosage is a suggestion the prescribing physician must approve or modify: as in the worked example, the physician can override the agent's 50 mcg to 25 mcg based on factors (age, cardiac history) they weigh differently. The agent never writes an order; only the physician does.
 
 ### Urgency Misclassification
 
-**Risk**: Agent classifies an emergency situation as routine, delaying critical care.
+**Risk**: Agent under-weights a critical finding, letting the physician deprioritize a case that needs immediate attention.
 
-**Mitigation**: Err on the side of caution. If the agent is uncertain about urgency, escalate UP, not down. A rule-based "red flag" symptom detector runs BEFORE the LLM assessment:
+**Mitigation**: Err on the side of caution. If the agent is uncertain about acuity, escalate case priority UP, not down. A rule-based "red flag" detector runs over the ingested patient data (chief complaint, notes, vitals, labs) BEFORE the LLM assessment:
 
 - Chest pain or pressure
 - Difficulty breathing or shortness of breath
@@ -619,7 +616,7 @@ This is a hard constraint -- even if the knowledge base contains dosage informat
 - Signs of stroke (sudden numbness, confusion, vision loss, severe headache)
 - Severe allergic reaction symptoms (throat swelling, difficulty swallowing)
 
-These red flags trigger an immediate emergency escalation regardless of the LLM's assessment. The rule-based detector cannot be overridden by the LLM.
+These red flags raise a prominent alert to the physician and bump the case to emergency priority regardless of the LLM's assessment. The rule-based detector cannot be overridden by the LLM.
 
 ### Fabricated Medical Claims
 
@@ -629,9 +626,9 @@ These red flags trigger an immediate emergency escalation regardless of the LLM'
 
 ### False Reassurance
 
-**Risk**: Agent tells the patient "everything is fine" when symptoms warrant medical attention.
+**Risk**: Agent downplays a concerning finding, and the physician, under time pressure, defers to the reassuring summary.
 
-**Mitigation**: The agent never dismisses symptoms. It always recommends a follow-up action, even for low-urgency assessments. The minimum response for any symptom report is: "Monitor for 24 hours and contact your doctor if symptoms worsen or new symptoms develop." The system prompt prohibits phrases like "nothing to worry about," "you are fine," or "this is normal."
+**Mitigation**: The agent never dismisses a finding. It always surfaces concerning data points with a recommended follow-up action, even for low-probability differentials, and low-confidence assessments are explicitly flagged for physician attention rather than smoothed over. The system prompt prohibits definitive-reassurance phrasing like "nothing to worry about" or "this is normal"; the agent presents evidence and uncertainty and leaves the clinical judgment to the physician.
 
 ### Safety Pipeline
 
@@ -658,11 +655,11 @@ Each stage in the pipeline is independent and any stage can halt the response or
 |-------|----------|-----------|-----|
 | PHI leakage in LLM logs | Patient names and dates of birth found in observability logs | LLM call logging includes full prompts containing patient data | Add PHI scrubbing middleware before all logging; log only session_id and token counts, never prompt content; audit existing log storage for PHI and purge |
 | Expired clinical guidelines served | Agent recommends outdated treatment protocol that has been superseded | Knowledge base not updated when guidelines were revised; `is_current` flag not flipped | Implement guideline update pipeline with publisher webhooks; add `expiry_date` check in retrieval query; alert when guidelines approach expiry (30-day warning) |
-| Session timeout losing triage progress | Patient's symptom assessment lost after 30-minute HIPAA-mandated timeout | Session TTL expires during long, complex conversations where patient takes time to respond | Persist encrypted triage checkpoints to PostgreSQL every 5 messages; allow session recovery with re-authentication and re-consent |
-| Emergency symptoms not escalated | Patient reports chest pain but agent continues normal triage conversation | Red flag detector using simple regex misses natural language variations ("my chest feels tight", "pressure in my chest area") | Replace regex with a fine-tuned classifier for emergency symptom detection; use a dedicated lightweight model (not the main LLM) trained on emergency department chief complaint data |
-| Consent withdrawal not propagated | Patient withdraws consent mid-session but data remains accessible until cache expires | Consent status cached in Redis; revocation not propagated to the active session context | Implement consent as a real-time check against PostgreSQL (not cached); add consent verification before every PHI access; treat consent revocation as an immediate session termination trigger |
+| Session timeout losing review progress | Physician's in-progress analysis lost after 30-minute HIPAA-mandated timeout | Session TTL expires during a long, complex chart review | Persist encrypted analysis checkpoints to PostgreSQL every 5 messages; allow session recovery with re-authentication |
+| Critical finding not escalated | Chart contains a chest-pain complaint but the case is not bumped to emergency priority | Red flag detector using simple regex misses natural language variations in notes ("chest feels tight", "pressure in chest area") | Replace regex with a fine-tuned classifier over clinical notes and chief complaints; use a dedicated lightweight model (not the main LLM) trained on emergency department data |
+| Access revocation not propagated | A patient's AI-analysis consent is withdrawn (or the physician's access is revoked) mid-session but data remains accessible until the cache expires | Authorization status cached in Redis; revocation not propagated to the active session context | Implement authorization as a real-time check against PostgreSQL (not cached); verify before every PHI access; treat revocation as an immediate session termination trigger |
 | Audit log gaps during high traffic | Compliance audit discovers missing entries during peak usage periods | Asynchronous audit logging dropping events when the message queue backs up under load | Make audit logging synchronous with the request (not fire-and-forget); use a WAL-backed write path; accept higher latency for compliance -- a slower response is always preferable to a missing audit record |
-| Agent provides diagnosis despite instructions | Patient pushes persistently and agent eventually says "you might have X" | LLM susceptible to conversational pressure overriding system prompt safety constraints | Implement output filter: scan every response for diagnostic language patterns ("you have", "this is likely", "diagnosis is", "you are suffering from"); reject the response and regenerate with reinforced safety instructions appended to the prompt |
+| Overconfident single diagnosis | Agent collapses the differential to one definitive diagnosis, overstating certainty to a time-pressured physician | LLM drops the ranked-possibilities structure under a confident-sounding case | Enforce a differential output schema (>= 3 ranked possibilities with probabilities and a contradicting-evidence field); reject single-diagnosis outputs and regenerate; the Hallucination Guard verifies every claim is grounded before display |
 
 ---
 

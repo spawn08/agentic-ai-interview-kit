@@ -73,3 +73,20 @@ All-pages run (no args): `done, 0 failure(s)`.
 - FAISS/BM25: no official partner package page found; FAISS replaced by Chroma/InMemoryVectorStore, BM25 stays in `langchain-community` (hence the `<0.4.2` pin until ragas or community resolves the vertexai break).
 - `ToolErrorMiddleware` exists in langchain 1.4.4 but is undocumented in the fetched pages; not referenced.
 - Many Tier 1/3 pages still hard-code `gpt-4o`; out of scope. Tier 4 sections untouched.
+
+## Addendum: tool-calling-agent.md reviewer fixes (2026-10-12)
+Findings fixed in `docs/implementations/tool-calling-agent.md` (tests in `examples/langchain-v1/test_tool_calling_agent.py`):
+- P1 calculator: `eval` with empty builtins is not a sandbox. Replaced by a bounded AST evaluator (numeric constants, unary +/-, `+ - * /` only; no names/attributes/calls/exponent; <=200 chars, <=50 nodes, |value|<=1e12, bool and non-finite rejected; JSON error result).
+- P2 validation: the node used to append errors and then ToolNode ran every call anyway (duplicate results). Now all-or-nothing: tool name + Pydantic schema checked; any invalid call -> one error ToolMessage per original call, `route_after_validate` bypasses `tools` via `audit` back to `agent`.
+- P2 limit: pending tool calls at the limit are finalized (one ToolMessage each + fallback AIMessage, `finalize_limit` -> END), so the next checkpointed turn is well-formed.
+- Budget per turn: `begin_turn` resets `iteration_count` at entry (previously accumulated across turns). Mermaid diagram updated.
+- Added a short preferred `create_agent` + `ModelCallLimitMiddleware`/`ToolCallLimitMiddleware`/`wrap_tool_call` block (illustrative, needs credentials only when `build_native_agent()` runs); the StateGraph stays as the educational topology.
+Verification (/tmp/lcv-b2): `pytest examples/langchain-v1/test_tool_calling_agent.py` 24 passed; `check_doc_imports.py docs/implementations/tool-calling-agent.md` 0 failures; full `pytest examples/langchain-v1` 125 passed (intermediate run).
+
+## Final ReAct and verification amendment (2026-10-12)
+
+- `docs/design-patterns/react-pattern.md`: replaced both unsafe arithmetic paths with a bounded AST calculator; the primary implementation and customization example now use native `create_agent` with `ModelCallLimitMiddleware`. Loop-policy customization uses `wrap_tool_call` instead of a forked `StateGraph`; the sole historical text parser remains explicitly labeled. Model injection supports offline tests without credentials.
+- `examples/langchain-v1/test_react_pattern.py`: 19 tests extract and execute the actual page fences, covering prohibited calculator input, valid arithmetic, native tool calling, model-call limits, well-formed histories, and middleware success/error tracing.
+- `docs/implementations/tool-calling-agent.md`: installation now includes `langchain`, required by the preferred middleware example.
+- Full offline suite: **144 passed**. Node/content/type/build verification and remaining limitations are consolidated in `reports/update-pass.md`; all earlier suite counts are intermediate results.
+- The two native-tool examples never execute model-supplied Python. Validation rejection runs no tools from the rejected batch, and limit exits close outstanding tool-call IDs before returning the final AI message. The custom tool-calling topology retains its explicit validation/audit nodes; ordinary ReAct loop policy is middleware-based.

@@ -96,18 +96,23 @@ This deliberately brittle parser takes only the first action and one input line;
 
 ## LangChain Implementation: `create_agent`
 
-The simplest path to a production ReAct-style agent is `create_agent` from `langchain.agents` (it replaces the older `langgraph.prebuilt.create_react_agent`). It wires up the Thought-Action-Observation loop as a compiled LangGraph graph with native tool calling. Set `AGENT_MODEL` to a `"<provider>:<model>"` string.
+The simplest path to a production ReAct-style agent is `create_agent` from `langchain.agents` (it replaces the older `langgraph.prebuilt.create_react_agent`). It wires up the Thought-Action-Observation loop as a compiled LangGraph graph with native tool calling. Set `AGENT_MODEL` to a `"<provider>:<model>"` string. Calls that use it (`build_react_agent()` without a model, `run_agent`) are illustrative: they need provider credentials. `ModelCallLimitMiddleware(run_limit=10)` caps model calls per invocation, and the calculator parses arithmetic with `ast` instead of `eval`, so model-supplied text is never executed.
 
 ```python
 """ReAct-style agent using langchain.agents.create_agent."""
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import json
 import logging
+import math
+import operator
 import os
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
@@ -128,27 +133,70 @@ def search(query: str) -> str:
     return fake_results.get(query.lower(), f"No results found for: {query}")
 
 
+MAX_EXPR_CHARS = 200
+MAX_EXPR_NODES = 50
+MAX_ABS_VALUE = 1e12
+
+_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def _check_number(value: object) -> float | int:
+    """Accept only finite, bounded int/float (bool is an int subclass, so reject it first)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("only numeric constants are allowed")
+    if not math.isfinite(value) or abs(value) > MAX_ABS_VALUE:
+        raise ValueError("number is not finite or exceeds the allowed magnitude")
+    return value
+
+
+def _eval_node(node: ast.AST) -> float | int:
+    if isinstance(node, ast.Constant):
+        return _check_number(node.value)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARYOPS:
+        return _check_number(_UNARYOPS[type(node.op)](_eval_node(node.operand)))
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+        return _check_number(_BINOPS[type(node.op)](_eval_node(node.left), _eval_node(node.right)))
+    # Names, attributes, calls, subscripts, exponent, comparisons, ... are all rejected.
+    raise ValueError(f"unsupported syntax: {type(node).__name__}")
+
+
+def safe_arithmetic(expression: str) -> float | int:
+    """Evaluate +, -, *, / over numeric literals with bounded size. Never calls eval()."""
+    if len(expression) > MAX_EXPR_CHARS:
+        raise ValueError("expression too long")
+    tree = ast.parse(expression.strip(), mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > MAX_EXPR_NODES:
+        raise ValueError("expression too complex")
+    return _eval_node(tree.body)
+
+
 @tool
 def calculator(expression: str) -> str:
-    """Evaluate a mathematical expression safely."""
-    allowed_names: dict[str, object] = {"__builtins__": {}}
+    """Evaluate basic arithmetic (+ - * / and parentheses) and return the result."""
     try:
-        result = eval(expression, allowed_names)  # noqa: S307
-        return str(result)
-    except Exception as exc:
-        return f"Error: {exc}"
+        return json.dumps({"expression": expression, "result": safe_arithmetic(expression)})
+    except (ValueError, SyntaxError, ZeroDivisionError, RecursionError, MemoryError) as exc:
+        return json.dumps({"error": f"Invalid expression: {exc}"})
 
 
 # ---------------------------------------------------------------------------
 # Build the agent
 # ---------------------------------------------------------------------------
 
-def build_react_agent() -> object:
+def build_react_agent(model: object | None = None) -> object:
     """Return a compiled LangGraph agent running the ReAct loop."""
     return create_agent(
-        model=os.environ["AGENT_MODEL"],
+        # Illustrative: a "<provider>:<model>" string needs provider credentials at run time.
+        model=model or os.environ["AGENT_MODEL"],
         tools=[search, calculator],
         system_prompt="Reason step by step and use the tools when you need facts or math.",
+        middleware=[ModelCallLimitMiddleware(run_limit=10, exit_behavior="end")],  # per run
         checkpointer=InMemorySaver(),
     )
 
@@ -165,174 +213,74 @@ async def run_agent(question: str) -> str:
 ```
 
 :::tip Prebuilt vs. Custom
-`create_agent` is ideal for rapid prototyping. It handles message formatting, tool dispatch, and the reason-act loop internally, and **middleware** (`before_model`, `wrap_tool_call`, `after_model`, summarization, human-in-the-loop) covers most customization. Move to a custom `StateGraph` (shown next) when you need a non-standard topology, fully custom state, or routing the standard loop cannot express.
+`create_agent` handles message formatting, tool dispatch, and the reason-act loop internally, and **middleware** (`before_model`, `wrap_tool_call`, `after_model`, summarization, human-in-the-loop) covers most customization. Use middleware for loop policy, as shown next. Move to a custom `StateGraph` when you need a non-standard topology, fully custom state, or routing the standard loop cannot express; see the [LangGraph deep dive](../frameworks/langgraph-deep-dive.md).
 :::
 
-## LangGraph Implementation: Custom Graph Nodes
+## Customizing the Loop with Middleware
 
-For full control, build the ReAct loop as explicit graph nodes with typed state, custom routing, and structured logging.
+When you want to change loop *policy* (limits, tracing, error handling), keep the prebuilt `create_agent` graph and add middleware instead of reimplementing the graph. `ModelCallLimitMiddleware` bounds model calls, and `wrap_tool_call` wraps every tool execution. This block is self-contained (its own small tools). Passing `model=None` uses `AGENT_MODEL`, which is illustrative and needs provider credentials.
 
 ```python
-"""Custom ReAct agent with explicit LangGraph nodes."""
+"""Customizing the prebuilt ReAct loop with middleware (self-contained)."""
 
 from __future__ import annotations
 
 import logging
-import operator
 import os
-from typing import Annotated, Any, Sequence, TypedDict
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    ToolMessage,
-)
-from langchain.chat_models import init_chat_model
-from langchain_core.tools import tool as lc_tool
-from langgraph.graph import END, StateGraph
-from pydantic import BaseModel, Field
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelCallLimitMiddleware, wrap_tool_call
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# State schema
-# ---------------------------------------------------------------------------
 
-class ReActState(TypedDict):
-    """Typed state flowing through the ReAct graph."""
-    messages: Annotated[Sequence[BaseMessage], operator.add]
-    step_count: int
-    max_steps: int
-
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
-
-@lc_tool
-def web_search(query: str) -> str:
-    """Search the web for current information on a topic."""
-    fake_db: dict[str, str] = {
-        "population of france": "Approximately 68 million (2024).",
-        "gdp of germany": "Germany GDP is roughly $4.5 trillion (2024).",
-    }
-    return fake_db.get(query.lower(), f"No results for: {query}")
+@tool
+def get_weather(city: str) -> str:
+    """Return deterministic demo weather for a city."""
+    return f"Weather in {city}: 20C, clear (demo data)."
 
 
-@lc_tool
-def math_eval(expression: str) -> str:
-    """Evaluate a mathematical expression and return the numeric result."""
+@tool
+def echo(text: str) -> str:
+    """Return the text unchanged."""
+    return text
+
+
+@wrap_tool_call
+def trace_tools(request, handler):
+    """Log every tool call with its status; turn exceptions into error ToolMessages."""
+    name = request.tool_call["name"]
     try:
-        return str(eval(expression, {"__builtins__": {}}))  # noqa: S307
-    except Exception as exc:
-        return f"Calculation error: {exc}"
-
-
-TOOLS = [web_search, math_eval]
-TOOL_MAP: dict[str, Any] = {t.name: t for t in TOOLS}
-
-# ---------------------------------------------------------------------------
-# Graph nodes
-# ---------------------------------------------------------------------------
-
-def reasoning_node(state: ReActState) -> dict[str, Any]:
-    """Call the LLM with tool bindings to decide the next action."""
-    llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0.0).bind_tools(TOOLS)
-    response: AIMessage = llm.invoke(state["messages"])
-    logger.info(
-        "reasoning_node step=%d tool_calls=%d",
-        state["step_count"],
-        len(response.tool_calls) if response.tool_calls else 0,
-    )
-    return {
-        "messages": [response],
-        "step_count": state["step_count"] + 1,
-    }
-
-
-def tool_execution_node(state: ReActState) -> dict[str, Any]:
-    """Execute every tool call present in the last AI message."""
-    last_message: AIMessage = state["messages"][-1]
-    tool_messages: list[ToolMessage] = []
-
-    for call in last_message.tool_calls:
-        tool_fn = TOOL_MAP.get(call["name"])
-        if tool_fn is None:
-            result = f"Unknown tool: {call['name']}"
-        else:
-            try:
-                result = tool_fn.invoke(call["args"])
-            except Exception as exc:
-                logger.exception("Tool %s failed", call["name"])
-                result = f"Tool error: {exc}"
-
-        tool_messages.append(
-            ToolMessage(content=str(result), tool_call_id=call["id"])
+        result = handler(request)
+    except Exception as exc:  # noqa: BLE001 - boundary: report, never crash the loop
+        logger.warning("tool=%s status=error error=%s", name, exc)
+        return ToolMessage(
+            content=f"Tool error: {type(exc).__name__}: {exc}",
+            tool_call_id=request.tool_call["id"],
+            status="error",
         )
-
-    return {"messages": tool_messages}
-
-
-# ---------------------------------------------------------------------------
-# Routing logic
-# ---------------------------------------------------------------------------
-
-def should_continue(state: ReActState) -> str:
-    """Decide whether to call tools, stop, or abort on step limit."""
-    last_message = state["messages"][-1]
-    if state["step_count"] >= state["max_steps"]:
-        logger.warning("Max steps (%d) reached, stopping.", state["max_steps"])
-        return "end"
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "tools"
-    return "end"
+    logger.info("tool=%s status=%s", name, getattr(result, "status", "ok"))
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Graph assembly
-# ---------------------------------------------------------------------------
-
-def build_custom_react_graph(max_steps: int = 10) -> Any:
-    """Compile the custom ReAct graph."""
-    graph = StateGraph(ReActState)
-
-    graph.add_node("reason", reasoning_node)
-    graph.add_node("tools", tool_execution_node)
-
-    graph.set_entry_point("reason")
-    graph.add_conditional_edges("reason", should_continue, {
-        "tools": "tools",
-        "end": END,
-    })
-    graph.add_edge("tools", "reason")
-
-    return graph.compile()
-
-
-async def run_custom_react(question: str, max_steps: int = 10) -> str:
-    """Run a question through the custom ReAct graph."""
-    app = build_custom_react_graph(max_steps=max_steps)
-    initial_state: ReActState = {
-        "messages": [HumanMessage(content=question)],
-        "step_count": 0,
-        "max_steps": max_steps,
-    }
-    result = await app.ainvoke(initial_state)
-    return result["messages"][-1].content
+def build_middleware_agent(model: object | None = None) -> object:
+    """Prebuilt loop plus policy: per-run model-call limit and tool tracing."""
+    return create_agent(
+        model=model or os.environ["AGENT_MODEL"],  # illustrative: needs credentials
+        tools=[get_weather, echo],
+        middleware=[
+            ModelCallLimitMiddleware(run_limit=5, exit_behavior="end"),
+            trace_tools,
+        ],
+    )
 ```
 
-### How the Code Works
+With `exit_behavior="end"` the run stops with a well-formed AI message once the limit is reached; use `"error"` to raise instead. `run_limit` counts per invocation, while `thread_limit` counts across a checkpointed thread.
 
-| Component | Purpose |
-|-----------|---------|
-| `ReActState` | TypedDict holding messages, step count, and max-step limit |
-| `reasoning_node` | Calls the LLM with bound tools; the LLM decides to call a tool or produce a final answer |
-| `tool_execution_node` | Dispatches every `tool_call` from the last AI message and returns `ToolMessage` results |
-| `should_continue` | Conditional edge: routes to `tools` if tool calls are present, or `END` otherwise |
-| `build_custom_react_graph` | Wires nodes and edges into a compiled `StateGraph` |
-
-:::tip Implementation Tip
-In production, inject the chat model instance via dependency injection rather than constructing it inside nodes. This makes the graph testable and allows swapping models per environment.
+:::tip Prebuilt vs. Custom
+Choose `create_agent` plus middleware (`ModelCallLimitMiddleware`, `wrap_tool_call`, `before_model`, `after_model`, summarization, human-in-the-loop) for limits, tracing, error handling, and approvals. Drop to a custom `StateGraph` only for a nonstandard topology, such as parallel branches, multiple agents, or routing the standard loop cannot express. See the [LangGraph deep dive](../frameworks/langgraph-deep-dive.md).
 :::
 
 ## When to Use ReAct
@@ -380,7 +328,7 @@ For single-step tool calls (e.g., "What is the weather in Paris?"), a simple too
 
 - ReAct fuses reasoning and acting into a single, interpretable loop.
 - The Thought-Action-Observation cycle keeps the agent grounded in real observations.
-- LangChain offers two paths: `create_agent` (with middleware) for fast prototyping, and custom LangGraph `StateGraph` for full control.
+- Choose `create_agent` plus middleware for limits, tracing, and error policy; use a custom `StateGraph` only for nonstandard topology (see the [LangGraph deep dive](../frameworks/langgraph-deep-dive.md)).
 - Use it when tasks demand multi-step information gathering; skip it for trivial single-tool calls.
 
 ## Further Reading

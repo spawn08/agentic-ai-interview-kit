@@ -91,7 +91,7 @@ def build_native_agent():
 ## Install Dependencies
 
 ```bash
-pip install langgraph langchain-openai langchain-core pydantic
+pip install langchain langgraph langchain-openai langchain-core pydantic
 ```
 
 ---

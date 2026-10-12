@@ -129,7 +129,7 @@ The original handoff items were resolved as follows:
 | llamaindex | `requirements-llamaindex.txt` | `docs/frameworks/llamaindex-agents.md` | `examples/tier1/llamaindex` |
 | crewai | `requirements-crewai.txt` (+ `langgraph`, `langchain-openai`) | `docs/frameworks/crewai-guide.md`, `docs/implementations/multi-agent-crew.md` | `examples/tier1/crewai` |
 
-`content-check.yml` (`examples-tier1-imports`, non-PR) and `monthly-latest.yml` (`latest-tier1`) both use
+`content-check.yml` (`examples-tier1-imports`, including PRs) and `monthly-latest.yml` (`latest-tier1`) both use
 `strategy.fail-fast: false` matrices; the monthly report job fires on `needs.*.result == failure`, so a failure in ANY leg
 opens/updates the deduplicated issue. Limits: smoke tests are offline fakes/constructions, not live API checks; Linux CI
 has not run these (verified on macOS arm64, Python 3.12.10); the Tier 1 files are unpinned floors, not freezes (a freeze

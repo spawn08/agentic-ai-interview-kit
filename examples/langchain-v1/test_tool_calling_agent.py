@@ -106,30 +106,9 @@ def test_calculator_does_not_use_eval(mods):
     assert "eval" not in calls and "exec" not in calls
 
 
-def _install_counting_tools(mods, monkeypatch):
-    """Replace the tool node so we can prove whether any tool ran."""
-    ran = []
-    from langchain_core.tools import tool
-
-    @tool
-    def get_weather(location: str, unit: str = "celsius") -> str:
-        """weather"""
-        ran.append(location)
-        return json.dumps({"location": location})
-
-    @tool
-    def create_ticket(customer_name: str, subject: str) -> str:
-        """ticket"""
-        ran.append("ticket")
-        return "TKT"
-
-    return ran, get_weather, create_ticket
-
-
 def test_mixed_valid_and_invalid_batch_runs_no_tools_and_has_no_duplicates(mods, monkeypatch):
     ran = []
     real_weather = mods.tools.get_weather
-    # Wrap the real tool func side effect: count executions via the ToolNode path.
     original = real_weather.func
 
     def spying(*a, **k):

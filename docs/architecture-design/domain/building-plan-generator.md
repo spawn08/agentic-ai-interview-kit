@@ -2,6 +2,7 @@
 sidebar_position: 3
 title: "AI System that Generates Building Plans"
 description: "System design for an AI system that generates architectural building plans from requirements with constraint satisfaction and multi-objective optimization"
+last_verified: 2026-10-12
 ---
 
 # AI System that Generates Building Plans
@@ -250,7 +251,7 @@ The IFC (Industry Foundation Classes) output is the most important for professio
 
 | Component | Cost | Notes |
 |-----------|------|-------|
-| LLM calls (parsing + refinement) | $0.10-0.30 | 3-5 LLM calls per generation cycle |
+| LLM calls (parsing + refinement) | `c_llm` x (3-5 calls) | Per call: (in x `p_in` + out x `p_out`) / 1M, assumed rates |
 | Optimization compute | $0.05-0.15 | CPU for GA, 100 generations |
 | Compliance checking | $0.02 | Rule-based, fast |
 | 3D model generation | $0.05-0.10 | Geometry computation |
@@ -362,6 +363,6 @@ Because approximate answers are unacceptable in building-code compliance and str
 - **Minutes 1-5:** Clarify requirements -- building type, single vs. multi-story, which codes, output formats, generation time budget
 - **Minutes 5-15:** Draw the architecture -- input processing, three-stage generation engine (procedural + CSP + GA + LLM refiner), validation pipeline, output generation, and feedback loop
 - **Minutes 15-25:** Deep dive into the hybrid generation approach (why LLMs alone fail for constrained layout), multi-objective optimization with NSGA-II (Pareto front, crossover/mutation operators), and building code compliance checking (egress distance calculation, ADA verification)
-- **Minutes 25-30:** Scaling (embarrassingly parallel candidate generation, GPU-accelerated fitness evaluation) and cost analysis ($0.42-1.05 per generation cycle including 5 variants)
+- **Minutes 25-30:** Scaling (embarrassingly parallel candidate generation, GPU-accelerated fitness evaluation) and cost analysis (non-LLM compute plus 3-5 x `c_llm` per generation cycle, including 5 variants)
 - **Minutes 30-35:** Trade-offs (pure LLM vs. hybrid, single vs. multi-objective optimization, hard vs. soft constraints) and the iterative feedback loop (constraint modification vs. direct plan editing)
 :::

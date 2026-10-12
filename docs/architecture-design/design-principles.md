@@ -2,6 +2,7 @@
 sidebar_position: 1
 title: "Design Principles"
 description: "Core engineering principles for building production-grade agentic AI systems"
+last_verified: 2026-10-12
 ---
 
 # Design Principles
@@ -352,22 +353,22 @@ The cache keys on an **exact, byte-stable prefix**. The rules that follow from t
 
 ### Cost & Latency Impact
 
-| Provider | Activation | Cached-input pricing (illustrative, 2026) | Notes |
+| Provider | Activation | Cached-input pricing (multipliers of base input rate; read yours from the vendor pricing page, see [shared model reference](../index.md#model-and-price-reference)) | Notes |
 |----------|-----------|-------------------------------------------|-------|
-| Anthropic | Explicit `cache_control` breakpoints | Cache **write ~1.25x**, cache **read ~0.1x** base input | 5-minute default TTL, 1-hour option |
-| OpenAI | Automatic for prefixes above the size floor | Cached input **~0.5x** base input | No config; matches on exact prefix |
-| Gemini | Explicit context caching + implicit caching | Cached tokens **heavily discounted** (~0.25x) + storage fee | Storage billed per token-hour |
+| Anthropic | Explicit `cache_control` breakpoints | Cache **write multiplier `w`** (above 1x), cache **read multiplier `r`** (far below 1x) | 5-minute default TTL, 1-hour option |
+| OpenAI | Automatic for prefixes above the size floor | Cached input at a discount multiplier `r` of base input | No config; matches on exact prefix |
+| Gemini | Explicit context caching + implicit caching | Cached tokens discounted (multiplier `r`) + storage fee | Storage billed per token-hour |
 
 Beyond cost, cached prefixes cut **time-to-first-token (TTFT)** substantially, because the model skips prefill over the cached region -- the latency win is often more noticeable to users than the dollar win.
 
 ### Illustrative Before / After
 
-Consider an agent with a **20K-token static prefix** (system prompt + tool definitions + retrieved RAG context) that makes **8 LLM calls per session**, at an illustrative **$3 per 1M input tokens**:
+Consider an agent with a **20K-token static prefix** (system prompt + tool definitions + retrieved RAG context) that makes **8 LLM calls per session**, at an assumed input rate of **`p_in` per 1M tokens** (from your pricing config):
 
-- **Without caching:** 20K x 8 = 160K prefix input tokens/session -> **~$0.48/session** on the prefix alone.
-- **With caching (Anthropic-style):** first call writes at 1.25x (20K -> ~25K-equivalent), the next 7 calls read at 0.1x (20K -> ~2K-equivalent each) -> ~39K-equivalent tokens -> **~$0.12/session**.
+- **Without caching:** 20K x 8 = 160K prefix input tokens/session -> **160K x `p_in` / 1M** per session on the prefix alone.
+- **With caching (Anthropic-style):** first call writes at `w` (20K x `w` equivalent tokens), the next 7 calls read at `r` (20K x `r` each) -> 20K x (`w` + 7`r`) equivalent tokens -> **20K x (`w` + 7`r`) x `p_in` / 1M** per session.
 
-That is a **~75% cut on static-prefix input cost**, before any output-side routing savings, plus a materially lower TTFT on calls 2-8. Note this extends -- it does not replace -- the output-token routing savings quantified in the next section; they stack.
+With example multipliers `w` = 1.25 and `r` = 0.1 (assumptions -- vendor multipliers differ and change), that is a **~75% cut on static-prefix input cost**, before any output-side routing savings, plus a materially lower TTFT on calls 2-8. Note this extends -- it does not replace -- the output-token routing savings quantified in the next section; they stack.
 
 ### The Tradeoff: Edits Bust the Cache
 
@@ -396,11 +397,11 @@ Prompt caching and aggressive context compaction pull in opposite directions. A 
 
 ## Critical Algorithm: Cost-Aware Adaptive Model Router
 
-The single most expensive mistake in agentic AI is routing every LLM call to the same frontier model. In a multi-step agent loop where each session triggers 5-15 LLM calls, sending every call to GPT-4o at ~$10/1M output tokens creates runaway costs. Most of those calls -- classification, parameter extraction, simple reformulation -- do not need frontier-level reasoning. An adaptive router that dispatches each step to the cheapest model meeting quality constraints can cut LLM spend by 60-80% without measurable quality loss on aggregate task completion.
+The single most expensive mistake in agentic AI is routing every LLM call to the same frontier model. In a multi-step agent loop where each session triggers 5-15 LLM calls, sending every call to the standard-tier model at its output rate creates runaway costs. Most of those calls -- classification, parameter extraction, simple reformulation -- do not need frontier-level reasoning. An adaptive router that dispatches each step to the cheapest model meeting quality constraints can cut LLM spend by 60-80% without measurable quality loss on aggregate task completion.
 
-Tiering is not just "cheap vs frontier." Modern routers have **three tiers**: cheap chat models (GPT-4o-mini-class) for simple/latency-sensitive steps, frontier chat models (GPT-4o / Claude Sonnet) for the bulk of moderate-to-complex work, and a **reasoning tier** (o-series-style / extended-thinking models) reserved for the genuinely hard steps -- goal decomposition, multi-step planning, and hard multi-hop reasoning. The reasoning tier has a very different cost/latency profile: it emits thinking tokens, so it is both slower and more expensive per useful token, which is exactly why you gate it behind the classifier rather than defaulting to it.
+Tiering is not just "cheap vs frontier." Modern routers have **three tiers**: cheap chat models (fast-tier) for simple/latency-sensitive steps, frontier chat models (the standard-tier model / a second-provider standard-tier model) for the bulk of moderate-to-complex work, and a **reasoning tier** (o-series-style / extended-thinking models) reserved for the genuinely hard steps -- goal decomposition, multi-step planning, and hard multi-hop reasoning. The reasoning tier has a very different cost/latency profile: it emits thinking tokens, so it is both slower and more expensive per useful token, which is exactly why you gate it behind the classifier rather than defaulting to it.
 
-The naive approach breaks at roughly $5K/month in LLM spend. Below that threshold, the engineering cost of maintaining a router exceeds the savings. Above it, the router pays for itself within weeks.
+The naive approach breaks at a monthly LLM spend of roughly a few thousand dollars (assumption; compute your own break-even). Below that threshold, the engineering cost of maintaining a router exceeds the savings. Above it, the router pays for itself within weeks.
 
 ```python
 from abc import ABC, abstractmethod
@@ -422,8 +423,11 @@ class Complexity(Enum):
 @dataclass
 class ModelConfig:
     name: str
-    cost_per_1k_input: float      # USD per 1K input tokens
-    cost_per_1k_output: float     # USD per 1K output tokens
+    # USD per 1M tokens. Required, no defaults: build from your pricing config, e.g.
+    #   price_in_per_million=float(os.environ["PRICING_INPUT_PER_MILLION"]),
+    #   price_out_per_million=float(os.environ["PRICING_OUTPUT_PER_MILLION"])
+    price_in_per_million: float
+    price_out_per_million: float
     quality_score: float          # 0.0 - 1.0, calibrated on eval set
     max_tokens: int
     latency_p50_ms: int
@@ -454,14 +458,15 @@ class AdaptiveModelRouter:
     """Routes each agent step to the cost-optimal model that meets quality constraints.
 
     This is the most impactful cost optimization in agentic systems. A naive system
-    sends every request to GPT-4o at $10/1M output tokens. An adaptive router sends
-    60% of traffic to GPT-4o-mini at $0.60/1M output tokens -- a 10x savings on the
-    majority of requests.
+    sends every request to the standard-tier model at price p_std per 1M output tokens.
+    An adaptive router sends 60% of traffic to the fast-tier model at p_fast -- the
+    savings on that majority is p_std / p_fast (assumption: rates come from your
+    pricing config; see docs/_shared/models.md).
     """
 
     def __init__(self, models: list[ModelConfig], classifier: ComplexityClassifier):
         # Models sorted by cost ascending so the cheapest qualified model is always first
-        self.models = sorted(models, key=lambda m: m.cost_per_1k_output)
+        self.models = sorted(models, key=lambda m: m.price_out_per_million)
         self.classifier = classifier
 
     async def route(self, task: AgentTask, budget: "TokenBudget") -> ModelConfig:
@@ -470,7 +475,7 @@ class AdaptiveModelRouter:
         # Hard constraint: remaining budget must cover worst-case token usage
         affordable = [
             m for m in self.models
-            if m.cost_per_1k_output * (task.estimated_output_tokens / 1000)
+            if m.price_out_per_million * (task.estimated_output_tokens / 1_000_000)
                <= budget.remaining_usd
         ]
         if not affordable:
@@ -487,7 +492,7 @@ class AdaptiveModelRouter:
         if complexity is Complexity.REASONING:
             reasoning_models = [m for m in affordable if m.is_reasoning]
             if reasoning_models:
-                return min(reasoning_models, key=lambda m: m.cost_per_1k_output)
+                return min(reasoning_models, key=lambda m: m.price_out_per_million)
             # No reasoning model fits the budget -- fall through to the best
             # affordable chat model under the REASONING quality floor below.
 
@@ -581,7 +586,7 @@ Logging every prompt-completion pair costs real money in storage and egress. At 
 
 ### Fault Tolerance vs User Experience
 
-A three-tier fallback chain (GPT-4o, then Claude Sonnet, then GPT-4o-mini, then a template) maximizes availability but introduces response quality inconsistency. A user who asks a nuanced question might get a frontier-quality answer on their first try and a generic template on the retry -- even within the same conversation. This inconsistency erodes trust faster than a clean error message. The design choice depends on the domain: for customer support agents where any answer is better than no answer, cascade aggressively. For financial advisory or medical triage agents where a wrong answer is worse than no answer, fail fast after the first fallback tier and route to a human. In all cases, communicate the degradation to the user so they can calibrate their trust in the response.
+A three-tier fallback chain (the standard-tier model, then a second-provider standard-tier model, then the fast-tier model, then a template) maximizes availability but introduces response quality inconsistency. A user who asks a nuanced question might get a frontier-quality answer on their first try and a generic template on the retry -- even within the same conversation. This inconsistency erodes trust faster than a clean error message. The design choice depends on the domain: for customer support agents where any answer is better than no answer, cascade aggressively. For financial advisory or medical triage agents where a wrong answer is worse than no answer, fail fast after the first fallback tier and route to a human. In all cases, communicate the degradation to the user so they can calibrate their trust in the response.
 
 ### Idempotency vs Freshness
 

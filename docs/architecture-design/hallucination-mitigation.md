@@ -2,6 +2,7 @@
 sidebar_position: 9
 title: "Hallucination Mitigation"
 description: "Detection, prevention, and recovery strategies for hallucinations in agentic AI systems"
+last_verified: 2026-10-12
 ---
 
 # Hallucination Mitigation
@@ -257,6 +258,8 @@ Grounding checks verify that the agent's response is actually supported by the r
 Use a lightweight Natural Language Inference (NLI) model to check whether the response is entailed by the retrieved context.
 
 ```python
+import os
+
 from transformers import pipeline
 from dataclasses import dataclass
 
@@ -275,7 +278,7 @@ class EntailmentChecker:
     Uses an NLI model to verify that agent responses are entailed
     by the retrieved context.
 
-    Model: cross-encoder/nli-deberta-v3-base (or similar)
+    Model: an NLI cross-encoder checkpoint, set via AGENT_NLI_MODEL
     - Entailment: the context supports the claim
     - Contradiction: the context contradicts the claim
     - Neutral: the context neither supports nor contradicts
@@ -283,13 +286,13 @@ class EntailmentChecker:
 
     def __init__(
         self,
-        model_name: str = "cross-encoder/nli-deberta-v3-base",
+        model_name: str | None = None,
         entailment_threshold: float = 0.7,
         contradiction_threshold: float = 0.5,
     ):
         self._classifier = pipeline(
             "zero-shot-classification",
-            model=model_name,
+            model=model_name or os.environ["AGENT_NLI_MODEL"],
             device="cpu",  # Use "cuda" in production
         )
         self._entailment_threshold = entailment_threshold
@@ -407,6 +410,7 @@ A lightweight alternative to NLI: compute cosine similarity between the response
 ```python
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import os
 
 
 class SemanticGroundingChecker:
@@ -417,9 +421,12 @@ class SemanticGroundingChecker:
 
     def __init__(
         self,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        model_name: str | None = None,
         similarity_threshold: float = 0.45,
     ):
+        # Resolved when the checker is constructed, not when this module is imported.
+        # A local SentenceTransformer name: AGENT_LOCAL_EMBEDDING_MODEL, not the API variable.
+        model_name = model_name or os.environ["AGENT_LOCAL_EMBEDDING_MODEL"]
         self._model = SentenceTransformer(model_name)
         self._threshold = similarity_threshold
 
@@ -567,7 +574,7 @@ Return a JSON object with:
 |-----------|-------------|------------|
 | **Meta-hallucination** | The judge LLM can itself hallucinate, approving an ungrounded claim | Use a different model family for the judge than for the generator |
 | **Context window limits** | Long contexts may exceed the judge's window | Chunk the evaluation: verify each response sentence against the top-3 most relevant context chunks |
-| **Cost** | Each evaluation is a full LLM call ($0.01-0.05) | Only use for high-stakes outputs; use cheaper techniques as pre-filters |
+| **Cost** | Each evaluation is a full LLM call (`c_judge`) | Only use for high-stakes outputs; use cheaper techniques as pre-filters |
 | **Latency** | Adds 1-3 seconds per evaluation | Run in parallel with response delivery where possible; or gate only on high-risk outputs |
 
 :::tip Interview Angle
@@ -865,6 +872,7 @@ Many grounding failures are actually retrieval failures -- the right information
 
 ```python
 from sentence_transformers import CrossEncoder
+import os
 
 
 class RerankedRetriever:
@@ -876,13 +884,14 @@ class RerankedRetriever:
     def __init__(
         self,
         vector_store,
-        reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        reranker_model: str | None = None,
         initial_k: int = 20,
         final_k: int = 5,
         min_relevance: float = 0.7,
     ):
         self._store = vector_store
-        self._reranker = CrossEncoder(reranker_model)
+        # Resolved at construction time, not at import time.
+        self._reranker = CrossEncoder(reranker_model or os.environ["AGENT_RERANKER_MODEL"])
         self._initial_k = initial_k
         self._final_k = final_k
         self._min_relevance = min_relevance
@@ -1510,7 +1519,7 @@ class HallucinationMitigationPipeline:
                 "confidence_hallucination", agent_response, context_chunks
             )
 
-        # Tier 3: LLM Judge (high risk only, ~3s, ~$0.03)
+        # Tier 3: LLM Judge (high risk only, ~3s, cost `c_judge`)
         judgment = await self._judge.evaluate(
             agent_response["text"], context_chunks
         )
@@ -1546,11 +1555,11 @@ Every detection technique has a cost in compute, latency, and money. The right a
 |-----------|---------------|---------|---------|--------|
 | **Structural validation** (tool name, schema) | ~$0 | < 1ms | CPU only | Every response |
 | **Tool result validation** (compare claimed vs actual) | ~$0 | < 1ms | CPU only | Every tool call |
-| **Semantic similarity** (embedding cosine) | ~$0.0001 | ~10ms | Embedding model inference | Every RAG response |
-| **Entailment check** (NLI model) | ~$0.001 | ~50ms | NLI model inference | Medium+ risk responses |
-| **Claim decomposition + verification** | ~$0.005 | ~200ms | LLM call + NLI | Medium+ risk responses |
-| **Self-consistency** (N=5 samples) | ~$0.05 | ~2-5s | 5x LLM calls | High risk only |
-| **LLM-as-Judge** | ~$0.01-0.05 | ~1-3s | 1x LLM call (judge) | High risk only |
+| **Semantic similarity** (embedding cosine) | negligible (small embedding call) | ~10ms | Embedding model inference | Every RAG response |
+| **Entailment check** (NLI model) | low (small local model) | ~50ms | NLI model inference | Medium+ risk responses |
+| **Claim decomposition + verification** | 1x `c_call` | ~200ms | LLM call + NLI | Medium+ risk responses |
+| **Self-consistency** (N=5 samples) | 5x `c_call` | ~2-5s | 5x LLM calls | High risk only |
+| **LLM-as-Judge** | `c_judge` | ~1-3s | 1x LLM call (judge) | High risk only |
 
 ### Risk-Based Tiering Strategy
 
@@ -1731,11 +1740,11 @@ Every hallucination mitigation technique trades cost and latency for detection a
 |-----------|-------------|---------|---------------|--------------------|---------| 
 | **Structural validation** | ~$0 | < 1ms | High (for structural errors) | Very Low | Fabricated tools, schema violations |
 | **Tool result validation** | ~$0 | < 1ms | High (for tool-related) | Very Low | Hallucinated API responses, capability claims |
-| **Semantic similarity** | ~$0.0001 | ~10ms | Low-Medium | Medium | Severe grounding failures |
-| **NLI entailment** | ~$0.001 | ~50ms | Medium-High | Low-Medium | Grounding failures, contradictions |
-| **Claim decomposition + NLI** | ~$0.005 | ~200ms | High | Low | Per-claim grounding failures |
-| **Self-consistency (N=5)** | ~$0.05 | ~2-5s | Medium | Low | Confidence hallucinations, uncertain claims |
-| **LLM-as-Judge** | ~$0.01-0.05 | ~1-3s | High | Medium | All types (but subject to meta-hallucination) |
+| **Semantic similarity** | negligible (small embedding call) | ~10ms | Low-Medium | Medium | Severe grounding failures |
+| **NLI entailment** | low (small local model) | ~50ms | Medium-High | Low-Medium | Grounding failures, contradictions |
+| **Claim decomposition + NLI** | 1x `c_call` | ~200ms | High | Low | Per-claim grounding failures |
+| **Self-consistency (N=5)** | 5x `c_call` | ~2-5s | Medium | Low | Confidence hallucinations, uncertain claims |
+| **LLM-as-Judge** | `c_judge` | ~1-3s | High | Medium | All types (but subject to meta-hallucination) |
 | **Idempotent tool re-execution** | Variable | Variable | Very High | Very Low | Hallucinated API responses (read-only tools) |
 
 ### Decision Framework by Use Case
@@ -1746,7 +1755,7 @@ Every hallucination mitigation technique trades cost and latency for detection a
 | **Customer support** (external-facing) | Medium | Structural + entailment + claim verification | ~$0.006/req | ~250ms |
 | **Financial advisory** | High | Full pipeline (all tiers) | ~$0.10/req | ~5-8s |
 | **Medical triage** | Critical | Full pipeline + human review on flagged | ~$0.15/req + human cost | ~8s + human time |
-| **Autonomous tool execution** (data writes) | High | Structural + tool result + LLM judge (pre-execution) | ~$0.05/req | ~3s |
+| **Autonomous tool execution** (data writes) | High | Structural + tool result + LLM judge (pre-execution) | ~`c_judge` + tool cost per request | ~3s |
 
 ### Architecture Decision Records
 

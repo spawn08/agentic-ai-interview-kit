@@ -1,6 +1,7 @@
 ---
 sidebar_position: 8
 title: "Human-in-the-Loop"
+last_verified: 2026-10-12
 ---
 
 # Human-in-the-Loop
@@ -78,6 +79,9 @@ from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt, Command
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +128,7 @@ class HITLState(TypedDict):
 
 def agent_node(state: HITLState) -> dict[str, Any]:
     """LLM decides the next action."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0).bind_tools(ALL_TOOLS)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0).bind_tools(ALL_TOOLS)
     response: AIMessage = llm.invoke(state["messages"])
     return {"messages": [response]}
 

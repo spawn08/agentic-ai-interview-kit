@@ -2,6 +2,7 @@
 sidebar_position: 2
 title: "AI Code Assistant"
 description: "Architecture design for a production AI coding assistant with real-time completions, multi-file editing, and CI/CD integration"
+last_verified: 2026-10-12
 ---
 
 # AI Code Assistant
@@ -386,22 +387,22 @@ Each component scales independently. Completion engine instances scale based on 
 
 | Component | Calls/Day | Tokens/Call | Unit Cost | Daily Cost |
 |-----------|-----------|-------------|-----------|------------|
-| Inline completions (7B) | 200 | 500 | $0.10/1M tokens | $0.010 |
-| Chat responses (30B) | 15 | 2,000 | $0.80/1M tokens | $0.024 |
-| Multi-file edits (70B+) | 2 | 8,000 | $3.00/1M tokens | $0.048 |
-| Test generation | 3 | 3,000 | $1.50/1M tokens | $0.014 |
-| Code review (per PR) | 1 | 10,000 | $2.00/1M tokens | $0.020 |
-| Sandbox execution | 5 | -- | $0.002/run | $0.010 |
-| Embedding/indexing | amortized | -- | -- | $0.005 |
-| **Total per user per day** | | | | **$0.131** |
+| Inline completions (small model) | 200 | 500 | `p_small`/1M tokens | 200 x 500 x `p_small` / 1M |
+| Chat responses (mid model) | 15 | 2,000 | `p_mid`/1M tokens | 15 x 2,000 x `p_mid` / 1M |
+| Multi-file edits (large model) | 2 | 8,000 | `p_large`/1M tokens | 2 x 8,000 x `p_large` / 1M |
+| Test generation | 3 | 3,000 | `p_mid`/1M tokens | 3 x 3,000 x `p_mid` / 1M |
+| Code review (per PR) | 1 | 10,000 | `p_mid`/1M tokens | 1 x 10,000 x `p_mid` / 1M |
+| Sandbox execution | 5 | -- | `c_run` per run (compute, not tokens) | 5 x `c_run` |
+| Embedding/indexing | amortized | -- | -- | `c_embed` (amortized) |
+| **Total per user per day** | | | | **sum of the rows above** (assumption: rates from your pricing config) |
 
-The $0.131 daily cost falls under the $0.15 budget, leaving headroom for usage spikes and heavy users.
+Compare the daily total to the per-user budget; any headroom is what absorbs usage spikes and heavy users.
 
 ### Monthly Cost at Scale (2M Users)
 
 | Category | Monthly Cost |
 |----------|-------------|
-| LLM inference (completion + chat + edit) | $5,400,000 |
+| LLM inference (completion + chat + edit) | 2,000,000 users x 30 days x (token rows of the daily table) |
 | GPU infrastructure (dedicated completion) | $1,200,000 |
 | Compute (orchestrator, indexer, gateway) | $400,000 |
 | Storage (vector store, object store, DB) | $150,000 |
@@ -569,7 +570,7 @@ Code completion has extreme latency requirements (< 500ms total). Context must b
 | Imported/referenced files (follow imports) | ~1,500 tokens | Type signatures, function contracts |
 | Similar code from the repository (vector search) | ~1,000 tokens | Project-specific patterns and conventions |
 | Recent completions in this session | ~500 tokens | Continuity and consistency |
-| **Total** | **~5,000 tokens** | Small, fast model (GPT-4o-mini or Claude Haiku) |
+| **Total** | **~5,000 tokens** | Small, fast model (fast-tier model or fast-tier model) |
 
 ### Context Window Strategy for Complex Tasks
 
@@ -580,7 +581,7 @@ Refactoring, debugging, and code review have more budget and less latency pressu
 | Full file under review | up to 8,000 tokens | Complete understanding of the file |
 | Related files (imports, tests, callers) | ~4,000 tokens | Cross-file dependencies and impact |
 | Project conventions (linting rules, style guide) | ~500 tokens | Consistency with existing codebase |
-| **Total** | **~12,500 tokens** | GPT-4o or Claude Sonnet |
+| **Total** | **~12,500 tokens** | standard-tier model or standard-tier model (second provider) |
 
 ### Incremental Indexing
 

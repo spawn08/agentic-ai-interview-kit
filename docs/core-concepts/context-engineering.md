@@ -2,11 +2,12 @@
 sidebar_position: 8
 title: "Context Engineering"
 description: Curating exactly what occupies a model's finite context window at each step of an agent's run to maximize signal-to-noise.
+last_verified: 2026-10-12
 ---
 
 # Context Engineering
 
-**Context engineering is the discipline of curating exactly what occupies a model's finite context window at each step of an agent's run** -- the system prompt, tool definitions, retrieved documents, message history, and memory. It reframes "prompt engineering" as an ongoing *systems* problem: because a model's usable recall degrades as its window fills (a phenomenon called **context rot**), engineers must actively manage context through compaction, note-taking, sub-agent isolation, and tool-result pruning -- all while preserving prompt-cache-friendly stable prefixes. The term was popularized in 2025; Anthropic's ["Effective context engineering for AI agents"](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) (September 2025, released alongside Claude Sonnet 4.5) is the canonical reference.
+**Context engineering is the discipline of curating exactly what occupies a model's finite context window at each step of an agent's run** -- the system prompt, tool definitions, retrieved documents, message history, and memory. It reframes "prompt engineering" as an ongoing *systems* problem: because a model's usable recall degrades as its window fills (a phenomenon called **context rot**), engineers must actively manage context through compaction, note-taking, sub-agent isolation, and tool-result pruning -- all while preserving prompt-cache-friendly stable prefixes. The term was popularized in 2025; Anthropic's ["Effective context engineering for AI agents"](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) (September 2025, released alongside a second-provider standard-tier model 4.5) is the canonical reference.
 
 ---
 
@@ -205,4 +206,4 @@ A sub-agent runs token-heavy work in its own clean window and returns only a dis
 - [RAG Basics](../foundations/rag-basics.md) -- Deciding what to retrieve into the window each turn.
 - [Reasoning Models & Test-Time Compute](../foundations/reasoning-models.md) -- Reasoning tokens consume the same window budget context engineering manages.
 - [Memory & State Management](../architecture-design/memory-and-state-management.md) -- Architecting the external state that context engineering leans on.
-- Anthropic, ["Effective context engineering for AI agents"](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) (September 2025) -- The canonical reference, released with Claude Sonnet 4.5.
+- Anthropic, ["Effective context engineering for AI agents"](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) (September 2025) -- The canonical reference, released with a second-provider standard-tier model 4.5.

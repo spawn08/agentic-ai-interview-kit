@@ -4,6 +4,14 @@
 # Production
 /build
 
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+
 # Generated files
 .docusaurus
 .cache-loader

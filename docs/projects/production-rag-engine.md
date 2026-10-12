@@ -1,6 +1,7 @@
 ---
 sidebar_position: 8
 title: "Project: Production RAG Engine"
+last_verified: 2026-10-12
 ---
 
 # Project: Production RAG Engine
@@ -9,10 +10,10 @@ Build a production-grade Retrieval-Augmented Generation engine that goes far bey
 
 :::info Framework Decision
 **Why Custom Python with sentence-transformers, rank_bm25, chromadb, and cross-encoder?**
-- **sentence-transformers for embeddings** -- Full control over model selection, quantization, and batching. Swap between `all-MiniLM-L6-v2` (fast, 384-dim) and `e5-large-v2` (accurate, 1024-dim) without changing a line of retrieval code.
+- **sentence-transformers for embeddings** -- Full control over model selection, quantization, and batching. Swap between a small fast model and a larger accurate one (set `AGENT_LOCAL_EMBEDDING_MODEL`) without changing a line of retrieval code.
 - **rank_bm25 for lexical search** -- Pure Python BM25 Okapi implementation. No external search engine dependency (Elasticsearch, Solr) for prototype and mid-scale deployments.
 - **chromadb or pgvector for vector storage** -- ChromaDB for local development and prototyping; pgvector for production PostgreSQL deployments where you need ACID transactions alongside vector search.
-- **cross-encoder models for reranking** -- `cross-encoder/ms-marco-MiniLM-L-12-v2` provides dramatically better relevance than bi-encoder retrieval alone, at acceptable latency for top-50 candidate sets.
+- **cross-encoder models for reranking** -- a cross-encoder model (`AGENT_RERANKER_MODEL`) provides dramatically better relevance than bi-encoder retrieval alone, at acceptable latency for top-50 candidate sets.
 - **Why not LlamaIndex or LangChain RAG?** -- Their abstractions hide the retrieval pipeline internals, making it impossible to optimize chunk strategy, fusion weights, or reranking thresholds. At Staff level, you OWN the retrieval pipeline. You need to be able to A/B test chunk sizes, swap fusion algorithms, tune reranker score thresholds, and instrument every stage independently. Frameworks give you convenience at the cost of control -- in production RAG, control wins.
 :::
 
@@ -65,9 +66,9 @@ pip install sentence-transformers rank-bm25 chromadb numpy \
 `.env`:
 ```bash
 OPENAI_API_KEY=your-key
-OPENAI_MODEL=gpt-4o-mini
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-CROSS_ENCODER_MODEL=cross-encoder/ms-marco-MiniLM-L-12-v2
+AGENT_MODEL_FAST=<fast-tier model id>
+AGENT_LOCAL_EMBEDDING_MODEL=<sentence-transformers model name>   # local model; API embedding IDs use AGENT_EMBEDDING_MODEL elsewhere
+AGENT_RERANKER_MODEL=<cross-encoder model id>
 CHROMA_PERSIST_DIR=./chroma_db
 ```
 
@@ -110,16 +111,14 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-CROSS_ENCODER_MODEL = os.getenv(
-    "CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-12-v2"
-)
+OPENAI_MODEL = os.environ["AGENT_MODEL_FAST"]
+EMBEDDING_MODEL = os.environ["AGENT_LOCAL_EMBEDDING_MODEL"]
+CROSS_ENCODER_MODEL = os.environ["AGENT_RERANKER_MODEL"]
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 COLLECTION_NAME = "rag_documents"
 
 # Tokenizer for counting tokens in prompts and chunks
-TOKENIZER = tiktoken.encoding_for_model("gpt-4o-mini")
+TOKENIZER = tiktoken.get_encoding("o200k_base")
 
 
 def count_tokens(text: str) -> int:
@@ -670,7 +669,7 @@ class CrossEncoderReranker:
     Solution: retrieve 50 candidates with fast bi-encoder, rerank top 50
     with slow cross-encoder, return top 10.
 
-    Model: cross-encoder/ms-marco-MiniLM-L-12-v2
+    Model: the cross-encoder in AGENT_RERANKER_MODEL
     - ~50ms per (query, document) pair on CPU
     - At 50 candidates: ~2.5 seconds total
     - Acceptable for most interactive applications
@@ -1500,6 +1499,8 @@ class IngestionPipeline:
 The CLI supports three modes: `index` to ingest documents, `query` to ask questions, and `evaluate` to run the evaluation suite against a JSONL dataset. Each mode prints detailed metrics so you can track pipeline performance.
 
 ```python
+# (EMBEDDING_MODEL is the module-level constant from the configuration step.)
+
 # ---------------------------------------------------------------------------
 # Step 10: CLI Entry Point
 # ---------------------------------------------------------------------------
@@ -1794,7 +1795,7 @@ Adaptive chunking resolves this by letting the content dictate size. A three-sen
 
 **What this project demonstrates:**
 
-1. **Retrieval quality drives RAG quality, not generation.** The LLM is only as good as the context it receives. A GPT-4-class model with poor retrieval produces worse answers than a GPT-3.5-class model with excellent retrieval. Staff engineers focus their optimization effort on the retrieval pipeline.
+1. **Retrieval quality drives RAG quality, not generation.** The LLM is only as good as the context it receives. A a frontier-tier model model with poor retrieval produces worse answers than a fast-tier model with excellent retrieval. Staff engineers focus their optimization effort on the retrieval pipeline.
 
 2. **Hybrid search is not optional in production.** Pure semantic search fails on entity lookups, error codes, product SKUs, and any query where exact string matching matters. Pure BM25 fails on paraphrased or conceptual queries. Hybrid is the baseline, not an enhancement.
 

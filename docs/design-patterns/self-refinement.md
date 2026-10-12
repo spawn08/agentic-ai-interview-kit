@@ -1,6 +1,7 @@
 ---
 sidebar_position: 7
 title: "Self-Refinement"
+last_verified: 2026-10-12
 ---
 
 # Self-Refinement
@@ -81,6 +82,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +128,7 @@ class RefinementState(TypedDict):
 
 def generate_node(state: RefinementState) -> dict[str, Any]:
     """Produce the initial output for the task."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     response: AIMessage = llm.invoke([
         SystemMessage(content="You are an expert. Complete the task thoroughly and correctly."),
         HumanMessage(content=f"Task: {state['task']}"),
@@ -154,7 +158,7 @@ def evaluate_node(state: RefinementState) -> dict[str, Any]:
         det_failures.append(syntax_msg)
 
     # --- LLM evaluation ---
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(Evaluation)
 
     det_context = ""
@@ -240,7 +244,7 @@ def quality_gate(state: RefinementState) -> Literal["pass", "fail"]:
 
 def refine_node(state: RefinementState) -> dict[str, Any]:
     """Revise the output to address all identified issues."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     last_eval = state["evaluations"][-1]
 
     all_issues = last_eval.issues + last_eval.deterministic_failures

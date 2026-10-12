@@ -1,12 +1,13 @@
 ---
 sidebar_position: 3
 title: "Design Pattern Questions"
-description: "15 Q&A on ReAct, Chain-of-Thought, multi-agent, reflection, and other agentic design patterns."
+description: "19 Q&A on ReAct, Chain-of-Thought, multi-agent, reflection, and other agentic design patterns."
+last_verified: 2026-10-12
 ---
 
 # Design Pattern Questions
 
-These 15 questions cover the proven architectural patterns used to build agentic AI systems. Expect these in senior-level interviews where the interviewer wants to see that you can design, not just implement.
+These 19 questions cover the proven architectural patterns used to build agentic AI systems. Expect these in senior-level interviews where the interviewer wants to see that you can design, not just implement.
 
 :::info Pattern vs. Framework
 Patterns are reusable architectural solutions. Frameworks implement patterns. Know the patterns first -- then you can evaluate any framework and explain why it made specific design choices.
@@ -107,7 +108,7 @@ The Map-Reduce pattern parallelizes work by splitting a task into independent su
 <details>
 <summary>View Answer</summary>
 
-The Fallback Chain pattern defines a sequence of increasingly powerful (and expensive) strategies for handling a request. If the first strategy fails or produces a low-confidence result, the system falls back to the next strategy. A typical chain: (1) **cache lookup** -- check if this exact query has been answered before; (2) **RAG retrieval** -- search the knowledge base for a direct answer; (3) **simple agent** -- use a cheap model (GPT-4o-mini) with basic tools; (4) **full agent** -- use the most capable model (GPT-4o) with all tools; (5) **human escalation** -- route to a human agent. This pattern optimizes for both cost and latency: the vast majority of queries are handled by cheap, fast strategies, while complex queries automatically escalate. Implementation requires a confidence or quality scoring mechanism at each level to decide whether to proceed or fall back. The pattern is analogous to a caching hierarchy in systems engineering. Key design decisions: what triggers a fallback (error, low confidence, specific query type), and how many levels are appropriate (too many levels add latency from failed attempts).
+The Fallback Chain pattern defines a sequence of increasingly powerful (and expensive) strategies for handling a request. If the first strategy fails or produces a low-confidence result, the system falls back to the next strategy. A typical chain: (1) **cache lookup** -- check if this exact query has been answered before; (2) **RAG retrieval** -- search the knowledge base for a direct answer; (3) **simple agent** -- use a cheap model (the fast-tier model) with basic tools; (4) **full agent** -- use the most capable model (the standard-tier model) with all tools; (5) **human escalation** -- route to a human agent. This pattern optimizes for both cost and latency: the vast majority of queries are handled by cheap, fast strategies, while complex queries automatically escalate. Implementation requires a confidence or quality scoring mechanism at each level to decide whether to proceed or fall back. The pattern is analogous to a caching hierarchy in systems engineering. Key design decisions: what triggers a fallback (error, low confidence, specific query type), and how many levels are appropriate (too many levels add latency from failed attempts).
 
 </details>
 
@@ -140,7 +141,7 @@ The State Machine pattern models an agent workflow as a finite set of states wit
 <details>
 <summary>View Answer</summary>
 
-The Critic pattern uses a separate LLM call (or model) to verify the primary agent's output before it is returned to the user. The critic receives the original query, the agent's response, and evaluation criteria, then produces a pass/fail judgment with specific feedback. If the critic rejects the response, it is sent back to the agent for revision. This differs from Reflection (where the agent self-evaluates) in that the critic is independent, which reduces self-serving bias. Implementation approaches: (1) **same model, different prompt** -- cheapest, but the model may make the same errors; (2) **different model** -- e.g., use Claude to critique GPT-4o's output; (3) **specialized verifier** -- a model fine-tuned for evaluation; (4) **rule-based verifier** -- check for factual consistency, format compliance, or policy violations without an LLM. The Critic pattern is especially valuable for high-stakes applications (medical, legal, financial) where errors have serious consequences. The cost trade-off is that every response requires at least one additional LLM call. In interviews, connect this to the "Constitutional AI" concept from Anthropic, where a set of principles guide the critic's evaluation.
+The Critic pattern uses a separate LLM call (or model) to verify the primary agent's output before it is returned to the user. The critic receives the original query, the agent's response, and evaluation criteria, then produces a pass/fail judgment with specific feedback. If the critic rejects the response, it is sent back to the agent for revision. This differs from Reflection (where the agent self-evaluates) in that the critic is independent, which reduces self-serving bias. Implementation approaches: (1) **same model, different prompt** -- cheapest, but the model may make the same errors; (2) **different model** -- e.g., use a second provider's model to critique the first model's output; (3) **specialized verifier** -- a model fine-tuned for evaluation; (4) **rule-based verifier** -- check for factual consistency, format compliance, or policy violations without an LLM. The Critic pattern is especially valuable for high-stakes applications (medical, legal, financial) where errors have serious consequences. The cost trade-off is that every response requires at least one additional LLM call. In interviews, connect this to the "Constitutional AI" concept from Anthropic, where a set of principles guide the critic's evaluation.
 
 </details>
 
@@ -176,3 +177,59 @@ The Parallel Execution pattern runs multiple independent agent tasks concurrentl
 Pattern selection depends on five factors: (1) **Task complexity** -- simple QA uses RAG or a single tool-calling agent; complex multi-step tasks use Plan-and-Execute or multi-agent systems. (2) **Reliability requirements** -- high-stakes tasks need Reflection, Critic, and HITL patterns; low-stakes tasks can use simpler patterns. (3) **Latency budget** -- real-time applications favor Router and Fallback Chain (fast paths for common queries); batch applications can afford Plan-and-Execute and multi-agent. (4) **Cost budget** -- each LLM call costs money; Reflection and Critic patterns double or triple the cost per query. Start with the simplest viable pattern and add complexity only when needed. (5) **Observability needs** -- regulated industries need auditable patterns like State Machine; research applications can use more flexible patterns. The general progression is: start with a simple tool-calling agent, add RAG if knowledge is needed, add Reflection if quality is insufficient, add Routing if you need to handle diverse query types, and only move to multi-agent if the task genuinely requires it. Over-engineering with complex patterns is a common mistake -- each added pattern increases latency, cost, and debugging difficulty.
 
 </details>
+
+---
+
+## Q16. When should a pattern use a native (vendor-run) tool instead of a custom tool?
+
+**Level: Mid**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** Use native tools for generic capabilities where the vendor's implementation is good enough (web search, sandboxed code execution). Use custom tools whenever you need control: your data, side effects, approval gates, audit, or portability.
+
+**2-minute answer:** In pattern terms, a native tool is a prebuilt capability you cannot intercept per call; a custom tool is code you own. Choose per tool, not per system. Prefer native when: the capability is commodity, the data involved is not sensitive, and per-call approval is unnecessary. Prefer custom when: the tool reads or writes internal systems, the action is irreversible, you need deterministic validation or rate limiting, or you must run across multiple model providers (native tool sets differ across vendors). Patterns that need gating -- human-in-the-loop, plan-and-execute with approval -- only work on custom tools because there is a call you can pause. A common hybrid: native search to gather information, custom tools for every write.
+
+</details>
+
+## Q17. How do you design a stateful workflow on top of stateless MCP (2026-07-28)?
+
+**Level: Senior**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** Model the state as an explicit resource. The first tool call creates it and returns a server-minted handle; later calls pass the handle as an ordinary argument. The server stores the state (with owner and expiry), not the protocol connection.
+
+**2-minute answer:** Because the 2026-07-28 revision removes protocol-level sessions, patterns that relied on connection state -- a multi-step wizard, a long-running job, a shopping cart -- become **handle-based**. Pattern: `create_job() -> job_id`, `add_step(job_id, ...)`, `get_status(job_id)`, `commit(job_id)`. Rules: (1) bind each handle to the authenticated caller and validate it on every call; (2) give handles a TTL and a delete path; (3) make `commit`-style calls idempotent (idempotency key) so client retries are safe; (4) keep handles opaque and unguessable; (5) return enough in each response for the model to continue, since the model, not a session, carries the thread. (The 2026-07-28 changelog also moves the experimental tasks feature out of the core protocol into an official extension, so check that extension if you need long-running task semantics.) Benefits are horizontal scalability and testability; the cost is explicit lifecycle management you previously got implicitly.
+
+</details>
+
+## Q18. How would you use reasoning effort in a router or orchestrator-worker pattern?
+
+**Level: Senior**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** Treat effort as a second routing dimension next to model choice: route easy requests to low effort (or a smaller model) and hard ones to high effort. Let adaptive thinking handle some of this automatically, and verify with evals.
+
+**2-minute answer:** The routing pattern classifies a request and sends it to a specialized path. Cost and latency can be tuned along two axes: **which model** and **how much effort**. In orchestrator-worker setups, the orchestrator planning step usually merits higher effort, while mechanical workers (extraction, formatting, simple lookups) run at low effort. Guard rails: (1) the classifier itself must be cheap, and its mistakes should fail toward the safer (more capable) path for risky tasks; (2) record route and effort in traces; (3) validate with an offline eval that compares success per dollar across route/effort settings; (4) re-check after model updates, because adaptive behavior and effort semantics are vendor-defined and change. Effort levels vary per model, so read the current vendor page instead of hard-coding assumptions.
+
+</details>
+
+## Q19. An agent's performance improved after you switched patterns (single agent to multi-agent). How do you know it was the pattern?
+
+**Level: Senior**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** You do not know until you control for the other variables. Multi-agent systems usually also spend more tokens, change context handling, and sometimes change the model, so run controlled comparisons that equalize or at least report cost.
+
+**2-minute answer:** Confounders: (1) **token budget** -- Anthropic reports multi-agent systems using about 15x the tokens of chat, and more spend alone can raise quality; compare at equal budget or report cost per success. (2) **Model and effort** -- keep them constant across arms. (3) **Harness details** -- prompts, tool descriptions, and retries often change in a redesign. (4) **Task type** -- parallel, breadth-first research benefits from multiple agents; tightly coupled tasks (like code changes with dependent decisions) often do not, per Cognition's counter-argument. (5) **Variance** -- run each task several times and report pass^k and pass@k. Also compare failure modes: if multi-agent introduces context-fragmentation errors, the aggregate score can hide them. State the claim narrowly: "on this task set, at this budget, pattern B beat pattern A." See [Multi-Agent Pattern](../design-patterns/multi-agent-pattern.md).
+
+</details>
+
+*Sources (checked 2026-10-12): [Claude tool use overview](https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview), [OpenAI tools guide](https://developers.openai.com/api/docs/guides/tools), [MCP specification 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and its [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog), [Claude effort](https://platform.claude.com/docs/en/build-with-claude/effort) and [adaptive thinking](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost), [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents).*

@@ -2,6 +2,7 @@
 sidebar_position: 4
 title: "Data Layer Design"
 description: "Database selection, vector store architecture, schema design, and query patterns for agentic AI systems"
+last_verified: 2026-10-12
 ---
 
 # Data Layer Design
@@ -218,7 +219,7 @@ CREATE TABLE document_chunks (
     document_id     UUID NOT NULL,
     tenant_id       UUID NOT NULL,
     content         TEXT NOT NULL,
-    embedding       vector(1536),        -- OpenAI text-embedding-3-small dimension
+    embedding       vector(${EMBEDDING_DIMENSION}),  -- render from len() of a real embedding; see note below
     chunk_index     INTEGER NOT NULL,    -- position within the document
     metadata        JSONB DEFAULT '{}',
     source_hash     TEXT NOT NULL,        -- hash of source content for staleness detection
@@ -239,6 +240,8 @@ CREATE INDEX idx_chunks_tenant ON document_chunks(tenant_id);
 -- Staleness detection: find chunks whose source has changed
 CREATE INDEX idx_chunks_document_updated ON document_chunks(document_id, updated_at);
 ```
+
+**The vector dimension is not a constant.** `${EMBEDDING_DIMENSION}` in the DDL is a template placeholder, not valid SQL. Measure it from the model you actually deploy (`len(embedding_fn("probe"))`, where `embedding_fn` is your embedding call) and export it as `EMBEDDING_DIMENSION` before rendering the migration, for example with `envsubst < schema.sql.tmpl > schema.sql`. Changing the embedding model usually changes the dimension, which means a new column or table and a re-embed.
 
 **Performance tuning parameters:**
 
@@ -317,10 +320,13 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 
 client = QdrantClient(url="http://localhost:6333")
 
+# Dimension of the embedding model you deploy: measure it, never assume it.
+EMBEDDING_DIMENSION = len(embedding_fn("dimension probe"))  # embedding_fn: your embedding call
+
 # Create collection with quantization
 client.create_collection(
     collection_name="agent_knowledge",
-    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+    vectors_config=VectorParams(size=EMBEDDING_DIMENSION, distance=Distance.COSINE),
     quantization_config={
         "scalar": {"type": "int8", "quantile": 0.99, "always_ram": True}
     },
@@ -486,7 +492,7 @@ CREATE TABLE messages (
     tool_calls        JSONB,                  -- LLM-generated tool call requests
     tool_results      JSONB,                  -- tool execution results (heterogeneous structure)
     token_count       INTEGER,                -- tokens consumed by this message
-    model             TEXT,                    -- "gpt-4o", "claude-sonnet-4-20250514", etc.
+    model             TEXT,                    -- value of the AGENT_MODEL (or tier-specific) env var used for the call
     latency_ms        INTEGER,                -- LLM response time for assistant messages
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -655,7 +661,7 @@ CREATE TABLE document_chunks (
     tenant_id         UUID NOT NULL,
     collection_name   TEXT NOT NULL DEFAULT 'default',  -- logical grouping (e.g., "policies", "docs")
     content           TEXT NOT NULL,           -- the actual text content of the chunk
-    embedding         vector(1536),            -- embedding vector (dimension matches model)
+    embedding         vector(${EMBEDDING_DIMENSION}),  -- embedding vector (dimension of the model in embedding_model)
     chunk_index       INTEGER NOT NULL,        -- position within the document (for ordering)
     total_chunks      INTEGER,                 -- total chunks in the parent document
     char_count        INTEGER NOT NULL,        -- character count for statistics
@@ -663,7 +669,7 @@ CREATE TABLE document_chunks (
     metadata          JSONB DEFAULT '{}',      -- arbitrary metadata (author, tags, section, etc.)
     source_url        TEXT,                    -- where this content came from
     source_hash       TEXT NOT NULL,           -- SHA-256 of source content for staleness detection
-    embedding_model   TEXT NOT NULL,           -- "text-embedding-3-small" -- track which model generated this
+    embedding_model   TEXT NOT NULL,           -- value of AGENT_EMBEDDING_MODEL at embed time -- track which model generated this
     is_current        BOOLEAN NOT NULL DEFAULT TRUE,  -- FALSE = pending deletion by cleanup job
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -692,7 +698,7 @@ CREATE INDEX idx_chunks_document_order
 
 **Why `source_hash` exists.** When the source document is updated, the ingestion pipeline computes its SHA-256 hash. If the hash differs from the stored `source_hash`, the chunks are stale and need re-embedding. This avoids re-embedding unchanged documents, which saves both compute (embedding API calls) and time.
 
-**Why `embedding_model` is tracked.** Embeddings from different models are not comparable. If you upgrade from `text-embedding-ada-002` to `text-embedding-3-small`, the old embeddings must be re-generated. Tracking the model per chunk allows incremental migration: serve queries against old embeddings while re-embedding in the background, then switch over.
+**Why `embedding_model` is tracked.** Embeddings from different models are not comparable. If you upgrade from one embedding model to another (for example, after changing `AGENT_EMBEDDING_MODEL`), the old embeddings must be re-generated. Tracking the model per chunk allows incremental migration: serve queries against old embeddings while re-embedding in the background, then switch over.
 
 ### 3.5 Analytics and Cost Tracking Schema
 
@@ -704,7 +710,7 @@ CREATE TABLE llm_calls (
     session_id        UUID REFERENCES agent_sessions(session_id),
     step_id           UUID REFERENCES agent_steps(step_id),
     tenant_id         UUID NOT NULL,
-    model             TEXT NOT NULL,           -- "gpt-4o-2024-08-06", "claude-sonnet-4-20250514"
+    model             TEXT NOT NULL,           -- exact model ID/snapshot the provider reports for the call
     provider          TEXT NOT NULL,           -- "openai", "anthropic", "azure"
     prompt_tokens     INTEGER NOT NULL,
     completion_tokens INTEGER NOT NULL,

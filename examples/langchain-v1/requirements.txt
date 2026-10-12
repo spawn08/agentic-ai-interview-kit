@@ -1,0 +1,22 @@
+# Verified 2026-10-12 against latest releases (see reports/batch-2.md)
+langchain[mcp]>=1.4         # [mcp] extra pulls fastmcp, required by langchain.mcp.MCPAdapter
+langchain-core>=1.0
+langgraph>=1.0
+langchain-classic>=1.0      # legacy boundary only
+langchain-chroma
+langchain-openai            # customer-support / research / multi-agent-crew pages: ChatOpenAI
+langchain-text-splitters
+langchain-community>=0.4,<0.4.2  # loaders / BM25 only; 0.4.2 drops chat_models.vertexai which ragas 0.4.3 imports
+pydantic>=2
+pytest
+mcp>=2                      # core-concepts/tools-and-function-calling: mcp.server.mcpserver.MCPServer
+ragas                       # foundations/rag-basics: evaluation snippet
+datasets                    # foundations/rag-basics: evaluation snippet
+langgraph-checkpoint-postgres  # frameworks/langgraph-deep-dive: PostgresSaver
+langgraph-swarm             # core-concepts/agent-architectures: create_swarm
+anthropic                   # core-concepts/tools-and-function-calling: Anthropic SDK example
+jinja2                      # foundations/prompting-techniques: Template example
+langchain-experimental      # foundations/rag-basics: SemanticChunker
+sentence-transformers       # foundations/rag-basics: CrossEncoder reranker
+tavily-python               # projects/research-agent: TavilyClient
+sqlparse                    # core-concepts/guardrails-and-safety: SQL validation example

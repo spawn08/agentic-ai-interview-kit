@@ -40,12 +40,30 @@ const config: Config = {
     ],
   ],
 
+  plugins: [
+    ['@docusaurus/plugin-client-redirects', {
+      redirects: [{
+        from: '/frameworks/openai-assistants-api',
+        to: '/frameworks/openai-responses-and-agents-sdk',
+      }],
+    }],
+  ],
+
   presets: [
     [
       'classic',
       {
         docs: {
           routeBasePath: '/',
+          // Docusaurus defaults preserved, plus an explicit exclusion so the shared model
+          // reference partial (docs/_shared/models.md) is only ever imported, never routed.
+          exclude: [
+            '**/_*.{js,jsx,ts,tsx,md,mdx}',
+            '**/_*/**',
+            '**/*.test.{js,jsx,ts,tsx}',
+            '**/__tests__/**',
+            '**/_shared/**',
+          ],
           sidebarPath: './sidebars.ts',
           showLastUpdateTime: false,
           editUrl:

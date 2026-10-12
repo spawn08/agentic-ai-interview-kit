@@ -1,0 +1,9 @@
+# Tier 1 / llamaindex-agents.md. Own environment; floors only (latest otherwise).
+# Do NOT add llama-index-question-gen-openai: its newest release caps llama-index-core<0.13, which
+# drags the whole environment back to old releases. The page uses core's LLMQuestionGenerator.
+# Run: python examples/langchain-v1/check_doc_imports.py docs/frameworks/llamaindex-agents.md
+#      pytest examples/tier1/llamaindex
+llama-index-core
+llama-index-llms-openai
+llama-index-embeddings-openai
+pytest

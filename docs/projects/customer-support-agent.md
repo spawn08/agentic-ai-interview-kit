@@ -2,6 +2,7 @@
 sidebar_position: 1
 title: "Project: Customer Support Agent"
 description: "Build a production customer support agent with LangGraph — multi-agent routing, RAG, tool calling, and human-in-the-loop escalation"
+last_verified: 2026-10-12
 ---
 
 # Project: Customer Support Agent
@@ -14,7 +15,7 @@ Build an AI-powered customer support agent that classifies user intent, routes t
 - **Conditional routing** -- The intent router naturally maps to LangGraph's conditional edges
 - **Built-in checkpointing** -- Conversation state persists across turns via SqliteSaver/PostgresSaver with zero custom code
 - **Human-in-the-loop** -- LangGraph's `interrupt()` function pauses the graph for human review, then resumes exactly where it left off
-- **Why not LangChain AgentExecutor?** -- Too simple for multi-agent routing; no conditional branching or checkpointing
+- **Why not a single `create_agent` agent?** -- Multi-agent routing needs conditional branching across specialists; a custom LangGraph `StateGraph` gives explicit routing and checkpointing (agents built with `create_agent` can still be nodes in it)
 - **Why not Custom?** -- LangGraph provides the state machine + persistence layer that would take weeks to build from scratch
 :::
 
@@ -60,7 +61,7 @@ Create a `.env` file:
 
 ```bash
 OPENAI_API_KEY=your-key-here
-OPENAI_MODEL=gpt-4o-mini
+AGENT_MODEL_FAST=<fast-tier model id>   # see docs/_shared/models.md
 ```
 
 ---
@@ -306,11 +307,13 @@ def create_support_ticket(
 Each node is a function that receives the full state and returns a partial state update. The intent router uses structured output to classify the user message. The specialist agents each have access to the tools relevant to their domain. The confidence check evaluates whether the response is good enough to send to the customer.
 
 ```python
+import os
+
 # ---------------------------------------------------------------------------
 # LLM setup
 # ---------------------------------------------------------------------------
 
-model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+model_name = os.environ["AGENT_MODEL_FAST"]
 llm = ChatOpenAI(model=model_name, temperature=0.0)
 
 

@@ -2,6 +2,7 @@
 sidebar_position: 2
 title: "AI Agent that Modifies CAD Models"
 description: "System design for an AI agent that understands and modifies CAD models via natural language with constraint solving and validation"
+last_verified: 2026-10-12
 ---
 
 # AI Agent that Modifies CAD Models
@@ -257,11 +258,11 @@ The sequence above illustrates the complete modification lifecycle. Notice sever
 
 | Component | Cost/Operation | Notes |
 |-----------|---------------|-------|
-| LLM inference (intent + translation) | $0.02-0.10 | Depends on context size and clarification rounds |
+| LLM inference (intent + translation) | `c_llm` per round | Depends on context size and clarification rounds |
 | Constraint solving (CPU) | $0.001-0.01 | Scales with model complexity and constraint depth |
 | Preview rendering (GPU) | $0.01-0.05 | Wireframe is cheap; shaded views cost more |
 | Storage (delta snapshots) | $0.001 | Delta compression keeps cost minimal |
-| **Total per modification** | **$0.03-0.17** | Typical session has 5-15 modifications |
+| **Total per modification** | **`c_llm` + non-LLM rows** | Typical session has 5-15 modifications |
 
 For an engineer whose time costs $60-100/hour, even a $1 session cost is trivial if it saves 10 minutes of manual CAD operations per modification.
 

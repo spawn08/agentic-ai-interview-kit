@@ -2,6 +2,7 @@
 sidebar_position: 7
 title: "Observability and Tracing"
 description: "LLM tracing, distributed observability, cost tracking, and debugging strategies for agentic systems"
+last_verified: 2026-10-12
 ---
 
 # Observability and Tracing
@@ -83,8 +84,12 @@ LLM-specific tracing captures the full prompt-completion lifecycle: what was sen
 ### Instrumenting LLM Calls
 
 ```python
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
+
 class InstrumentedLLMClient:
-    async def generate(self, prompt, model="gpt-4o", **kwargs):
+    async def generate(self, prompt, model=MODEL, **kwargs):
         with tracer.start_as_current_span("llm.generate") as span:
             span.set_attribute("llm.model", model)
             start = time.monotonic()
@@ -314,7 +319,7 @@ class CostTracker:
 
 | Metric | Granularity | Alert Threshold |
 |--------|------------|-----------------|
-| Cost per request | Per session | > $0.50 per request |
+| Cost per request | Per session | > a per-request cost threshold (config) |
 | Daily cost | Per user, per org | > daily budget |
 | Cost per model | Aggregate | Unusual spike |
 | Tokens per step | Per agent step | > 4000 tokens per step |
@@ -462,7 +467,7 @@ Every observability decision in an agentic system involves a concrete tradeoff b
 
 Recording every prompt-completion pair gives perfect debuggability but at massive storage cost. At 10K daily agent requests averaging 8K tokens per request, you are storing 80M tokens/day of trace data. Sampling (capture 10% of traces) cuts cost 10x but means you will miss 90% of edge-case failures.
 
-**The compromise:** head-based sampling for normal traffic (10%) plus tail-based sampling that captures 100% of error traces, slow traces (above P95 latency), and expensive traces (over $0.10 per request). This gives you full visibility into problems while sampling away routine successes.
+**The compromise:** head-based sampling for normal traffic (10%) plus tail-based sampling that captures 100% of error traces, slow traces (above P95 latency), and expensive traces (over a per-request cost threshold). This gives you full visibility into problems while sampling away routine successes.
 
 ### 2. Prompt Logging: Full vs Redacted vs Hash-Only
 

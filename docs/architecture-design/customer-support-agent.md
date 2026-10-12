@@ -2,6 +2,7 @@
 sidebar_position: 1
 title: "Customer Support Agent"
 description: "Architecture design for a production AI-powered customer support agent system"
+last_verified: 2026-10-12
 ---
 
 # Customer Support Agent
@@ -77,9 +78,9 @@ graph TB
 
     subgraph "Agent Layer"
         Router[Intent Router]
-        FAQ[FAQ Agent<br/>GPT-4o-mini]
-        Order[Order Agent<br/>GPT-4o]
-        Return[Return Agent<br/>GPT-4o]
+        FAQ[FAQ Agent<br/>fast-tier model]
+        Order[Order Agent<br/>standard-tier model]
+        Return[Return Agent<br/>standard-tier model]
         Escalation[Escalation Agent]
     end
 
@@ -145,18 +146,18 @@ The **Tool Layer** exposes backend systems as callable tools -- CRM lookups, ord
 
 ### 1. Intent Router
 
-The Intent Router is the entry point for every customer message. Its job is to classify the user's intent and dispatch to the correct specialist agent. It exists as a separate component for one critical reason: **cost optimization**. Without a router, every message would go to the most capable (and most expensive) model. With routing, simple FAQ questions (60% of traffic) go to GPT-4o-mini at $0.15/1M input tokens, while only complex order and return issues go to GPT-4o at $2.50/1M input tokens.
+The Intent Router is the entry point for every customer message. Its job is to classify the user's intent and dispatch to the correct specialist agent. It exists as a separate component for one critical reason: **cost optimization**. Without a router, every message would go to the most capable (and most expensive) model. With routing, simple FAQ questions (60% of traffic) go to the fast-tier model at the fast-tier input rate `p_in_fast`, while only complex order and return issues go to the standard-tier model at `p_in_std` (rates from your pricing config).
 
-The router uses GPT-4o-mini for classification itself -- it is a lightweight, fast classification task that does not need a large model. It maintains a mapping of intents to agent configurations:
+The router uses the fast-tier model for classification itself -- it is a lightweight, fast classification task that does not need a large model. It maintains a mapping of intents to agent configurations:
 
 | Intent | Agent | Model | Priority |
 |--------|-------|-------|----------|
-| FAQ / general question | FAQ Agent | GPT-4o-mini | Low |
-| Order status | Order Agent | GPT-4o | Normal |
-| Return request | Return Agent | GPT-4o | Normal |
-| Billing issue | Order Agent | GPT-4o | High |
-| Complaint / request for human | Escalation Agent | GPT-4o | High |
-| Unknown | FAQ Agent | GPT-4o-mini | Normal |
+| FAQ / general question | FAQ Agent | fast-tier model | Low |
+| Order status | Order Agent | standard-tier model | Normal |
+| Return request | Return Agent | standard-tier model | Normal |
+| Billing issue | Order Agent | standard-tier model | High |
+| Complaint / request for human | Escalation Agent | standard-tier model | High |
+| Unknown | FAQ Agent | fast-tier model | Normal |
 
 The router also includes a hard-coded override: if the user explicitly asks for a human agent (detected via keyword matching, not LLM), the message is routed directly to the Escalation Agent regardless of classified intent. This ensures customers are never trapped in an AI loop when they want human help.
 
@@ -168,13 +169,13 @@ The FAQ Agent handles product questions, policy inquiries, and general informati
 
 **Retrieval strategy**: When a message arrives, the agent embeds the query and retrieves the top 5 relevant articles from the pgvector store, filtering to only published articles. The retrieved documents are injected into the system prompt as context, and the LLM generates a response grounded in those documents.
 
-**Model and temperature**: The agent uses GPT-4o-mini with a temperature of 0.1. The low temperature ensures consistent, factual responses -- customer support answers should not vary creatively between sessions. GPT-4o-mini is sufficient because FAQ responses are largely extractive (pulling answers from retrieved documents rather than reasoning over complex scenarios).
+**Model and temperature**: The agent uses the fast-tier model with a temperature of 0.1. The low temperature ensures consistent, factual responses -- customer support answers should not vary creatively between sessions. The fast-tier model is sufficient because FAQ responses are largely extractive (pulling answers from retrieved documents rather than reasoning over complex scenarios).
 
 **Confidence thresholds and escalation**: The agent evaluates confidence in its response. If confidence falls below 0.6, the agent does not attempt an answer. Instead, it returns an escalation signal with the reason "low_confidence" and the confidence score. This prevents the agent from confidently delivering wrong answers, which erodes customer trust faster than admitting it cannot help. The threshold of 0.6 is tuned based on production data -- too high and you escalate too many routine questions; too low and you deliver unreliable answers.
 
 ### 3. Order Agent
 
-The Order Agent handles order lookups, status checks, and modifications. Unlike the FAQ Agent, it needs to take actions -- looking up real data and creating real tickets -- which makes it more complex and requires a more capable model (GPT-4o).
+The Order Agent handles order lookups, status checks, and modifications. Unlike the FAQ Agent, it needs to take actions -- looking up real data and creating real tickets -- which makes it more complex and requires a more capable model (the standard-tier model).
 
 **Tool access**: The agent has access to three tools:
 
@@ -186,13 +187,13 @@ The Order Agent handles order lookups, status checks, and modifications. Unlike 
 
 **CRM integration**: The agent first loads session state from Redis to understand the customer context (authenticated user, previous messages). It then sends the message and conversation history to the LLM, which generates a plan -- typically a tool call sequence. For example, for "Where is my order #12345?", the LLM plans to call `get_order_status`, receives the order data (status, tracking number, carrier), and synthesizes a natural-language response.
 
-**Why GPT-4o instead of GPT-4o-mini**: The Order Agent needs to reason about when to call which tool, interpret structured API responses, and compose responses that combine data from multiple sources. GPT-4o-mini's smaller capacity leads to more frequent tool-calling errors and hallucinated order data in testing. The cost difference is justified by the higher accuracy requirement for transactional queries.
+**Why the standard-tier model instead of the fast-tier model**: The Order Agent needs to reason about when to call which tool, interpret structured API responses, and compose responses that combine data from multiple sources. The fast-tier model's smaller capacity leads to more frequent tool-calling errors and hallucinated order data in testing. The cost difference is justified by the higher accuracy requirement for transactional queries.
 
 ### 4. Escalation Agent
 
 The Escalation Agent manages the handoff from AI to human support. Its design goal is to make the handoff as smooth as possible -- the human agent should have full context without needing to ask the customer to repeat themselves.
 
-**Conversation summarization**: When escalation is triggered, the agent uses GPT-4o-mini to generate a structured summary of the conversation. The summary includes: the customer's core issue, what steps the AI already took (tool calls, information retrieved), relevant order or account information discovered during the conversation, and the reason for escalation (low confidence, customer request, policy constraint).
+**Conversation summarization**: When escalation is triggered, the agent uses the fast-tier model to generate a structured summary of the conversation. The summary includes: the customer's core issue, what steps the AI already took (tool calls, information retrieved), relevant order or account information discovered during the conversation, and the reason for escalation (low confidence, customer request, policy constraint).
 
 **Handoff protocol**: The agent creates a handoff ticket in the ticketing system with the session ID, customer ID, conversation summary, full conversation history, priority level, and escalation reason. Priority is determined by signals in the conversation -- mentions of legal action, repeated frustration, high-value orders, or billing disputes increase priority.
 
@@ -218,7 +219,7 @@ sequenceDiagram
     participant GW as API Gateway
     participant Router as Intent Router
     participant OA as Order Agent
-    participant LLM as GPT-4o
+    participant LLM as standard-tier model
     participant OMS as Order System
     participant Redis as Session Store
 
@@ -244,13 +245,13 @@ sequenceDiagram
 
 ### Happy Path Walkthrough
 
-The user sends "Where is my order #12345?" through the web chat widget. The API Gateway authenticates the request and forwards it to the Intent Router. The router classifies the intent as `order_status` using GPT-4o-mini (a lightweight classification call costing fractions of a cent) and dispatches to the Order Agent.
+The user sends "Where is my order #12345?" through the web chat widget. The API Gateway authenticates the request and forwards it to the Intent Router. The router classifies the intent as `order_status` using the fast-tier model (a lightweight classification call costing fractions of a cent) and dispatches to the Order Agent.
 
-The Order Agent loads the session state from Redis to check for any prior context (is this a returning customer? have they already asked about this order?). It sends the message and conversation history to GPT-4o, which generates a plan: call the `get_order_status` tool with `order_id="12345"`.
+The Order Agent loads the session state from Redis to check for any prior context (is this a returning customer? have they already asked about this order?). It sends the message and conversation history to the standard-tier model, which generates a plan: call the `get_order_status` tool with `order_id="12345"`.
 
-The agent executes the tool call against the Order Management System, which returns structured data: the order is shipped, the tracking number is "1Z999...", and the carrier is UPS. The agent sends this data back to GPT-4o to synthesize a natural-language response: "Your order #12345 was shipped on June 8 and is currently in transit. Your tracking number is 1Z999..."
+The agent executes the tool call against the Order Management System, which returns structured data: the order is shipped, the tracking number is "1Z999...", and the carrier is UPS. The agent sends this data back to the standard-tier model to synthesize a natural-language response: "Your order #12345 was shipped on June 8 and is currently in transit. Your tracking number is 1Z999..."
 
-The agent saves the updated session state (including this turn) to Redis and returns the response through the API Gateway to the user. Total latency: under 3 seconds. Total cost: approximately $0.015.
+The agent saves the updated session state (including this turn) to Redis and returns the response through the API Gateway to the user. Total latency: under 3 seconds. Total cost: roughly `C_order` from the Cost Analysis section.
 
 ### Escalation Path
 
@@ -316,10 +317,10 @@ Before committing to replica counts and provider quotas, size the system from fi
 | Fleet turn rate | 10,000 turns/min (~167/sec) | 5,000 x 2 |
 | Tokens per turn (in + out) | ~6,500 | Context budget table (Agent Memory) |
 | Aggregate token demand | ~65M TPM | 10,000 x 6,500 |
-| GPT-4o demand (40% order/return) | ~26M TPM | 0.40 x 65M |
-| GPT-4o-mini demand (60% FAQ) | ~39M TPM | 0.60 x 65M |
+| standard-tier model demand (40% order/return) | ~26M TPM | 0.40 x 65M |
+| fast-tier model demand (60% FAQ) | ~39M TPM | 0.60 x 65M |
 
-**Step 2 -- TPM budget vs. provider quota.** The ~26M tokens-per-minute of GPT-4o demand exceeds any single deployment's quota (a typical Azure OpenAI GPT-4o deployment is provisioned in the low millions of TPM; OpenAI's top usage tier caps around 30M TPM). Applying a 1.5x safety headroom, the target is ~39M TPM -- which no single deployment satisfies. This is the concrete justification for the multi-provider LLM Gateway: spread GPT-4o traffic across the OpenAI account plus two or three Azure OpenAI deployments, each contributing a few million TPM. Prompt caching (see Cost Analysis) cuts billed input tokens on multi-turn conversations by ~40%, lowering effective GPT-4o demand from ~26M toward ~16M TPM and reclaiming quota headroom.
+**Step 2 -- TPM budget vs. provider quota.** The ~26M tokens-per-minute of the standard-tier model demand exceeds any single deployment's quota (a typical cloud-hosted standard-tier deployment is provisioned in the low millions of TPM; OpenAI's top usage tier caps around 30M TPM). Applying a 1.5x safety headroom, the target is ~39M TPM -- which no single deployment satisfies. This is the concrete justification for the multi-provider LLM Gateway: spread the standard-tier model traffic across the OpenAI account plus two or three Azure OpenAI deployments, each contributing a few million TPM. Prompt caching (see Cost Analysis) cuts billed input tokens on multi-turn conversations by ~40%, lowering effective the standard-tier model demand from ~26M toward ~16M TPM and reclaiming quota headroom.
 
 **Step 3 -- Worker/replica count.** Workers are sized by concurrent in-flight LLM calls, not by total sessions. With a ~2-second LLM turn and a turn every ~30 seconds, each session is "in flight" only ~7% of the time:
 
@@ -372,19 +373,21 @@ If this system evolves into a platform serving multiple enterprise tenants (each
 
 ### Per-Conversation Cost Breakdown
 
+Cost per call is `(in_tokens * p_in + out_tokens * p_out) / 1_000_000`, where `p_in` and `p_out` are USD per 1M tokens for the model tier used. The rates are **assumptions loaded from your pricing config** (see the [shared model reference](../index.md#model-and-price-reference)), not constants; the structure below is what matters.
+
 | Component | Tokens/Calls | Unit Cost | Cost per Conversation |
 |-----------|-------------|-----------|----------------------|
-| Intent classification | 200 tokens (mini) | $0.15/1M | $0.00003 |
-| FAQ response (3 turns) | 3,000 tokens (mini) | $0.15/1M in, $0.60/1M out | $0.0008 |
-| Order lookup (3 turns) | 4,500 tokens (4o) | $2.50/1M in, $10/1M out | $0.015 |
-| RAG retrieval | 3 queries | $0.001/query | $0.003 |
-| Redis session | 1 session | ~$0 | negligible |
-| **Total (FAQ path)** | | | **$0.004** |
-| **Total (order path)** | | | **$0.018** |
-| **Blended average** | 60% FAQ, 40% order | | **$0.010** |
+| Intent classification | 200 tokens (fast tier) | `p_in_fast` | 200 x `p_in_fast` / 1M |
+| FAQ response (3 turns) | 3,000 tokens (fast tier) | `p_in_fast`, `p_out_fast` | `C_faq` = (in x `p_in_fast` + out x `p_out_fast`) / 1M |
+| Order lookup (3 turns) | 4,500 tokens (standard tier) | `p_in_std`, `p_out_std` | `C_order` = (in x `p_in_std` + out x `p_out_std`) / 1M |
+| RAG retrieval | 3 queries | `c_query` per query (infrastructure, not tokens) | 3 x `c_query` |
+| Redis session | 1 session | ~0 | negligible |
+| **Total (FAQ path)** | | | classification + `C_faq` + retrieval |
+| **Total (order path)** | | | classification + `C_order` + retrieval |
+| **Blended average** | 60% FAQ, 40% order | | 0.6 x FAQ path + 0.4 x order path |
 
 :::tip
-The blended cost per conversation ($0.01) is well under the $0.15 budget. This headroom allows for longer conversations, retries, and the occasional expensive escalation path without exceeding budget.
+Compare the blended cost per conversation to your per-conversation budget. If the blended figure sits well under budget, the headroom allows longer conversations, retries, and the occasional expensive escalation path without exceeding it.
 :::
 
 ### Monthly Cost at Scale
@@ -393,29 +396,29 @@ The blended cost per conversation ($0.01) is well under the $0.15 budget. This h
 |--------|-------|
 | Daily conversations | 50,000 |
 | Monthly conversations | 1,500,000 |
-| Blended cost per conversation | $0.010 |
-| **Monthly LLM cost** | **$15,000** |
-| Infrastructure (Redis, compute, networking) | $3,000 |
-| Observability (Langfuse, Grafana) | $500 |
-| **Total monthly cost** | **$18,500** |
+| Blended cost per conversation | `C_blend` (from the table above) |
+| **Monthly LLM cost** | **1,500,000 x `C_blend`** |
+| Infrastructure (Redis, compute, networking) | fixed monthly cost (your own estimate) |
+| Observability (Langfuse, Grafana) | fixed monthly cost (your own estimate) |
+| **Total monthly cost** | **LLM cost + infrastructure + observability** |
 
 ### Prompt Caching
 
 The per-conversation costs above assume every turn re-sends the full input context. In practice a large, identical prefix is sent on every turn of a conversation: the system prompt, the tool definitions, and (within a topic) the retrieved knowledge base context -- the stable prefix described in the Context Window Strategy. Provider prompt caching bills that prefix at a steep discount after the first turn. Anthropic charges ~1.25x the base input rate to *write* a cache entry and ~0.1x to *read* it (a ~90% discount on cached tokens); OpenAI applies an automatic ~50% discount on cached input tokens for prefixes over 1,024 tokens. Only the stable prefix is cached -- the dynamic tail (the new user message, fresh tool results, the rolling summary) is billed normally.
 
-Savings scale with conversation length, because the prefix is re-read on every turn. Consider a mid-length order conversation on GPT-4o -- 6 turns, a ~3,000-token stable prefix (system prompt + tool definitions + retrieved policy context), ~500 dynamic input tokens per turn, and ~300 output tokens per turn. Using Anthropic-style cache pricing:
+Savings scale with conversation length, because the prefix is re-read on every turn. Consider a mid-length order conversation on the standard-tier model -- 6 turns, a ~3,000-token stable prefix (system prompt + tool definitions + retrieved policy context), ~500 dynamic input tokens per turn, and ~300 output tokens per turn. Using Anthropic-style cache pricing:
 
 | Item | Without caching | With prompt caching |
 |------|----------------|--------------------|
-| Stable prefix input | 3,000 x 6 = 18,000 tok @ $2.50/1M = $0.045 | 1 write ($0.0094) + 5 reads ($0.0038) = $0.013 |
-| Dynamic input | 500 x 6 = 3,000 tok @ $2.50/1M = $0.0075 | $0.0075 |
-| Output | 300 x 6 = 1,800 tok @ $10/1M = $0.018 | $0.018 |
-| **Total LLM cost** | **~$0.070** | **~$0.039** |
+| Stable prefix input | 3,000 x 6 = 18,000 tok x `p_in` / 1M | 1 write (3,000 x `w` x `p_in` / 1M) + 5 reads (3,000 x `r` x `p_in` / 1M) |
+| Dynamic input | 500 x 6 = 3,000 tok x `p_in` / 1M | same |
+| Output | 300 x 6 = 1,800 tok x `p_out` / 1M | same |
+| **Total LLM cost** | sum of the rows | sum of the rows; only the prefix row changes |
 
-Caching cuts the input portion by ~60% and the total by ~45% on this conversation, and it also lowers latency: the cached prefix skips re-encoding on the provider side, improving time-to-first-token on long prefixes.
+With the assumed multipliers (write `w`, read `r`), caching cuts the prefix portion of input cost substantially -- the total saving depends on how large the prefix is relative to dynamic input and output -- and it also lowers latency: the cached prefix skips re-encoding on the provider side, improving time-to-first-token on long prefixes.
 
 :::info Illustrative figures
-These numbers are illustrative and use Anthropic-style cache read/write multipliers; exact discounts and the minimum cacheable prefix length differ by provider and change over time. The savings are largest on the long-conversation tail -- the 5% of conversations exceeding 20 turns that the Production Issues section identifies as ~40% of token spend. Applied across the fleet, prompt caching trims the blended cost per conversation from ~$0.010 toward ~$0.007, extending the existing headroom under the $0.15 budget rather than replacing the estimate above. Typical short (2--3 turn) conversations see smaller absolute savings because the prefix is re-read fewer times.
+The structure is illustrative: `w` and `r` are assumed cache write/read multipliers of the base input rate; exact discounts and the minimum cacheable prefix length differ by provider and change over time. The savings are largest on the long-conversation tail -- the 5% of conversations exceeding 20 turns that the Production Issues section identifies as ~40% of token spend. Applied across the fleet, prompt caching trims the blended cost per conversation `C_blend` toward roughly 0.7 x `C_blend` (assumption), extending the existing headroom under the $0.15 budget rather than replacing the estimate above. Typical short (2--3 turn) conversations see smaller absolute savings because the prefix is re-read fewer times.
 :::
 
 ---
@@ -846,19 +849,19 @@ The system uses a **budget-based context packing** approach. For each LLM call, 
 | Response budget | ~1,000 tokens | Reserved for LLM output |
 | **Total per turn** | **~6,500 tokens** | |
 
-This budget keeps each turn well within GPT-4o-mini's 128K context limit while optimizing for cost -- paying for 6,500 tokens per turn rather than naively stuffing the full conversation history (which could grow to 50K+ tokens in long sessions).
+This budget keeps each turn well within the fast-tier model's 128K context limit while optimizing for cost -- paying for 6,500 tokens per turn rather than naively stuffing the full conversation history (which could grow to 50K+ tokens in long sessions).
 
 ### Rolling Summary
 
 When a conversation exceeds 10 turns, the system compresses older messages into a rolling summary. This prevents unbounded context growth while preserving the information the agent needs.
 
-The summary is generated by GPT-4o-mini with a structured prompt that captures four elements:
+The summary is generated by the fast-tier model with a structured prompt that captures four elements:
 1. **Customer's issue** -- what the customer originally asked about
 2. **Actions taken** -- which tools were called and what data was retrieved
 3. **Current state** -- where the conversation stands (resolved? pending? escalated?)
 4. **Relevant data** -- order numbers, account details, or policy references discovered during the conversation
 
-The summary replaces messages 1 through N-10 in the context window. Only the most recent 10 messages are kept verbatim. This approach costs approximately $0.001 per summary (a short GPT-4o-mini call) but saves $0.01+ per turn in reduced context length for long conversations.
+The summary replaces messages 1 through N-10 in the context window. Only the most recent 10 messages are kept verbatim. This approach costs one short fast-tier call per summary but saves the input cost of the dropped messages on every later turn of a long conversation.
 
 ### Cross-Session Memory
 
@@ -953,7 +956,7 @@ The following table documents production issues observed in customer support age
 | Agent loops on ambiguous intent | Same classification repeated 3+ times; customer frustration rises; conversation exceeds 10 turns without progress | User query matches multiple intents with near-equal probability; the router oscillates between FAQ and Order agents each turn | Add a "confused" intent that triggers immediate escalation after 2 reclassifications; implement a priority ordering for tie-breaking (FAQ < Order < Return < Escalation) so ties resolve deterministically |
 | Stale knowledge base answers | Agent gives outdated policy information (e.g., old return window); customer complaints about incorrect information | Knowledge articles were updated in the CMS but the embedding index was not refreshed | Implement webhook-triggered re-indexing: CMS publishes an event on article update, the indexing service re-embeds and upserts the article within 5 minutes; add `updated_at` freshness check in retrieval to prefer recently updated articles |
 | PII leakage in logs | Customer PII (emails, phone numbers, addresses) found in observability logs during a compliance audit | Tool results containing PII were logged verbatim by the tracing middleware | Add PII scrubbing middleware to the logging pipeline; use regex-based redaction for emails, phone numbers, credit card numbers, and addresses before writing to any log sink; validate with automated PII scanning in CI |
-| Cost spike on long conversations | Monthly LLM cost 3x the projected budget | 5% of conversations exceed 20 turns, each turn hitting GPT-4o with a growing context window; these long conversations account for 40% of total token spend | Add a per-conversation cost limit ($0.50); after the limit is reached, switch to summary mode (compress history, use GPT-4o-mini) or escalate to a human agent; alert on conversations exceeding 15 turns |
+| Cost spike on long conversations | Monthly LLM cost 3x the projected budget | 5% of conversations exceed 20 turns, each turn hitting standard-tier model with a growing context window; these long conversations account for 40% of total token spend | Add a per-conversation cost limit ($0.50); after the limit is reached, switch to summary mode (compress history, use fast-tier model) or escalate to a human agent; alert on conversations exceeding 15 turns |
 | WebSocket disconnection losing context | Customer reconnects after a network interruption; the agent has no memory of the prior conversation; customer must repeat their issue | Session state expired in Redis during the network interruption (TTL elapsed while the customer was disconnected) | Persist conversation checkpoints to PostgreSQL every 5 turns; on reconnect, attempt Redis recovery first, then fall back to PostgreSQL checkpoint; extend Redis TTL to 30 minutes for sessions with active WebSocket connections |
 | Escalation queue flooding | Human agents overwhelmed with escalated conversations; wait times exceed 30 minutes; customer satisfaction drops | Confidence threshold set too high (0.8), causing the agent to escalate routine FAQ questions that it could answer correctly | Tune the confidence threshold down to 0.6 based on production accuracy data; add a "suggest but do not escalate" tier for medium confidence (0.4--0.6) where the agent provides its best answer along with an option to speak with a human |
 | Semantic cache returning wrong answers | Customer receives an answer to a semantically similar but different question (e.g., asked about return policy for electronics, received answer about return policy for clothing) | Cosine similarity threshold for cache hits set too low (0.90), matching queries that are similar but not equivalent | Raise the similarity threshold to 0.95; add a category-matching constraint so cache hits only occur within the same intent category; log cache hit decisions for manual review during the first 2 weeks after threshold changes |
@@ -969,7 +972,7 @@ Before launching a customer support agent, build runbooks for each issue in this
 | Decision | Rationale | Alternative | Why Not |
 |----------|-----------|-------------|---------|
 | Specialized agents per intent | Each agent uses the optimal model and tools for its domain; enables independent iteration and cost control | Single general-purpose agent handling all intents | Higher cost (every query hits the expensive model), harder to tune prompts (one prompt tries to cover FAQ, orders, returns), and tool sprawl in a single agent's context window |
-| GPT-4o-mini for FAQ, GPT-4o for orders | 10x cost difference between models; FAQ is extractive and does not need complex reasoning | Use GPT-4o for everything | Blended cost jumps from $0.01 to $0.04+ per conversation; at 1.5M monthly conversations, that is $45K+ extra per month with no quality improvement on FAQ responses |
+| fast-tier model for FAQ, standard-tier model for orders | large cost ratio between tiers (see `p_std / p_fast`); FAQ is extractive and does not need complex reasoning | Use standard-tier model for everything | Blended cost rises toward `C_order` for every conversation (the standard/fast price ratio, `p_std / p_fast`); at 1.5M monthly conversations that is a large extra monthly cost with no quality improvement on FAQ responses |
 | pgvector for knowledge base | Runs inside existing PostgreSQL infrastructure; no additional managed service; sufficient for knowledge bases under 1M documents | Dedicated vector database (Pinecone, Qdrant) | Adds operational complexity and cost; pgvector handles the expected scale; migrate to a dedicated solution if vector search latency becomes a bottleneck |
 | Redis for session state | Sub-millisecond reads; built-in TTL for session expiration; cluster mode for fault tolerance | Store sessions in PostgreSQL | Adds 5-10ms per read to every turn of every conversation; at 5,000 concurrent sessions, this latency compounds |
 | Confidence-based escalation (threshold 0.6) | Prevents low-quality AI responses from reaching customers; preserves trust | Always attempt an answer regardless of confidence | Low-confidence answers are often wrong; incorrect answers from the AI are harder to recover from than a prompt escalation |

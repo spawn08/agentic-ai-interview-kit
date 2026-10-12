@@ -2,6 +2,7 @@
 sidebar_position: 6
 title: "Evaluation Metrics"
 description: "Traditional metrics, LLM-as-judge, human evaluation, RAG evaluation, and agent evaluation approaches"
+last_verified: 2026-10-12
 ---
 
 # Evaluation Metrics
@@ -107,8 +108,9 @@ Measures how "surprised" the model is by a text. Lower perplexity means the mode
 ```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import os
 
-model_name = "gpt2"
+model_name = os.environ["AGENT_PPL_MODEL"]  # small local causal LM for perplexity
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(model_name)
 
@@ -139,14 +141,18 @@ print(f"Garbled text perplexity: {compute_perplexity(text_garbled):.2f}")
 
 ## LLM-as-Judge
 
-The most widely used evaluation approach for modern LLM applications. Use a strong LLM (typically GPT-4o or Claude) to evaluate the output of the system being tested.
+The most widely used evaluation approach for modern LLM applications. Use a strong LLM (typically a frontier- or standard-tier model) to evaluate the output of the system being tested.
 
 ### Pointwise Evaluation
 
 Rate a single output on specific criteria.
 
 ```python
+import os
 from openai import OpenAI
+
+MODEL = os.environ["AGENT_MODEL"]
+
 
 client = OpenAI()
 
@@ -179,7 +185,7 @@ Provide your evaluation as JSON with the following format:
 def evaluate_response(question: str, response: str) -> dict:
     """Use LLM-as-judge to evaluate a response."""
     result = client.chat.completions.create(
-        model="gpt-4o",
+        model=MODEL,
         messages=[
             {
                 "role": "user",
@@ -206,9 +212,14 @@ print(json.dumps(evaluation, indent=2))
 
 ### Pairwise Evaluation
 
+
 Compare two responses and determine which is better. More reliable than pointwise scoring because relative comparisons are easier for judges than absolute ratings.
 
 ```python
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
+
 PAIRWISE_PROMPT = """You are an expert evaluator. Compare the two responses 
 below and determine which better answers the question.
 
@@ -234,7 +245,7 @@ def pairwise_evaluate(
 ) -> dict:
     """Compare two responses using pairwise evaluation."""
     result = client.chat.completions.create(
-        model="gpt-4o",
+        model=MODEL,
         messages=[
             {
                 "role": "user",
@@ -261,7 +272,7 @@ LLM judges have systematic biases:
 
 2. **Verbosity bias** -- judges prefer longer, more detailed responses even when shorter is better. **Mitigation:** Include "conciseness" as an explicit criterion. Instruct the judge to penalize unnecessary verbosity.
 
-3. **Self-enhancement bias** -- GPT-4 may rate GPT-4 outputs higher than Claude outputs (and vice versa). **Mitigation:** Use a different model as judge than the one being evaluated. Or use multiple judges and aggregate.
+3. **Self-enhancement bias** -- a model may rate outputs from its own family higher than outputs from other providers (and vice versa). **Mitigation:** Use a different model as judge than the one being evaluated. Or use multiple judges and aggregate.
 
 4. **Sycophancy** -- judges may rate everything as "good" to avoid conflict. **Mitigation:** Use calibration examples with known-bad responses to establish the full scale. Require the judge to identify at least one flaw.
 
@@ -270,7 +281,7 @@ LLM judges have systematic biases:
 </details>
 
 :::tip Best Practice: Multi-Judge Agreement
-Use 3 different LLM judges (e.g., GPT-4o, Claude 4 Sonnet, Gemini 2.5 Pro) and take the majority vote. This reduces individual model biases and produces more reliable evaluations.
+Use 3 different LLM judges (e.g., standard-tier models from three different providers) and take the majority vote. This reduces individual model biases and produces more reliable evaluations.
 :::
 
 ---
@@ -552,12 +563,126 @@ def evaluate_agent_run(
 
 | Benchmark | What It Tests | Tasks |
 |---|---|---|
-| **SWE-bench** | Autonomous code repair | Fix real GitHub issues |
+| **SWE-bench** | Autonomous code repair | Fix real GitHub issues (variants: Verified, Multimodal, Lite) |
+| **tau-bench** (τ-bench) | Tool-agent-user conversations under domain policy rules; reports **pass^k** reliability | Retail and airline domains; success is judged by final database state |
+| **tau2-bench** (τ²-bench) | Dual-control conversations where agent *and* user act on a shared world | Adds a Telecom domain |
+| **Terminal-Bench** | Agents doing real work in a terminal; leaderboard reports resolution rate, cost, and tokens | Terminal tasks |
 | **WebArena** | Web navigation agents | Complete tasks on live websites |
 | **GAIA** | General AI assistant | Multi-step reasoning with tools |
 | **AgentBench** | Multi-domain agent capabilities | OS, DB, web, game environments |
-| **ToolBench** | Tool use accuracy | 16,000+ real-world API tasks |
+| **ToolBench** | Tool use accuracy (from the ToolLLM paper) | 16,000+ real-world API tasks |
 | **HumanEval** | Code generation | Function-level code completion |
+
+*Sources (checked 2026-10-12): [SWE-bench](https://www.swebench.com/), [tau-bench paper](https://arxiv.org/abs/2406.12045), [tau2-bench paper](https://arxiv.org/abs/2506.07982), [Terminal-Bench](https://www.tbench.ai/), [GAIA](https://arxiv.org/abs/2311.12983), [WebArena](https://arxiv.org/abs/2307.13854), [AgentBench](https://arxiv.org/abs/2308.03688), [ToolLLM/ToolBench](https://arxiv.org/abs/2307.16789), [HumanEval](https://arxiv.org/abs/2107.03374). Benchmark scores change quickly and versions differ; always cite the benchmark version and harness when quoting a number.*
+
+### Reliability: pass^k vs pass@k
+
+One successful run does not make an agent dependable. Run each task **n** times and count **c** successes, then choose the metric that matches the product requirement:
+
+| Metric | Question it answers | If per-run success probability is *p* (independent runs) | Estimator from n runs, c successes |
+|--------|--------------------|----------------------------------------------------------|-------------------------------------|
+| **pass@k** | Does *at least one* of k attempts succeed? (search, best-of-k with a verifier) | 1 − (1 − p)^k | 1 − C(n−c, k) / C(n, k) |
+| **pass^k** | Do *all* k attempts succeed? (customer-facing reliability, repeatable operations) | p^k | C(c, k) / C(n, k) |
+
+pass^k was introduced in the tau-bench paper as the chance that **all k i.i.d. trials are successful**, averaged across tasks. The two metrics move in opposite directions as k grows: pass@k rises toward 1, pass^k falls. An agent with p = 0.9 per run has pass^8 = 0.9^8 ≈ 0.43. Note that p^k is the *theoretical* value for a single task with fixed p; the **unbiased estimator** C(c, k) / C(n, k) is what you compute from finite runs (and it must be averaged over tasks, since p differs per task).
+
+```python
+from math import comb
+
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased estimate of P(at least one of k runs succeeds), from c successes in n runs."""
+    if not 0 <= c <= n or not 1 <= k <= n:
+        raise ValueError("need 0 <= c <= n and 1 <= k <= n")
+    return 1.0 - comb(n - c, k) / comb(n, k)
+
+
+def pass_hat_k(n: int, c: int, k: int) -> float:
+    """Unbiased estimate of P(all k runs succeed), from c successes in n runs (pass^k)."""
+    if not 0 <= c <= n or not 1 <= k <= n:
+        raise ValueError("need 0 <= c <= n and 1 <= k <= n")
+    return comb(c, k) / comb(n, k)
+
+
+def mean_over_tasks(metric, runs_per_task: dict[str, list[bool]], k: int) -> float:
+    """Average a per-task metric over tasks. Every task must have the same number of runs."""
+    sizes = {len(r) for r in runs_per_task.values()}
+    assert len(sizes) == 1, "use the same n for every task"
+    n = sizes.pop()
+    return sum(metric(n, sum(r), k) for r in runs_per_task.values()) / len(runs_per_task)
+```
+
+:::warning Do not substitute p^k for the estimator
+Computing `(c/n) ** k` is a biased shortcut: it treats the observed rate as the true p. With n = 4 and c = 3, `(3/4)**4 ≈ 0.32` but the unbiased pass^4 is `C(3,4)/C(4,4) = 0`, because you never observed four straight successes. Use the combinatorial estimator, and report n alongside k.
+:::
+
+### Trajectory Evaluation
+
+Final-answer checks miss agents that succeed for the wrong reasons (or fail after correct steps). **Trajectory evaluation** scores the sequence of actions against a reference, using one of several match modes:
+
+| Mode | Passes when | Use for |
+|------|-------------|---------|
+| **Exact** | Same tool calls in the same order | Fixed procedures, compliance flows |
+| **In-order** | Expected calls appear as a subsequence (extra steps allowed) | Required ordering with flexibility |
+| **Any-order** | Expected calls all appear, order ignored | Independent lookups that can run in parallel |
+| **Precision / recall** | Share of actual calls that were expected / of expected calls that happened | Detecting wasteful or missing calls |
+
+```python
+def trajectory_match(actual: list[str], expected: list[str], mode: str = "in_order") -> bool:
+    """Compare tool-call names. Extend to compare arguments for stricter checks."""
+    if mode == "exact":
+        return actual == expected
+    if mode == "any_order":
+        return set(expected) <= set(actual)
+    if mode == "in_order":
+        it = iter(actual)
+        return all(step in it for step in expected)
+    raise ValueError(f"unknown mode: {mode}")
+
+
+def trajectory_precision_recall(actual: list[str], expected: list[str]) -> tuple[float, float]:
+    hit = len(set(actual) & set(expected))
+    precision = hit / len(set(actual)) if actual else 0.0
+    recall = hit / len(set(expected)) if expected else 1.0
+    return precision, recall
+```
+
+Trajectories are a diagnostic, not the goal: for open-ended tasks several different paths are valid, so pair trajectory scores with outcome checks (for example, tau-bench compares the end database state with the goal state).
+
+### Cost-Normalized Metrics
+
+An agent that is 3 points more accurate but 10x as expensive is not automatically better. Report quality **per unit of cost**:
+
+| Metric | Definition |
+|--------|------------|
+| **Cost per task** | total spend / tasks attempted |
+| **Cost per success** | total spend / successful tasks -- includes the money wasted on failures |
+| **Successes per dollar** | successful tasks / total spend |
+| **Tokens per success, steps per success** | the same ratios for tokens and tool-call steps; stable across price changes |
+
+```python
+def cost_report(runs: list[dict], input_price_per_mtok: float, output_price_per_mtok: float) -> dict:
+    """runs: [{"success": bool, "input_tokens": int, "output_tokens": int}, ...].
+
+    Prices are inputs, never constants: look them up for your provider and date them.
+    """
+    spend = sum(
+        r["input_tokens"] * input_price_per_mtok + r["output_tokens"] * output_price_per_mtok
+        for r in runs
+    ) / 1_000_000
+    wins = sum(1 for r in runs if r["success"])
+    return {
+        "spend": spend,
+        "cost_per_task": spend / len(runs) if runs else 0.0,
+        "cost_per_success": spend / wins if wins else float("inf"),
+        # no wins -> 0.0 (even at zero spend); wins with zero spend -> inf (no cost data)
+        "successes_per_dollar": 0.0 if not wins else (wins / spend if spend else float("inf")),
+    }
+```
+
+Corner cases: with no successes `successes_per_dollar` is `0.0` (and `cost_per_success` is `inf`), even when spend is zero. `inf` for successes per dollar appears only when there are wins but zero recorded spend, which usually means missing token counts or prices rather than a free agent; treat it as "no cost data", not as a result.
+
+For current prices see the [Model and Price Reference](../index.md#model-and-price-reference). Compare agents at matched success rates or plot a cost-vs-success frontier; and always count retries, tool-call tokens, and judge-model calls in the spend.
 
 <details>
 <summary><strong>Deep Dive: Building Your Own Agent Evaluation Suite</strong></summary>

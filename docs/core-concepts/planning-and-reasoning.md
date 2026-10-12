@@ -2,6 +2,7 @@
 sidebar_position: 3
 title: Planning and Reasoning
 description: How AI agents decompose tasks, form plans, reason with chain-of-thought and tree-of-thought, and recover when planning fails.
+last_verified: 2026-10-12
 ---
 
 # Planning and Reasoning
@@ -235,6 +236,10 @@ graph TD
 
 **Cons**: Higher token usage, can loop or drift, harder to predict total cost.
 
+:::info Implementation Note
+Today the "Act" step is almost always a **native tool call** (a structured, schema-validated `{name, args}` returned by the model API, possibly several in parallel), not a `Thought:`/`Action:` string parsed with regexes as in the original ReAct paper. The loop is unchanged; the reliability is much better. In LangChain this is `create_agent`; see the [ReAct Pattern](../design-patterns/react-pattern#native-tool-calls-vs-text-parsed-react) page for the comparison and the one collapsed legacy example.
+:::
+
 ### Hybrid: Plan-and-Solve
 
 Generate a high-level plan, then use iterative refinement within each step. This combines the structure of top-down planning with the adaptability of ReAct.
@@ -389,19 +394,20 @@ Without iteration limits and progress checks, an agent can consume thousands of 
 
 ## Putting It All Together: A Planning Agent in LangGraph
 
-The plan-and-execute pattern maps naturally onto a LangGraph state graph: one node creates the plan, another executes the current step (using a ReAct sub-agent), and a conditional edge decides whether to continue, replan, or finish.
+The plan-and-execute pattern maps naturally onto a LangGraph state graph: one node creates the plan, another executes the current step (using a `create_agent` ReAct-style sub-agent), and a conditional edge decides whether to continue, replan, or finish.
 
 ```python
 from __future__ import annotations
 
+import os
 from enum import Enum
 from typing import Annotated, TypedDict
 
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, Field
 
 
@@ -439,8 +445,9 @@ class PlanState(TypedDict):
 
 MAX_REPLANS = 3
 
-planner_llm = ChatOpenAI(model="gpt-4o", temperature=0)
-executor_llm = ChatOpenAI(model="gpt-4o", temperature=0)
+# AGENT_MODEL is "<provider>:<model>"
+planner_llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0)
+executor_llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0)
 
 
 # --- Graph nodes ---------------------------------------------------------
@@ -469,13 +476,13 @@ def create_plan(state: PlanState) -> PlanState:
 
 
 def execute_step(state: PlanState) -> PlanState:
-    """Execute the current plan step using a ReAct sub-agent."""
+    """Execute the current plan step using a create_agent sub-agent."""
     plan = state["plan"]
     idx = state["current_step_index"]
     step = plan.steps[idx]
 
-    # Build a lightweight ReAct executor for this step
-    executor = create_react_agent(executor_llm, tools=[])  # bind real tools here
+    # Build a lightweight tool-calling (ReAct-style) executor for this step
+    executor = create_agent(executor_llm, tools=[])  # bind real tools here
     try:
         result = executor.invoke(
             {"messages": [HumanMessage(content=step.description)]},

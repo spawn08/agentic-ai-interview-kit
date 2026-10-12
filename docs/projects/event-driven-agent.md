@@ -2,6 +2,7 @@
 sidebar_position: 9
 title: "Project: Real-Time Event-Driven Agent"
 description: "Build a real-time event-driven agent with async Python — stream processing, stateful reasoning, anomaly detection, and graduated autonomous remediation"
+last_verified: 2026-10-12
 ---
 
 # Project: Real-Time Event-Driven Agent
@@ -69,6 +70,10 @@ pip install aiokafka redis[hiredis] openai pydantic python-dotenv structlog
 OPENAI_API_KEY=your-key
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092
 REDIS_URL=redis://localhost:6379/0
+AGENT_MODEL=<standard-tier model id>   # see docs/_shared/models.md
+# Token prices: USD per 1M tokens, from the vendor pricing page (required, no defaults)
+PRICING_INPUT_PER_MILLION=<number>
+PRICING_OUTPUT_PER_MILLION=<number>
 ```
 
 ---
@@ -114,9 +119,12 @@ KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "event-agent-v1")
 KAFKA_TOPICS = ["infra.metrics", "infra.alerts", "infra.deploys", "infra.incidents"]
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL = os.environ["AGENT_MODEL"]
 LLM_CONFIDENCE_THRESHOLD = 0.7
 LLM_HOURLY_BUDGET_USD = float(os.getenv("LLM_HOURLY_BUDGET_USD", "50.0"))
+# Token prices: USD per 1M tokens from your pricing config. Required; no defaults.
+PRICING_INPUT_PER_MILLION = float(os.environ["PRICING_INPUT_PER_MILLION"])
+PRICING_OUTPUT_PER_MILLION = float(os.environ["PRICING_OUTPUT_PER_MILLION"])
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +504,7 @@ class WindowedStateAggregator:
 
 ### Step 3: Rule Engine (Fast, Deterministic)
 
-The rule engine is the first-pass anomaly detector. It runs against every event's updated service state and does not require LLM calls. Its job is to filter: at 10,000 events per minute, sending every event to the LLM would cost $72,000 per month. The rule engine passes through only the 5% of events that look anomalous, reducing LLM cost to approximately $3,600 per month.
+The rule engine is the first-pass anomaly detector. It runs against every event's updated service state and does not require LLM calls. Its job is to filter: at 10,000 events per minute, sending every event to the LLM would cost 432M x `c` per month (see the cost table). The rule engine passes through only the 5% of events that look anomalous, reducing LLM cost to 5% of that.
 
 ```python
 # ---------------------------------------------------------------------------
@@ -544,9 +552,9 @@ class RuleEngine:
     """Fast, deterministic anomaly detection.
 
     Why rules before LLM:
-    LLM calls cost $0.01-0.05 each and take 1-5 seconds. At 10,000
+    Each LLM call costs `c` (see Cost Analysis) and take 1-5 seconds. At 10,000
     events per minute, sending every event to the LLM would cost
-    $6,000-30,000 per hour. The rule engine filters ~95% of events
+    600,000 x `c` per hour. The rule engine filters ~95% of events
     as normal, sending only the anomalous ~5% to the LLM. This reduces
     LLM cost by 20x.
 
@@ -769,11 +777,11 @@ class LLMReasoner:
                 ],
             )
 
-            # Track cost (approximate: $0.005/1K input, $0.015/1K output for gpt-4o)
+            # Track cost: cost = (in_tokens*p_in + out_tokens*p_out) / 1_000_000 (rates from your pricing config)
             usage = response.usage
             if usage:
-                cost = (usage.prompt_tokens * 0.005 / 1000 +
-                        usage.completion_tokens * 0.015 / 1000)
+                cost = (usage.prompt_tokens * PRICING_INPUT_PER_MILLION
+                        + usage.completion_tokens * PRICING_OUTPUT_PER_MILLION) / 1_000_000
                 self._total_cost_usd += cost
 
             self._hourly_call_count += 1
@@ -1702,7 +1710,7 @@ python -m event_agent kill-switch deactivate --user "oncall-eng"
 
 | Decision | Chosen | Alternative | Why |
 |----------|--------|-------------|-----|
-| Rules-first, LLM-second | Two-tier: fast rules filter, LLM analyzes flagged events only | LLM-first: send every event to the LLM for analysis | At 10K events/min, LLM-first costs $72K/month. The rule engine pre-filter reduces this to $3.6K/month by filtering out 95% of normal events. Rules also provide sub-millisecond latency for known patterns. |
+| Rules-first, LLM-second | Two-tier: fast rules filter, LLM analyzes flagged events only | LLM-first: send every event to the LLM for analysis | At 10K events/min, LLM-first costs 432M x `c` per month. The rule engine pre-filter reduces this to 5% of that by filtering out 95% of normal events. Rules also provide sub-millisecond latency for known patterns. |
 | Advisory LLM (recommends only) | LLM produces structured recommendations; Action Engine decides execution | Agentic LLM with direct tool access (function calling to restart, rollback, etc.) | Separation of intelligence and execution. If the LLM hallucinates a recommendation, safety checks catch it before it reaches production. Agentic LLM bypass would mean a hallucinated "rollback" executes immediately. |
 | Graduated autonomy (4 levels) | Per-service autonomy levels from observe-only to full-auto | Binary on/off switch for all automated actions | Different services have different risk profiles. The payment service should be observe-only; the batch processor can be full-auto. Binary on/off forces the same policy on all services. |
 | Per-service configuration | Each service has its own autonomy level, oncall channel, and limits | Global configuration shared across all services | A "scale up" that is safe for a stateless API gateway may be dangerous for a stateful database proxy. Per-service config captures domain knowledge about each service's operational characteristics. |
@@ -1768,10 +1776,10 @@ At 10,000 events per minute (a medium-sized infrastructure):
 | Events per hour | 600,000 | 600,000 |
 | Events sent to LLM | 600,000 (100%) | 30,000 (5%) |
 | Avg tokens per LLM call | ~2,000 | ~2,000 |
-| Cost per LLM call (GPT-4o) | ~$0.04 | ~$0.04 |
-| Hourly LLM cost | $24,000 | $1,200 |
-| Monthly LLM cost | **$17.3M** | **$864K** |
-| With caching + dedup | ~$72K | **~$3.6K** |
+| Cost per LLM call (standard-tier model) | `c` = (2,000 x `p_in` + out x `p_out`) / 1M | same `c` |
+| Hourly LLM cost | 600,000 x `c` | 30,000 x `c` |
+| Monthly LLM cost (720 h) | **432M x `c`** | **21.6M x `c`** |
+| With caching + dedup | a small fraction of the row above | **a smaller fraction still** |
 
 The "with caching + dedup" row reflects production reality: most rule matches in a 5-minute window are for the same service and the same anomaly. The agent caches LLM analysis results per service state fingerprint and skips re-analysis if the state has not materially changed since the last analysis. This reduces actual LLM calls to roughly 5% of rule matches, bringing the effective LLM invocation rate to 0.25% of total events.
 
@@ -1785,7 +1793,7 @@ The "with caching + dedup" row reflects production reality: most rule matches in
 
 2. **Separation of intelligence and execution.** The LLM recommends; the Action Engine decides. This is a non-obvious architectural choice that prevents the most dangerous failure mode: a confidently wrong LLM triggering destructive actions. It also makes the system testable -- you can unit test the Action Engine's safety checks independently of LLM behavior.
 
-3. **Cost-aware architecture.** The rule-engine-first design is not just a performance optimization; it is a cost architecture decision. Knowing that 95% of events are normal and designing the system to avoid $70K/month in unnecessary LLM calls demonstrates production-scale thinking.
+3. **Cost-aware architecture.** The rule-engine-first design is not just a performance optimization; it is a cost architecture decision. Knowing that 95% of events are normal and designing the system to avoid the bulk of monthly cost in unnecessary LLM calls demonstrates production-scale thinking.
 
 4. **Kill switch design philosophy.** The kill switch is intentionally simple, has no overrides, and fails closed. This shows understanding of how automated systems behave during incidents: complexity in safety mechanisms is itself a risk.
 
@@ -1804,4 +1812,4 @@ The "with caching + dedup" row reflects production reality: most rule matches in
 - **Slack/Teams bot interface**: Expose approval requests and audit queries through a chat bot. On-call engineers approve actions with a button click rather than running CLI commands.
 - **Canary-aware rules**: Integrate with canary deployment systems (Flagger, Argo Rollouts). Automatically pause canary promotion if the agent detects anomalies in the canary's metrics window.
 - **Cost dashboard**: Track and visualize LLM costs, action counts, and rule match rates over time. Alert when costs trend above budget or when false positive rates increase.
-- **Multi-LLM routing**: Use a fast, cheap model (GPT-4o-mini) for initial triage and a capable model (GPT-4o) only when the cheap model's confidence is low. This can reduce costs by another 3-5x.
+- **Multi-LLM routing**: Use a fast, cheap model (the fast-tier model) for initial triage and a capable model (the standard-tier model) only when the cheap model's confidence is low. This can reduce costs by another 3-5x.

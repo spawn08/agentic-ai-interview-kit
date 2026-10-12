@@ -2,6 +2,7 @@
 sidebar_position: 3
 title: "Memory and State Management"
 description: "Distributed state, checkpointing, and conversation threading for agentic systems"
+last_verified: 2026-10-12
 ---
 
 # Memory and State Management
@@ -343,6 +344,49 @@ State that is never cleaned up eventually consumes all available storage. TTL (t
 | Semantic memory | No TTL (explicit deletion) | Long-term knowledge; managed by user |
 | Rate limit counters | 1-60 minutes | Match the rate limit window |
 
+:::note Illustrative Defaults
+These values are starting points for a typical consumer-style deployment. Enterprise retention periods come from your legal, compliance, and contractual requirements, and sometimes **conflict** with the defaults (for example, a regulated tenant may require shorter conversation retention, or a legal hold may suspend deletion).
+:::
+
+### Enterprise Retention and DELETE Policy
+
+A TTL expires data on a timer. A **DELETE policy** is the separate, on-demand guarantee that a user's or tenant's data can be erased across *every* store that holds a copy or a derivative. Design both.
+
+| Data class | Retention driver | On delete request |
+|------------|------------------|-------------------|
+| Session state, workflow **checkpoints** | Operational need (recovery window) | Delete all checkpoints for the thread (`delete_thread` in LangGraph checkpointers); checkpoints hold full message and tool-result snapshots, so they count as personal data |
+| Conversation history | Contract / compliance | Delete by `user_id`; honor legal holds first |
+| **Embeddings** | Same as their source | Delete vectors by source ID; vectors can leak source content via nearest-neighbor retrieval, so they are not "anonymous" |
+| **Derived artifacts** (summaries, extracted profiles, caches, eval sets from traces) | Same as their source | Cascade via lineage (`source_id` on every derived record), or regenerate without the deleted source |
+| Tool result cache | Freshness | Delete with the session; short TTL is usually enough |
+| Logs / traces | Security and debugging | Redact at write time; shorter retention; exclude raw prompts where possible |
+
+```python
+# Every write records lineage so deletion can cascade (pseudocode).
+record = {"id": new_id(), "user_id": uid, "created_at": now(), "source_ids": [msg.id for msg in batch]}
+summary_store.put(record | {"text": summarize(batch)})
+vector_index.upsert(id=record["id"], vector=embed(record["text"]), metadata={"user_id": uid, "source_ids": record["source_ids"]})
+
+async def erase_user(uid: str) -> None:
+    for thread_id in await threads.list_ids(uid):
+        checkpointer.delete_thread(thread_id)       # checkpoints
+    await vector_index.delete(filter={"user_id": uid})   # embeddings
+    await summary_store.delete(filter={"user_id": uid})  # derived artifacts
+    await audit.record("erase_user", user_id=uid)        # store the fact, not the content
+```
+
+**Verification matters more than the call.** Add a test or periodic job that, after erasure, queries every store for the `user_id` and fails if anything remains -- including vector search by metadata and the cache layer. Backups are handled by an expiry window rather than in-place edits; document that window.
+
+*Source: LangGraph [persistence](https://docs.langchain.com/oss/python/langgraph/persistence) and [memory](https://docs.langchain.com/oss/python/langgraph/add-memory) docs (`delete_thread`, prune old checkpoints; checked 2026-10-12). The vector and summary store calls are illustrative.*
+
+### Filesystem State and Progress Files
+
+For long-running, multi-session work, durable state can be plain files rather than a database: a **progress file** (what was done, what is next), a feature/task list with pass-fail status, an init script, and version-control history. A fresh context window reads these to resume. Anthropic's guidance for long-running agent harnesses describes exactly this: each session makes incremental progress, commits with descriptive messages, updates the progress file, and leaves the environment clean so the next session can orient quickly and revert bad changes via git.
+
+Treat these files as state with the same lifecycle rules: they sit under the same retention policy, belong to a tenant-scoped directory, are validated on read (a prior session can write wrong or injected content), and are deleted with the workspace. An agent that is allowed to edit its own task list can mark work done prematurely -- gate "done" on tests, not on the note.
+
+*Source: Anthropic, [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) (checked 2026-10-12).*
+
 ### Tiered Expiration
 
 ```python
@@ -573,9 +617,9 @@ The sections above describe the mechanisms. This section addresses the harder qu
 
 ### 1. Full History vs Summarized Context
 
-Keeping every message in the context window maximizes recall but costs O(n) tokens per turn, where n is the conversation length. At turn 20 with 500 tokens per turn, you are spending 10K tokens just on history -- roughly $0.025 per turn at GPT-4o rates. Summarization compresses the entire history into ~500 tokens but loses specific details (exact numbers, verbatim quotes, tool output).
+Keeping every message in the context window maximizes recall but costs O(n) tokens per turn, where n is the conversation length. At turn 20 with 500 tokens per turn, you are spending 10K tokens just on history -- roughly 10,000 x `p_in` / 1M per turn at your standard-tier input rate. Summarization compresses the entire history into ~500 tokens but loses specific details (exact numbers, verbatim quotes, tool output).
 
-The tradeoff: use full history for short conversations (under 10 turns) and rolling summarization for long ones. The break-even point is typically around 8-12 turns depending on model pricing. Below that threshold, the cost of summarization (an extra LLM call per turn, ~$0.005) exceeds the savings from reduced input tokens.
+The tradeoff: use full history for short conversations (under 10 turns) and rolling summarization for long ones. The break-even point is typically around 8-12 turns depending on model pricing. Below that threshold, the cost of summarization (an extra LLM call per turn) exceeds the savings from reduced input tokens.
 
 ### 2. Redis vs DynamoDB for Session State
 
@@ -590,9 +634,9 @@ Redis wins for active sessions where sub-millisecond access matters and data los
 
 ### 3. Per-Step vs Per-Phase Checkpointing
 
-Per-step checkpointing writes state after every tool call (10-20 writes per session). Per-phase checkpointing writes after each major phase -- plan, execute, synthesize -- yielding roughly 3 writes per session. Per-step wastes I/O if individual steps are cheap (sub-second LLM calls costing under $0.001). Per-phase wastes compute if a failure discards 5 expensive tool calls (API queries, web scrapes) that must be re-executed.
+Per-step checkpointing writes state after every tool call (10-20 writes per session). Per-phase checkpointing writes after each major phase -- plan, execute, synthesize -- yielding roughly 3 writes per session. Per-step wastes I/O if individual steps are cheap (sub-second, very low-cost LLM calls). Per-phase wastes compute if a failure discards 5 expensive tool calls (API queries, web scrapes) that must be re-executed.
 
-The decision rule: if the average step cost exceeds $0.01 (in LLM tokens, API fees, or wall-clock time), use per-step checkpointing. Below that threshold, per-phase is sufficient and reduces write amplification.
+The decision rule: if the average step cost exceeds a threshold you set (in LLM tokens, API fees, or wall-clock time), use per-step checkpointing. Below that threshold, per-phase is sufficient and reduces write amplification.
 
 ### 4. Semantic Memory: Vector DB Selection
 

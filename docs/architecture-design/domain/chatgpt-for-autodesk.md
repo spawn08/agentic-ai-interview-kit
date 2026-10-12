@@ -2,6 +2,7 @@
 sidebar_position: 1
 title: "ChatGPT for Autodesk"
 description: "System design for an AI assistant specialized for Autodesk products with multi-modal input, domain-specific RAG, and plugin architecture"
+last_verified: 2026-10-12
 ---
 
 # ChatGPT for Autodesk
@@ -253,12 +254,12 @@ The sequence diagram above shows the full lifecycle of a design modification. Ev
 
 | Component | Cost/Session | Notes |
 |-----------|-------------|-------|
-| LLM inference | $0.05-0.20 | Depends on query complexity |
+| LLM inference | `c_llm` per query | Depends on query complexity |
 | Vision processing | $0.01-0.05 | Only when images provided |
 | RAG retrieval | $0.001 | Cached embeddings |
 | Preview rendering | $0.02-0.10 | GPU render time |
 | Infrastructure | $0.01 | Amortized |
-| **Total** | **$0.09-0.37** | Per session (avg 5-10 interactions) |
+| **Total** | **`c_llm` + non-LLM rows** | Per session (avg 5-10 interactions) |
 
 Autodesk products have high per-seat costs ($2K-$5K/year). An AI assistant adding $50-100/year to the cost is easily justified if it saves even 30 minutes per week of engineering time.
 
@@ -405,6 +406,6 @@ Mitigations:
 - **Minutes 1-5:** Clarify requirements -- which Autodesk products, assistant vs. autonomous, enterprise vs. individual, multi-modal scope
 - **Minutes 5-15:** Draw the architecture diagram -- client plugins, API gateway, input processing with multi-modal fusion, AI core with domain routing, RAG pipeline, execution layer with product adapters
 - **Minutes 15-25:** Deep dive into plugin architecture (why per-product plugins), domain-specific RAG (specialized chunking for building codes), and the preview-confirm-execute workflow
-- **Minutes 25-30:** Scaling (GPU render farm, partitioned vector DB, tiered storage) and cost analysis ($0.09-0.37 per session, easily justified against $2K-5K seat costs)
+- **Minutes 25-30:** Scaling (GPU render farm, partitioned vector DB, tiered storage) and cost analysis (`c_llm` plus non-LLM rows per session, easily justified against $2K-5K seat costs)
 - **Minutes 30-35:** Trade-offs (late vs. early fusion, server vs. client rendering, transaction-wrapped execution) and security considerations (IP protection for proprietary designs, data residency, access control)
 :::

@@ -2,6 +2,7 @@
 sidebar_position: 5
 title: "AI-Powered Content Moderation System"
 description: "Architecture design for a tiered AI content moderation system handling 10M posts/day with sub-second latency"
+last_verified: 2026-10-12
 ---
 
 # AI-Powered Content Moderation System
@@ -76,7 +77,7 @@ graph TB
 
     subgraph "Agent Review Pipeline"
         CtxBuilder[Context Builder<br/>Thread, History, Rules]
-        LLMAgent[Multimodal LLM Agent<br/>GPT-4o / Claude]
+        LLMAgent[Multimodal LLM Agent<br/>standard-tier model]
         PolicyEng[Policy Engine<br/>Per-Community Rules]
     end
 
@@ -242,12 +243,12 @@ Sharding the human review queue by content category and region ensures that revi
 
 | Component | Volume/Day | Unit Cost | Daily Cost |
 |-----------|-----------|-----------|------------|
-| Fast-path GPU inference | 10M classifications | $0.00001/classification | $100 |
-| LLM agent review | 1.5M posts (15%) | $0.008/review (avg 2K tokens) | $12,000 |
+| Fast-path GPU inference | 10M classifications | `c_cls` per classification (self-hosted GPU) | 10M x `c_cls` |
+| LLM agent review | 1.5M posts (15%) | `c_llm` = 2K tokens x `p` / 1M per review | 1.5M x `c_llm` |
 | Human review | 250K posts (2.5%) | $0.15/review (30s at $18/hr) | $37,500 |
 | Infrastructure (Kafka, PG, S3) | -- | -- | $500 |
-| **Total daily** | | | **$50,100** |
-| **Cost per post (blended)** | | | **$0.005** |
+| **Total daily** | | | **sum of the rows above** |
+| **Cost per post (blended)** | | | **sum of the tier costs weighted by traffic share** |
 
 The dominant cost is human review. Every improvement in LLM agent accuracy that moves content from human review to auto-decision saves approximately $0.14 per post. A 1% improvement in agent accuracy at the 0.7 threshold saves roughly $1,500 per day.
 
@@ -556,7 +557,7 @@ The system uses a fixed token budget of approximately 4,000 tokens per moderatio
 | System instructions (classification guidelines, output format) | ~700 tokens | Static configuration |
 | **Total per decision** | **~4,000 tokens** | |
 
-This compact budget means each LLM moderation call costs approximately $0.008 (at GPT-4o pricing). The budget is deliberately smaller than a conversational agent because moderation is a classification task, not a generation task -- the agent needs to decide and cite a policy, not generate a lengthy response.
+This compact budget means each LLM moderation call costs about `c_llm` = (in_tokens x `p_in` + out_tokens x `p_out`) / 1M at your assumed standard-tier rates. The budget is deliberately smaller than a conversational agent because moderation is a classification task, not a generation task -- the agent needs to decide and cite a policy, not generate a lengthy response.
 
 ### Batch Memory for Coordinated Attack Detection
 
@@ -670,7 +671,7 @@ Before launching a content moderation system, build runbooks for each issue in t
 
 | Decision | Rationale | Alternative | Why Not |
 |----------|-----------|-------------|---------|
-| Tiered classifier + LLM agent | 85% of content handled at $0.00001/post; only borderline cases hit the expensive LLM path | LLM for all content | At $0.008 per LLM review, processing 10M posts costs $80K/day vs $12K/day with tiering |
+| Tiered classifier + LLM agent | 85% of content handled at a tiny per-post classifier cost; only borderline cases hit the expensive LLM path | LLM for all content | At `c_llm` per LLM review, processing 10M posts costs 10M x `c_llm` per day vs 1.5M x `c_llm` with tiering |
 | Context-aware moderation (thread + history) | Reduces false positives by 40% on context-dependent content (sarcasm, quotes, community norms) | Moderate each post in isolation | Isolated moderation cannot distinguish sarcasm from genuine hate speech; unacceptable false positive rate |
 | Confidence-based routing with three tiers | Balances automation speed with accuracy; auto-applies safe decisions while protecting against errors | Binary auto/human split | Wastes human reviewer time on medium-confidence cases that the agent handles at 94% accuracy |
 | Independent appeal review (separate LLM or senior reviewer) | Prevents confirmation bias; regulatory compliance in many jurisdictions | Same system re-reviews its own decision | Original decision reasoning biases the re-review; user trust erodes if appeals feel rubber-stamped |

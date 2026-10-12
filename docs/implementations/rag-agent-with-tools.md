@@ -2,6 +2,7 @@
 sidebar_position: 2
 title: "RAG Agent with LangGraph"
 description: "Adaptive RAG agent using LangGraph with retrieval, grading, web search fallback, and structured generation."
+last_verified: 2026-10-12
 ---
 
 # RAG Agent with LangGraph
@@ -36,9 +37,15 @@ The **router** classifies the query. The **grader** filters irrelevant retrieval
 ## Install Dependencies
 
 ```bash
-pip install langgraph langchain-openai langchain-core langchain-community \
-    chromadb pydantic
+pip install langchain langgraph langchain-openai langchain-core \
+    langchain-chroma langchain-text-splitters langchain-community pydantic
+
+# Required environment (no model IDs are hard-coded in this page):
+#   AGENT_MODEL="<provider>:<model>"            e.g. for init_chat_model
+#   AGENT_EMBEDDINGS="<provider>:<embedding-model>"
 ```
+
+`langchain-chroma` is the partner package for Chroma (it replaces `langchain_community.vectorstores.Chroma`), and `langchain-text-splitters` replaces the removed `langchain.text_splitter`. Document loaders (`TextLoader`, `DirectoryLoader`) are still published under `langchain-community`; the official integrations index lists no standalone package for them.
 
 ---
 
@@ -102,10 +109,12 @@ class RAGState(BaseModel):
 
 from __future__ import annotations
 
+import os
+
+from langchain.embeddings import init_embeddings
+from langchain_chroma import Chroma
 from langchain_community.document_loaders import TextLoader, DirectoryLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 def build_vectorstore(
@@ -137,7 +146,7 @@ def build_vectorstore(
     )
     chunks = splitter.split_documents(documents)
 
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    embeddings = init_embeddings(os.environ["AGENT_EMBEDDINGS"])
     vectorstore = Chroma.from_documents(
         documents=chunks, embedding=embeddings, persist_directory=persist_dir,
     )
@@ -146,7 +155,7 @@ def build_vectorstore(
 
 def load_vectorstore(persist_dir: str = "./chroma_db") -> Chroma:
     """Load an existing ChromaDB vector store from disk."""
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    embeddings = init_embeddings(os.environ["AGENT_EMBEDDINGS"])
     return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
 ```
 
@@ -161,12 +170,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.parse
 import urllib.request
 from typing import Any
 
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from state import RAGState
@@ -174,7 +184,7 @@ from vectorstore import load_vectorstore
 
 logger = logging.getLogger(__name__)
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0.0)
 
 
 # ── Structured output models ────────────────────────────────────────────────
@@ -437,9 +447,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
-from langchain_openai import ChatOpenAI
+from langchain.chat_models import init_chat_model
 from pydantic import BaseModel, Field
 
 from state import RAGState
@@ -463,7 +474,7 @@ async def generate_with_retry(
 
     Falls back to a simple response if all retries fail.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0.0)
     structured_llm = llm.with_structured_output(StructuredAnswer)
 
     for attempt in range(max_retries):

@@ -2,11 +2,16 @@
 sidebar_position: 6
 title: "Agent Evaluation Harness"
 description: "Production evaluation framework for LangGraph agents with Pydantic schemas, async test runner, LLM-as-judge, LangSmith integration, and CI/CD gating."
+last_verified: 2026-10-12
 ---
 
 # Agent Evaluation Harness
 
 Agents are notoriously hard to test. Their outputs are non-deterministic, they depend on external tools, and a single prompt change can cause cascading behavioral shifts. This implementation builds a **systematic evaluation harness** with Pydantic-typed test cases, multiple scoring strategies, async parallel execution, LangSmith tracing integration, and CI/CD gating.
+
+:::note Example verification
+Steps 1–7 are illustrative application modules: their Python syntax and SDK imports were checked, but the assembled harness, live judge calls, and LangSmith integration were not executed. Step 8's repeated-trial, trajectory, and cost calculations are executed offline by `examples/langchain-v1/test_evaluation.py`; this verifies the math, not agent quality or live service behavior.
+:::
 
 :::warning Why This Matters
 "It worked when I tried it" is not a testing strategy. Production agents need automated, repeatable evaluation suites that catch regressions before they reach users. If you cannot measure it, you cannot improve it.
@@ -151,6 +156,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from schema import ScoreMethod, TestCase
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +220,7 @@ async def score_with_llm_judge(
     query: str,
     actual: str,
     criteria: str,
-    model: str = "gpt-4o",
+    model: str = MODEL,
 ) -> tuple[float, str]:
     """Use an LLM to evaluate the agent's response quality.
 
@@ -823,6 +831,100 @@ jobs:
 
 ---
 
+## Step 8: Repeated Trials, Trajectories, and Cost
+
+A single pass over the suite hides flakiness. This step runs each case **n** times and reports **pass^k** (all k runs succeed -- reliability), **pass@k** (at least one succeeds -- capability with retries), trajectory conformance, and cost per success. The formulas and their caveats are explained in [Evaluation Metrics](../foundations/evaluation-metrics.md#reliability-passk-vs-passk); the code below is standard-library only so it runs offline with a stub agent.
+
+```python
+# reliability.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import comb
+import os
+from typing import Callable
+
+
+@dataclass
+class Run:
+    success: bool
+    tool_calls: list[str]
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+def pass_hat_k(n: int, c: int, k: int) -> float:
+    """pass^k: unbiased estimate that all k runs succeed (c successes in n runs)."""
+    if not 0 <= c <= n or not 1 <= k <= n:
+        raise ValueError("need 0 <= c <= n and 1 <= k <= n")
+    return comb(c, k) / comb(n, k)
+
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """pass@k: unbiased estimate that at least one of k runs succeeds."""
+    if not 0 <= c <= n or not 1 <= k <= n:
+        raise ValueError("need 0 <= c <= n and 1 <= k <= n")
+    return 1.0 - comb(n - c, k) / comb(n, k)
+
+
+def in_order(actual: list[str], expected: list[str]) -> bool:
+    it = iter(actual)
+    return all(step in it for step in expected)
+
+
+def evaluate_repeated(
+    agent: Callable[[str], Run],
+    tasks: dict[str, list[str]],  # task prompt -> expected tool-call sequence
+    n: int,
+    ks: tuple[int, ...] = (1, 2),
+    *,
+    in_price: float,   # USD per 1M input tokens, required (PRICING_INPUT_PER_MILLION)
+    out_price: float,  # USD per 1M output tokens, required (PRICING_OUTPUT_PER_MILLION)
+) -> dict:
+    if not tasks:
+        raise ValueError("tasks must be non-empty")
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    if any(not 1 <= k <= n for k in ks):  # pass^k / pass@k are only defined for 1 <= k <= n
+        raise ValueError("every k must satisfy 1 <= k <= n")
+    runs = {task: [agent(task) for _ in range(n)] for task in tasks}
+    report: dict = {"n": n}
+    for k in ks:
+        counts = [sum(r.success for r in rs) for rs in runs.values()]
+        report[f"pass^{k}"] = sum(pass_hat_k(n, c, k) for c in counts) / len(counts)
+        report[f"pass@{k}"] = sum(pass_at_k(n, c, k) for c in counts) / len(counts)
+    all_runs = [r for rs in runs.values() for r in rs]
+    report["trajectory_ok"] = sum(
+        in_order(r.tool_calls, tasks[t]) for t, rs in runs.items() for r in rs
+    ) / len(all_runs)
+    spend = sum(r.input_tokens * in_price + r.output_tokens * out_price for r in all_runs) / 1e6
+    wins = sum(r.success for r in all_runs)
+    report["cost_per_success"] = spend / wins if wins else float("inf")
+    return report
+
+
+if __name__ == "__main__":
+    # Offline stub: succeeds on 3 of 4 calls (deterministic), so pass^k < pass@k.
+    calls = {"i": 0}
+
+    def stub_agent(task: str) -> Run:
+        calls["i"] += 1
+        ok = calls["i"] % 4 != 0
+        return Run(ok, ["search", "answer"], input_tokens=1000, output_tokens=200)
+
+    print(evaluate_repeated(
+        stub_agent, {"q1": ["search", "answer"]}, n=4, ks=(1, 4),
+        in_price=float(os.environ["PRICING_INPUT_PER_MILLION"]),
+        out_price=float(os.environ["PRICING_OUTPUT_PER_MILLION"]),
+    ))
+```
+
+:::tip Choosing k
+Pick k from the product requirement, not from convenience: k = 1 is typical accuracy; a large k answers "will it work every time for a customer?". Report n with every pass^k, since the estimator is only defined for k ≤ n and is noisy when n is small.
+:::
+
+---
+
 ## Key Takeaways for Interviews
 
 :::tip Interview Talking Points
@@ -833,6 +935,7 @@ jobs:
 5. **Regression detection** catches prompt drift. When you change a prompt, the suite detects unintended behavioral changes.
 6. **LangSmith tracing** gives per-test-case traces so you can debug failures by inspecting the exact LLM calls and tool invocations.
 7. **CI/CD gating** treats eval suites like unit tests. Agents that fail evaluation do not get deployed.
+8. **Report reliability, not just accuracy.** pass^k (all k runs succeed) falls as k grows, while pass@k (any run succeeds) rises; add trajectory checks and cost per success so a "better" agent is not simply a pricier one.
 :::
 
 ---

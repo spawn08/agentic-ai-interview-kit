@@ -1,0 +1,24 @@
+.diagram {
+  margin: 1.5rem 0;
+}
+
+.viewer {
+  display: block;
+  width: 100%;
+  height: 900px;
+  border: 1px solid var(--ifm-color-emphasis-300);
+  border-radius: 12px;
+  background: var(--ifm-background-color);
+}
+
+.diagram figcaption {
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+  color: var(--ifm-color-emphasis-700);
+}
+
+@media (max-width: 996px) {
+  .viewer {
+    height: 750px;
+  }
+}

@@ -1,6 +1,7 @@
 ---
 sidebar_position: 1
 title: "ReAct (Reason + Act)"
+last_verified: 2026-10-12
 ---
 
 # ReAct (Reason + Act)
@@ -36,28 +37,80 @@ sequenceDiagram
 
 ### Step-by-Step Walkthrough
 
-1. **Thought** -- The model explicitly verbalizes its reasoning. For example: *"I need to find the population of France. I should use the search tool."*
-2. **Action** -- The model emits a structured action, such as `Search("population of France 2024")`.
+1. **Thought** -- The model reasons about what to do. For example: *"I need to find the population of France. I should use the search tool."* With modern models this is the (often hidden or summarized) reasoning plus any text content that precedes a tool call.
+2. **Action** -- The model emits a **native tool call**: a structured `{name, args}` object validated against the tool's schema, such as `search(query="population of France 2024")`.
 3. **Observation** -- The system executes the action and returns the result to the model as an observation.
 4. **Repeat** -- The model reads the observation, generates a new thought, and decides whether to act again or produce a final answer.
 
-## LangGraph Implementation: Prebuilt ReAct Agent
+### Native Tool Calls vs. Text-Parsed ReAct
 
-The simplest path to a production ReAct agent is `create_react_agent` from `langgraph.prebuilt`. It wires up the Thought-Action-Observation loop as a compiled graph with tool calling.
+The original ReAct paper and early frameworks had the model print `Thought:` / `Action:` / `Action Input:` as plain text, which application code parsed with regexes. Today's chat models return tool calls as structured API fields, so the loop is the same but the *Action* is machine-readable and schema-validated. This is the primary approach on this page and in the code below.
+
+| Concern | Native tool calls | Text-parsed ReAct |
+|---------|-------------------|-------------------|
+| Action format | Structured `tool_calls` with JSON args | Free text parsed by regex |
+| Schema validation | Args validated against the tool schema before execution | Hand-rolled; malformed output means retry |
+| Parallel calls | Model can return several tool calls in one turn | One action per turn by convention |
+| Failure mode | Invalid args become a tool error message the model can fix | Parse errors and hallucinated tool names |
+
+:::tip Interview Point
+Why did the industry move from text-parsed ReAct to native tool calling? Reliability: structured calls remove brittle parsing, enable **parallel tool calls** in a single model turn, and allow **schema validation** of arguments before execution (with errors fed back to the model). Keep the Thought/Action/Observation vocabulary for explaining the loop, but implement it with tool calls.
+:::
+
+<details>
+<summary>Legacy: the historical text-parsed format</summary>
+
+This is how ReAct looked when the model's raw text was the only interface. It is shown for recognition only; do not build new agents this way.
+
+```text
+Question: What is the population of France?
+Thought: I need to look this up.
+Action: search
+Action Input: population of France 2024
+Observation: The population of France is approximately 68 million (2024).
+Thought: I now know the final answer.
+Final Answer: About 68 million.
+```
 
 ```python
-"""ReAct agent using langgraph.prebuilt.create_react_agent."""
+# Historical / illustrative: parsing model text before native tool calling.
+# Offline-tested for this single-action format; never use it as an execution gate.
+import re
+
+
+def parse_legacy_action(text: str) -> tuple[str, str]:
+    match = re.search(r"^Action: ([^\n]+)\nAction Input: ([^\n]+)", text, re.MULTILINE)
+    if match is None:
+        raise ValueError("Missing historical Action / Action Input pair")
+    return match.group(1).strip(), match.group(2).strip()
+
+
+assert parse_legacy_action("Action: search\nAction Input: population of France") == (
+    "search", "population of France"
+)
+```
+
+This deliberately brittle parser takes only the first action and one input line; it neither validates a tool name against an allowlist nor checks argument schemas. Formatting changes, multiline inputs, and parallel calls break its assumptions. The native implementation below avoids this text-parsing boundary; authorization is still the harness's responsibility.
+
+</details>
+
+## LangChain Implementation: `create_agent`
+
+The simplest path to a production ReAct-style agent is `create_agent` from `langchain.agents` (it replaces the older `langgraph.prebuilt.create_react_agent`). It wires up the Thought-Action-Observation loop as a compiled LangGraph graph with native tool calling. Set `AGENT_MODEL` to a `"<provider>:<model>"` string.
+
+```python
+"""ReAct-style agent using langchain.agents.create_agent."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Annotated
+import os
 
+from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import InMemorySaver
 
 logger = logging.getLogger(__name__)
 
@@ -87,20 +140,22 @@ def calculator(expression: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Build the prebuilt ReAct agent
+# Build the agent
 # ---------------------------------------------------------------------------
 
-def build_prebuilt_react_agent() -> object:
-    """Return a compiled LangGraph ReAct agent."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
-    tools = [search, calculator]
-    graph = create_react_agent(model=llm, tools=tools)
-    return graph
+def build_react_agent() -> object:
+    """Return a compiled LangGraph agent running the ReAct loop."""
+    return create_agent(
+        model=os.environ["AGENT_MODEL"],
+        tools=[search, calculator],
+        system_prompt="Reason step by step and use the tools when you need facts or math.",
+        checkpointer=InMemorySaver(),
+    )
 
 
-async def run_prebuilt(question: str) -> str:
-    """Execute a question through the prebuilt ReAct agent."""
-    graph = build_prebuilt_react_agent()
+async def run_agent(question: str) -> str:
+    """Execute a question through the agent."""
+    graph = build_react_agent()
     config = {"configurable": {"thread_id": "demo-thread"}}
     result = await graph.ainvoke(
         {"messages": [HumanMessage(content=question)]},
@@ -110,7 +165,7 @@ async def run_prebuilt(question: str) -> str:
 ```
 
 :::tip Prebuilt vs. Custom
-`create_react_agent` is ideal for rapid prototyping. It handles message formatting, tool dispatch, and the reason-act loop internally. Move to a custom graph (shown next) when you need fine-grained control over node logic, custom state fields, or non-standard routing.
+`create_agent` is ideal for rapid prototyping. It handles message formatting, tool dispatch, and the reason-act loop internally, and **middleware** (`before_model`, `wrap_tool_call`, `after_model`, summarization, human-in-the-loop) covers most customization. Move to a custom `StateGraph` (shown next) when you need a non-standard topology, fully custom state, or routing the standard loop cannot express.
 :::
 
 ## LangGraph Implementation: Custom Graph Nodes
@@ -124,6 +179,7 @@ from __future__ import annotations
 
 import logging
 import operator
+import os
 from typing import Annotated, Any, Sequence, TypedDict
 
 from langchain_core.messages import (
@@ -132,8 +188,8 @@ from langchain_core.messages import (
     HumanMessage,
     ToolMessage,
 )
+from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool as lc_tool
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
@@ -181,7 +237,7 @@ TOOL_MAP: dict[str, Any] = {t.name: t for t in TOOLS}
 
 def reasoning_node(state: ReActState) -> dict[str, Any]:
     """Call the LLM with tool bindings to decide the next action."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0).bind_tools(TOOLS)
+    llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0.0).bind_tools(TOOLS)
     response: AIMessage = llm.invoke(state["messages"])
     logger.info(
         "reasoning_node step=%d tool_calls=%d",
@@ -276,7 +332,7 @@ async def run_custom_react(question: str, max_steps: int = 10) -> str:
 | `build_custom_react_graph` | Wires nodes and edges into a compiled `StateGraph` |
 
 :::tip Implementation Tip
-In production, inject the `ChatOpenAI` instance via dependency injection rather than constructing it inside nodes. This makes the graph testable and allows swapping models per environment.
+In production, inject the chat model instance via dependency injection rather than constructing it inside nodes. This makes the graph testable and allows swapping models per environment.
 :::
 
 ## When to Use ReAct
@@ -315,8 +371,8 @@ For single-step tool calls (e.g., "What is the weather in Paris?"), a simple too
 ## Best Practices
 
 1. **Limit max steps** -- Always set a ceiling to prevent runaway loops and control cost.
-2. **Use structured tool calling** -- LangGraph's `bind_tools` eliminates regex parsing errors.
-3. **Inject few-shot examples** -- Show the model 1-2 complete Thought/Action/Observation traces in the system prompt.
+2. **Use native tool calling** -- `create_agent` / `bind_tools` eliminates regex parsing errors and gives you schema validation and parallel calls.
+3. **Inject few-shot examples** -- Show the model 1-2 complete example tool-use traces (as message turns) when tool selection is ambiguous.
 4. **Log every step** -- The trace is ReAct's greatest debugging asset. Use structured logging with step counts.
 5. **Add a fallback** -- If the agent hits max steps, escalate to a human or a more capable model.
 
@@ -324,12 +380,11 @@ For single-step tool calls (e.g., "What is the weather in Paris?"), a simple too
 
 - ReAct fuses reasoning and acting into a single, interpretable loop.
 - The Thought-Action-Observation cycle keeps the agent grounded in real observations.
-- LangGraph offers two paths: `create_react_agent` for fast prototyping, and custom `StateGraph` for full control.
+- LangChain offers two paths: `create_agent` (with middleware) for fast prototyping, and custom LangGraph `StateGraph` for full control.
 - Use it when tasks demand multi-step information gathering; skip it for trivial single-tool calls.
 
 ## Further Reading
 
 - Yao, S. et al. "ReAct: Synergizing Reasoning and Acting in Language Models" (ICLR 2023)
 - Shinn, N. et al. "Reflexion: Language Agents with Verbal Reinforcement Learning" (NeurIPS 2023)
-- LangGraph ReAct Agent documentation
-- LangGraph `create_react_agent` API reference
+- LangChain `create_agent` documentation and the LangChain v1 migration guide (from `langgraph.prebuilt.create_react_agent`)

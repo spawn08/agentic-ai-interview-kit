@@ -1,6 +1,7 @@
 ---
 sidebar_position: 6
 title: "Plan-and-Execute"
+last_verified: 2026-10-12
 ---
 
 # Plan-and-Execute
@@ -53,6 +54,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +118,7 @@ class PlanExecState(TypedDict):
 
 def planner_node(state: PlanExecState) -> dict[str, Any]:
     """Generate an execution plan for the task."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(ExecutionPlan)
 
     plan: ExecutionPlan = structured_llm.invoke([
@@ -144,7 +148,7 @@ def executor_node(state: PlanExecState) -> dict[str, Any]:
     if step is None:
         return {}
 
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
 
     # Build context from completed results
     context_lines = [
@@ -194,7 +198,7 @@ def executor_node(state: PlanExecState) -> dict[str, Any]:
 
 def replanner_node(state: PlanExecState) -> dict[str, Any]:
     """Decide whether to continue, replan, or finish."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(ReplanDecision)
 
     completed_text = "\n".join(
@@ -258,7 +262,7 @@ def route_after_execute(state: PlanExecState) -> Literal["replan", "finish"]:
 
 def synthesizer_node(state: PlanExecState) -> dict[str, Any]:
     """Combine all step results into a final response."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
 
     results_text = "\n\n".join(
         f"**Step {r.step_number}: {r.description}**\n{r.output}"

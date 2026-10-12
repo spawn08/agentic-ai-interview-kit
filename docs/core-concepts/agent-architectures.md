@@ -2,6 +2,7 @@
 sidebar_position: 5
 title: Agent Architectures
 description: Single-agent and multi-agent architectures including supervisor, peer-to-peer, hierarchical, and swarm patterns, with guidance on choosing the right one.
+last_verified: 2026-10-12
 ---
 
 # Agent Architectures
@@ -105,13 +106,14 @@ graph TD
 ```python
 from __future__ import annotations
 
+import os
 from typing import Annotated, Literal, TypedDict
 
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import AnyMessage, HumanMessage
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel
 
 
@@ -122,24 +124,24 @@ class SupervisorState(TypedDict):
     next_worker: str
 
 
-# --- Worker agents (each a ReAct sub-agent) -----------------------------
+# --- Worker agents (each a create_agent sub-agent) -----------------------------
 
-researcher = create_react_agent(
-    ChatOpenAI(model="gpt-4o", temperature=0),
+researcher = create_agent(
+    init_chat_model(os.environ["AGENT_MODEL"], temperature=0),
     tools=[],  # bind search / RAG tools here
-    prompt="You are a research specialist. Find factual information.",
+    system_prompt="You are a research specialist. Find factual information.",
 )
 
-analyst = create_react_agent(
-    ChatOpenAI(model="gpt-4o", temperature=0),
+analyst = create_agent(
+    init_chat_model(os.environ["AGENT_MODEL"], temperature=0),
     tools=[],  # bind data / code-exec tools here
-    prompt="You are a data analyst. Analyze data and produce insights.",
+    system_prompt="You are a data analyst. Analyze data and produce insights.",
 )
 
-writer = create_react_agent(
-    ChatOpenAI(model="gpt-4o", temperature=0),
+writer = create_agent(
+    init_chat_model(os.environ["AGENT_MODEL"], temperature=0),
     tools=[],
-    prompt="You are a professional writer. Produce polished prose.",
+    system_prompt="You are a professional writer. Produce polished prose.",
 )
 
 
@@ -149,7 +151,7 @@ class RouteDecision(BaseModel):
     next: Literal["researcher", "analyst", "writer", "FINISH"]
 
 
-supervisor_llm = ChatOpenAI(model="gpt-4o", temperature=0)
+supervisor_llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0)
 
 
 def supervisor(state: SupervisorState) -> SupervisorState:
@@ -221,10 +223,11 @@ LangGraph models peer-to-peer handoffs as **conditional edges** between agent no
 ```python
 from __future__ import annotations
 
+import os
 from typing import Annotated, Literal, TypedDict
 
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import AnyMessage, HumanMessage
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
@@ -234,7 +237,7 @@ class HandoffState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0)
 
 
 class HandoffDecision(BaseModel):
@@ -363,9 +366,11 @@ LangGraph provides `create_swarm` for building swarm-style multi-agent systems w
 ```python
 from __future__ import annotations
 
+import os
+
+from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
 from langgraph_swarm import create_handoff_tool, create_swarm
 
 
@@ -401,26 +406,26 @@ def search_kb(query: str) -> str:
 
 # --- Agent definitions --------------------------------------------------
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0)
 
-triage = create_react_agent(
+triage = create_agent(
     llm,
     tools=[handoff_to_billing, handoff_to_technical],
-    prompt="You are a triage agent. Classify the issue and hand off.",
+    system_prompt="You are a triage agent. Classify the issue and hand off.",
     name="triage",
 )
 
-billing = create_react_agent(
+billing = create_agent(
     llm,
     tools=[lookup_invoice, handoff_to_triage],
-    prompt="You are a billing specialist. Handle payment inquiries.",
+    system_prompt="You are a billing specialist. Handle payment inquiries.",
     name="billing",
 )
 
-technical = create_react_agent(
+technical = create_agent(
     llm,
     tools=[search_kb, handoff_to_triage],
-    prompt="You are a tech-support specialist. Troubleshoot issues.",
+    system_prompt="You are a tech-support specialist. Troubleshoot issues.",
     name="technical",
 )
 

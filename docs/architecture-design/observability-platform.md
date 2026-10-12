@@ -2,6 +2,7 @@
 sidebar_position: 8
 title: "Agent Observability and Debugging Platform"
 description: "Architecture design for a Datadog-like observability platform purpose-built for AI agent systems, handling 1B spans/day"
+last_verified: 2026-10-12
 ---
 
 # Agent Observability and Debugging Platform
@@ -173,9 +174,9 @@ At 1 billion spans per day, storing everything is cost-prohibitive ($15K+/month 
 
 ### 3. Cost Attribution Engine
 
-Cost attribution is a differentiating feature for an AI agent observability platform. Traditional observability tools track infrastructure cost (compute, storage), but the dominant cost in agent systems is LLM API spend. The Cost Calculator maintains a price table mapping each model (GPT-4o, Claude 3.5 Sonnet, Llama 3, etc.) to its per-token input and output prices. For each LLM call span, it computes: cost = (input_tokens * input_price) + (output_tokens * output_price).
+Cost attribution is a differentiating feature for an AI agent observability platform. Traditional observability tools track infrastructure cost (compute, storage), but the dominant cost in agent systems is LLM API spend. The Cost Calculator maintains a price table mapping each model (each tier and provider, plus any self-hosted model) to its per-token input and output prices. For each LLM call span, it computes: cost = (input_tokens * input_price) + (output_tokens * output_price).
 
-Costs aggregate up through the span hierarchy: a single agent conversation cost is the sum of all LLM call costs within that trace. These costs then aggregate by agent, by user, by feature, and by time period. The Cost Dashboard shows breakdowns such as: "The Research Agent spent $4,200 last week, 62% on GPT-4o for synthesis and 38% on GPT-4o-mini for search queries." This enables teams to identify cost optimization opportunities (e.g., routing more queries to cheaper models).
+Costs aggregate up through the span hierarchy: a single agent conversation cost is the sum of all LLM call costs within that trace. These costs then aggregate by agent, by user, by feature, and by time period. The Cost Dashboard shows breakdowns such as: "The Research Agent spent a large share of last week's budget, 62% on the standard-tier model for synthesis and 38% on the fast-tier model for search queries." This enables teams to identify cost optimization opportunities (e.g., routing more queries to cheaper models).
 
 ### 4. Replay Service
 
@@ -205,7 +206,7 @@ sequenceDiagram
     participant S3 as S3
     participant Dash as Dashboard
 
-    Agent->>SDK: start_span("llm_call", model="gpt-4o")
+    Agent->>SDK: start_span("llm_call", model=AGENT_MODEL)
     SDK->>Buffer: Buffer span (async, non-blocking)
     Agent->>Agent: Execute LLM call (800ms)
     Agent->>SDK: end_span(tokens_in=1200, tokens_out=350)
@@ -234,7 +235,7 @@ sequenceDiagram
 
 An AI agent processing a customer query starts an LLM call. The SDK creates a span with the trace ID, span ID, model name, and start timestamp. The span is written to the in-memory buffer in under 1ms (non-blocking). The agent proceeds with the LLM call (800ms). When the call completes, the SDK updates the span with duration, token counts, and the response (if payload capture is enabled).
 
-Every 100ms, the buffer flushes accumulated spans to the Trace Collector via gRPC. The Collector receives 47 spans in this batch, runs them through the Sampling Engine (this trace is a success trace, and the random sample includes it in the 10%), enriches each LLM span with cost data ($0.0054 for this call based on GPT-4o pricing), and publishes to Kafka.
+Every 100ms, the buffer flushes accumulated spans to the Trace Collector via gRPC. The Collector receives 47 spans in this batch, runs them through the Sampling Engine (this trace is a success trace, and the random sample includes it in the 10%), enriches each LLM span with cost data (`c_call` for this call, computed from the price table), and publishes to Kafka.
 
 The Span Processor reads from Kafka, writes structured metadata to ClickHouse (partitioned by day, ordered by timestamp), and writes full payloads to S3 (keyed by trace_id/span_id). Redis counters are incremented for real-time dashboard metrics.
 

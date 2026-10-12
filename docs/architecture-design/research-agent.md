@@ -2,6 +2,7 @@
 sidebar_position: 3
 title: "Research Agent"
 description: "Architecture design for a deep research agent with multi-source search, synthesis, and citation tracking"
+last_verified: 2026-10-12
 ---
 
 # Research Agent
@@ -376,7 +377,7 @@ Each research task is assigned a token budget tracked in the task state. The cum
 - **Per-task budget cap:** Each task has a hard ceiling (default $2.00 for deep research). The orchestrator tracks cumulative spend in the task state and halts further search when approaching the limit.
 - **Phase-level spend tracking:** Each phase (planning, search, analysis, verification, deepening, report) logs its token consumption independently, enabling fine-grained cost attribution and identification of cost outliers.
 - **Forced synthesis on budget approach:** When cumulative spend reaches 80% of the task budget, the Deepening Agent is instructed to skip further searches and proceed directly to report generation with available findings.
-- **Depth-based budget allocation:** The `token_budget` column is populated per depth mode rather than relying on the schema default. Quick research tasks receive roughly 50K tokens (approximately $0.30) with fewer sub-questions and no deepening iterations, standard tasks roughly 90K, and deep research tasks roughly 150K -- enough to cover the ~125K typical deep-research spend (see the token table above) plus headroom for one extra deepening pass. The `DEFAULT 50000` in the schema is the shallow-tier floor and is deliberately never used for a deep task.
+- **Depth-based budget allocation:** The `token_budget` column is populated per depth mode rather than relying on the schema default. Quick research tasks receive roughly 50K tokens with fewer sub-questions and no deepening iterations, standard tasks roughly 90K, and deep research tasks roughly 150K -- enough to cover the ~125K typical deep-research spend (see the token table above) plus headroom for one extra deepening pass. The `DEFAULT 50000` in the schema is the shallow-tier floor and is deliberately never used for a deep task.
 
 ---
 

@@ -1,0 +1,197 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Agent = Model + Harness",
+    "animation": "none",
+    "quality_profile": "showcase",
+    "output": "static/diagrams/model-and-harness.html"
+  },
+  "lanes": [
+    {
+      "id": "harness",
+      "label": "Requester & harness"
+    },
+    {
+      "id": "model",
+      "label": "Model & policy gate",
+      "variant": "exception"
+    },
+    {
+      "id": "world",
+      "label": "Tools & environment"
+    },
+    {
+      "id": "state",
+      "label": "State & evaluation (off main path)"
+    }
+  ],
+  "mainPath": [
+    "user-request",
+    "harness-loop",
+    "model-step",
+    "policy-gate",
+    "tool-runtime",
+    "environment",
+    "observation"
+  ],
+  "nodes": [
+    {
+      "id": "user-request",
+      "lane": "harness",
+      "col": 0,
+      "type": "external",
+      "label": "User request",
+      "sublabel": "goal / task",
+      "width": 140
+    },
+    {
+      "id": "harness-loop",
+      "lane": "harness",
+      "col": 1,
+      "type": "backend",
+      "label": "Harness",
+      "sublabel": "loop + context assembly",
+      "width": 150
+    },
+    {
+      "id": "model-step",
+      "lane": "model",
+      "col": 2,
+      "type": "cloud",
+      "label": "Model",
+      "sublabel": "chooses next action",
+      "width": 140
+    },
+    {
+      "id": "policy-gate",
+      "lane": "model",
+      "col": 3,
+      "type": "security",
+      "label": "Policy / approval gate",
+      "sublabel": "permissions + sign-off",
+      "width": 160
+    },
+    {
+      "id": "tool-runtime",
+      "lane": "world",
+      "col": 4,
+      "type": "messagebus",
+      "label": "Tool runtime",
+      "sublabel": "executes approved calls",
+      "width": 150
+    },
+    {
+      "id": "environment",
+      "lane": "world",
+      "col": 5,
+      "type": "external",
+      "label": "Environment",
+      "sublabel": "files, APIs, systems",
+      "width": 140
+    },
+    {
+      "id": "observation",
+      "lane": "harness",
+      "col": 5,
+      "type": "backend",
+      "label": "Observation",
+      "sublabel": "result returned to harness",
+      "width": 150
+    },
+    {
+      "id": "memory-checkpoints",
+      "lane": "state",
+      "col": 2,
+      "type": "database",
+      "label": "Memory & checkpoints",
+      "sublabel": "state persistence",
+      "width": 160
+    },
+    {
+      "id": "eval-trace",
+      "lane": "state",
+      "col": 0,
+      "type": "database",
+      "label": "Eval trace",
+      "sublabel": "observability + evals",
+      "width": 140
+    }
+  ],
+  "edges": [
+    {
+      "id": "request-to-harness",
+      "from": "user-request",
+      "to": "harness-loop",
+      "variant": "emphasis"
+    },
+    {
+      "id": "harness-to-model",
+      "from": "harness-loop",
+      "to": "model-step",
+      "label": "context",
+      "variant": "emphasis"
+    },
+    {
+      "id": "model-to-gate",
+      "from": "model-step",
+      "to": "policy-gate",
+      "label": "proposed action",
+      "variant": "security"
+    },
+    {
+      "id": "gate-to-tools",
+      "from": "policy-gate",
+      "to": "tool-runtime",
+      "label": "approved",
+      "variant": "security"
+    },
+    {
+      "id": "tools-to-env",
+      "from": "tool-runtime",
+      "to": "environment",
+      "label": "acts"
+    },
+    {
+      "id": "env-to-observation",
+      "from": "environment",
+      "to": "observation",
+      "label": "result"
+    },
+    {
+      "id": "observation-loop",
+      "from": "observation",
+      "to": "harness-loop",
+      "label": "next iteration",
+      "variant": "emphasis",
+      "role": "return"
+    },
+    {
+      "id": "harness-checkpoint",
+      "from": "harness-loop",
+      "to": "memory-checkpoints",
+      "label": "save state",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "harness-trace",
+      "from": "harness-loop",
+      "to": "eval-trace",
+      "label": "record events",
+      "variant": "dashed",
+      "role": "branch"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Privilege boundary",
+      "items": [
+        "The model proposes; the harness decides what runs",
+        "No direct model access to privileged tools",
+        "Memory, checkpoints and eval trace stay off the action loop"
+      ]
+    }
+  ]
+}

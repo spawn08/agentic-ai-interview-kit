@@ -2,6 +2,7 @@
 sidebar_position: 6
 title: "Intelligent Document Processing Pipeline"
 description: "Architecture design for an AI-powered document processing system handling 100K docs/day with 95%+ extraction accuracy"
+last_verified: 2026-10-12
 ---
 
 # Intelligent Document Processing Pipeline
@@ -259,12 +260,12 @@ At 100,000 documents per day (~1.16 documents per second average, with peak burs
 | Component | Volume/Day | Unit Cost | Daily Cost |
 |-----------|-----------|-----------|------------|
 | OCR processing (40% of docs) | 40,000 docs | $0.015/page, avg 5 pages | $3,000 |
-| LLM extraction | 100,000 docs | $0.02/doc (avg 3K tokens) | $2,000 |
+| LLM extraction | 100,000 docs | `c_doc` = 3K tokens x `p` / 1M per doc (assumed rates) | 100,000 x `c_doc` |
 | Classification (lightweight) | 100,000 docs | $0.001/doc | $100 |
 | Human review (8% of docs) | 8,000 docs | $0.50/doc (2 min at $15/hr) | $4,000 |
 | Infrastructure (compute, storage, Kafka) | -- | -- | $400 |
 | **Total daily** | | | **$9,500** |
-| **Cost per document (blended)** | | | **$0.095** |
+| **Cost per document (blended)** | | | **sum of the stage costs above** |
 
 The largest cost lever is reducing the human review rate. Each 1% reduction in human review saves approximately $500/day. The active learning pipeline targets a 2-3% annual reduction in human review rate through continuous prompt improvement.
 
@@ -493,7 +494,7 @@ FROM documents
 WHERE content_hash = $1;
 ```
 
-This query runs before any processing begins. The unique index on `content_hash` makes this an index-only lookup (sub-millisecond). If a match is found, the upload is rejected with a reference to the existing document, saving the full pipeline cost ($0.095 per document). The hash is computed client-side using SHA-256 over the raw file bytes.
+This query runs before any processing begins. The unique index on `content_hash` makes this an index-only lookup (sub-millisecond). If a match is found, the upload is rejected with a reference to the existing document, saving the full pipeline cost (the blended per-document cost). The hash is computed client-side using SHA-256 over the raw file bytes.
 
 ---
 
@@ -558,7 +559,7 @@ The document processing agent uses a focused context window for each extraction 
 | System instructions | ~1,000 tokens | Static configuration |
 | **Total per extraction step** | **~6,000 tokens** | |
 
-This compact context window keeps extraction cost low ($0.02 per document average) while providing sufficient context for accurate field extraction. Multi-page documents are processed page-by-page, with extracted fields aggregated and deduplicated after all pages are processed.
+This compact context window keeps extraction cost low (`c_doc` per document on average) while providing sufficient context for accurate field extraction. Multi-page documents are processed page-by-page, with extracted fields aggregated and deduplicated after all pages are processed.
 
 ---
 

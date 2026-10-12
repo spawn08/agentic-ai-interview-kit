@@ -1,241 +1,93 @@
 ---
 sidebar_position: 8
 title: "Framework Comparison"
+last_verified: 2026-10-12
 ---
+
+import DiagramEmbed from '@site/src/components/DiagramEmbed';
 
 # Framework Comparison
 
-Choosing the right agentic AI framework is one of the most consequential early decisions in a project. Each framework encodes a set of opinions about how agents should be built, and those opinions have downstream effects on development velocity, debugging, scalability, and maintenance. This page provides a structured comparison to help you make an informed choice.
+**Official documentation checked: 2026-10-12.** Compare execution models and operational requirements, not unsupported numerical scores for community size or “production readiness.” The recommendations below are engineering judgments, not benchmark results. Provider support and feature parity depend on the language, adapter, model, and version you deploy.
 
-## Decision Matrix
+## Current Options
 
-The following table scores each framework across key dimensions on a 1-5 scale (5 = best).
+| Option | Core abstraction | Good starting point when… | Key trade-off / responsibility |
+|--------|------------------|---------------------------|--------------------------------|
+| [LangChain](https://docs.langchain.com/oss/python/langchain/overview) | High-level agents and integrations; current agents use LangGraph underneath | You need a standard tool-using agent and broad model/data integrations | Higher-level convenience still requires understanding the underlying runtime and adapter behavior |
+| [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) | Stateful graphs with explicit nodes and edges | You need branching, cycles, durable execution, checkpointing, or human intervention | You design state, routing, persistence, and safe replay; it can be used without LangChain |
+| [CrewAI](https://docs.crewai.com/en/introduction) | Role/task-based Crews plus event-driven Flows | Work naturally decomposes into specialist roles, or you want Flows to coordinate deterministic and agentic steps | Crews and Flows are different abstractions; termination, state, and reliability still need design |
+| [Microsoft Agent Framework](./microsoft-agent-framework.md) | Agents plus functional and graph-based workflows | You want Microsoft's successor to AutoGen/Semantic Kernel, with explicit orchestration and enterprise integrations | Verify language/provider parity and distinguish session memory from workflow checkpoints |
+| [LlamaIndex](./llamaindex-agents.md) | Workflow-based agents and data/query-engine tools | Retrieval over structured or unstructured enterprise data is central | Retrieval quality, source access, ingestion, and tool descriptions dominate correctness |
+| [OpenAI Agents SDK](./openai-responses-and-agents-sdk.md) | Agents, tools, handoffs, guardrails, sessions, tracing | You want a small application-side orchestration layer, especially around Responses | SDK orchestration and OpenAI hosted APIs are separate layers; provider portability is adapter-dependent |
+| [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview) | The agent loop and tools powering Claude Code, exposed through Python/TypeScript SDKs | You need a Claude-powered agent that can work with files, commands, and development workflows | Permissions, subprocess/runtime setup, filesystem scope, and sandboxing are central design concerns |
+| [Google ADK](https://google.github.io/adk-docs/) | LLM agents, tools, sessions, and workflow agents | You want Google's agent ecosystem or sequential/parallel/loop orchestration | ADK is designed to be model- and deployment-agnostic, but capabilities vary by integration and runtime |
+| [PydanticAI](https://ai.pydantic.dev/) | Typed Python agents, dependencies, tools, and validated structured output | Python type safety, dependency injection, and testable structured results matter | Schema validation is not factual validation; durable execution needs the documented integrations |
 
-| Dimension | LangChain | LangGraph | CrewAI | AutoGen | Semantic Kernel | LlamaIndex | Assistants API |
-|-----------|:---------:|:---------:|:------:|:-------:|:---------------:|:----------:|:--------------:|
-| **Ease of Use** | 4 | 3 | 5 | 3 | 3 | 3 | 5 |
-| **Flexibility** | 4 | 5 | 3 | 4 | 3 | 4 | 2 |
-| **Multi-Agent** | 2 | 5 | 5 | 5 | 2 | 2 | 1 |
-| **Production Readiness** | 4 | 4 | 3 | 3 | 4 | 4 | 4 |
-| **RAG Capabilities** | 4 | 3 | 2 | 2 | 3 | 5 | 3 |
-| **Observability** | 5 | 5 | 3 | 3 | 4 | 3 | 3 |
-| **Community Size** | 5 | 4 | 3 | 4 | 3 | 4 | 5 |
-| **Learning Curve** | 3 | 2 | 4 | 3 | 3 | 3 | 4 |
-| **Provider Agnostic** | 5 | 5 | 4 | 3 | 4 | 4 | 1 |
-| **Enterprise Support** | 4 | 4 | 2 | 4 | 5 | 3 | 4 |
+### LangChain and LangGraph Are Complementary
 
-:::info How to Read This Table
-Higher scores are better. **Learning Curve** is inverted: a score of 4 means the framework is *easy* to learn. **Provider Agnostic** scores how well the framework works across LLM providers (OpenAI, Anthropic, open-source models).
-:::
+Use LangChain's high-level agent API for a standard agent loop. Use LangGraph directly when execution topology and state transitions need explicit control. It is misleading to compare them as unrelated competitors or describe current LangChain only as LCEL chains.
 
-## Framework Profiles
+### Crews Are Not the Whole of CrewAI
 
-### LangChain
+Crews express role-based collaboration; Flows provide event-driven control, state management, and routing. The historical claim that CrewAI has no branching or cycles should not drive a current framework choice.
 
-**Architecture**: Chain/Runnable composition via LCEL (LangChain Expression Language).
+### A Provider SDK Is Not a Hosted Agent Service
 
-**Sweet spot**: Rapid prototyping, RAG pipelines, single-agent tool use, broad integrations.
+OpenAI's Responses/Conversations APIs and its Agents SDK have different responsibilities. Likewise, Claude Agent SDK is more than an HTTP client for the Messages API: it exposes a runtime with tools and an agent loop. Ask where code executes, where state lives, and which tools can access the host.
 
-**Key trade-off**: The massive ecosystem and frequent API changes mean you trade stability for breadth. The abstraction layers can make debugging non-trivial.
+## Decision Guide
 
-**Best for**: Teams that need to integrate with many different data sources and LLM providers quickly.
+| Primary requirement | Evaluate first | Questions to resolve |
+|---------------------|----------------|----------------------|
+| Standard tool-using agent with many integrations | LangChain; PydanticAI for a typed Python approach | Do you need dynamic model selection, structured output, or explicit dependency injection? |
+| Explicit state transitions, pause/resume, review gates | LangGraph; Microsoft Agent Framework | What is checkpointed? How are side effects protected during replay? |
+| Role-based collaborative work | CrewAI; Microsoft Agent Framework orchestration patterns | Who owns routing, stop conditions, and review? Would a deterministic workflow be simpler? |
+| Retrieval-heavy agentic applications | LlamaIndex, with retrieval tooling from other stacks where needed | How are source permissions, citations, freshness, and retrieval quality evaluated? |
+| Responses tools plus lightweight orchestration | OpenAI Agents SDK | Which tools are hosted versus local? Which memory strategy will you use? |
+| Filesystem/command-oriented Claude agents | Claude Agent SDK | What are the permission policy, sandbox, allowed directories, and audit trail? |
+| Google ecosystem and workflow agents | Google ADK | Which model/runtime integrations support the features your application needs? |
+| Typed outputs and Python application integration | PydanticAI | How will dependencies, retries, external tool effects, and validation failures be tested? |
 
-### LangGraph
+Do not choose a multi-agent design solely because a framework supports it. Start with a single agent or deterministic pipeline, measure failure modes, and add delegation only when it provides a demonstrated benefit.
 
-**Architecture**: Directed state graphs with nodes, edges, and conditional routing.
+## Operational Comparison Checklist
 
-**Sweet spot**: Complex agent workflows with branching, cycles, persistence, and human-in-the-loop.
+For every candidate, verify these against the **specific version and language** you will deploy:
 
-**Key trade-off**: More powerful than LangChain agents but requires thinking in terms of graph topology, which has a steeper learning curve.
+- **State**: conversation history, shared workflow state, and durable checkpoints are different things. Identify storage, tenant isolation, and retention.
+- **Human-in-the-loop**: distinguish a prompt asking for confirmation from an actual suspended execution with authenticated approval and resume.
+- **Tools**: check schema support, provider compatibility, timeouts, least privilege, and idempotency for external writes.
+- **Observability**: confirm model/tool/workflow tracing, correlation, exporter configuration, and sensitive-data redaction. Do not assume a named tracing integration is enabled by default.
+- **Durability**: simulate a crash, replay, expired credentials, and duplicate tool calls. No framework makes arbitrary side effects exactly-once automatically.
+- **Evaluation**: compare representative tasks, retrieval grounding, tool success, latency, and measured usage. This page does not supply model prices or performance rankings.
+- **Portability**: “provider agnostic” is a design goal, not proof that every hosted tool or structured-output feature works on every model.
 
-**Best for**: Production agent systems that need explicit control flow, checkpointing, and multi-step reasoning with quality gates.
+## Legacy / Superseded Options
 
-### CrewAI
+<DiagramEmbed src="/diagrams/framework-migration.html" title="Framework migration paths">
+  Read each lane as an independent migration, not a chain of replacements. Dashed branches
+  distinguish optional application orchestration from the primary replacement API.
+  These are conceptual paths: stored state, tool contracts, and regression tests still need migration.
+</DiagramEmbed>
 
-**Architecture**: Role-based multi-agent crews with sequential or hierarchical execution.
+| Historical option | Verified status on 2026-10-12 | Current direction / historical reference |
+|-------------------|------------------------------|------------------------------------------|
+| OpenAI Assistants API | Officially sunset August 26, 2026; no longer available | [Responses, Conversations, and Agents SDK migration](./openai-responses-and-agents-sdk.md) |
+| Microsoft AutoGen | Repository states maintenance mode; new development is directed to Microsoft Agent Framework | [Historical AutoGen guide](./autogen-guide.md); use the official migration guide, not a mechanical import rename |
+| Microsoft Semantic Kernel | Repository identifies Microsoft Agent Framework as its enterprise-ready successor | [Historical Semantic Kernel guide](./semantic-kernel.md); this does not establish an SDK shutdown date |
 
-**Sweet spot**: Team-of-specialists workflows where agents have distinct roles and collaborate on well-defined tasks.
-
-**Key trade-off**: Intuitive and fast to set up, but limited control flow (no cycles, no conditional branching). Harder to customize the internal orchestration logic.
-
-**Best for**: Content production, research pipelines, and workflows that naturally decompose into role-based tasks.
-
-### AutoGen
-
-**Architecture**: Conversable agents communicating through message passing, with group chat coordination.
-
-**Sweet spot**: Code generation workflows, collaborative problem-solving, scenarios where agents iterate through conversation.
-
-**Key trade-off**: Powerful conversation-based orchestration, but debugging multi-agent conversations is challenging and termination conditions require careful tuning.
-
-**Best for**: Development automation, code review pipelines, and research scenarios where iterative refinement through dialogue is the core pattern.
-
-### Semantic Kernel
-
-**Architecture**: Central kernel with a plugin/function model, automatic function calling.
-
-**Sweet spot**: Enterprise .NET applications, Azure-native deployments, structured plugin ecosystems.
-
-**Key trade-off**: Excellent enterprise integration and clean architecture, but smaller Python community and limited multi-agent capabilities.
-
-**Best for**: Enterprise teams on the Microsoft stack building internal AI tools with Azure OpenAI.
-
-### LlamaIndex
-
-**Architecture**: Data-first framework with query engines, indexes, and retrieval pipelines as first-class agent tools.
-
-**Sweet spot**: Agents that primarily need to query, synthesize, and reason over complex data sources.
-
-**Key trade-off**: Best-in-class RAG capabilities, but less suited for action-oriented agents that need to modify external systems.
-
-**Best for**: Knowledge management, document Q&A, multi-source research, and any use case where intelligent data retrieval is the core capability.
-
-### OpenAI Assistants API
-
-**Architecture**: Managed stateful agent runtime with built-in tools (Code Interpreter, File Search).
-
-**Sweet spot**: Single-agent applications where you want minimal infrastructure and fast time-to-market.
-
-**Key trade-off**: Fastest path to a working agent, but complete vendor lock-in to OpenAI with limited customization.
-
-**Best for**: Prototypes, internal tools, and applications where OpenAI lock-in is acceptable and infrastructure simplicity is valued.
-
-## Detailed Comparison by Capability
-
-### State Management
-
-| Framework | Approach | Persistence |
-|-----------|----------|-------------|
-| LangChain | Stateless chains; state via external stores | Manual |
-| LangGraph | Built-in state graph with typed reducers | Checkpointers (Postgres, Redis, memory) |
-| CrewAI | Task context passing; agent memory | Built-in short/long-term memory |
-| AutoGen | Conversation history in agent objects | Manual serialization |
-| Semantic Kernel | Chat history object, memory plugin | Plugin-based (volatile, Azure) |
-| LlamaIndex | Query engine state; chat memory | Manual or via storage context |
-| Assistants API | Server-managed threads and messages | Automatic (OpenAI servers) |
-
-### Tool Integration
-
-| Framework | Definition Style | Notable Features |
-|-----------|-----------------|------------------|
-| LangChain | `@tool` decorator, `BaseTool` class | 300+ built-in tools, LangChain Hub |
-| LangGraph | Inherits LangChain tools + `ToolNode` | Prebuilt tool node for graphs |
-| CrewAI | `@tool` decorator, crewai_tools library | Role-scoped tool assignment |
-| AutoGen | `register_function`, inline execution | Auto code execution, Docker sandbox |
-| Semantic Kernel | `@kernel_function` decorator | Plugin-scoped, filter middleware |
-| LlamaIndex | `FunctionTool`, `QueryEngineTool` | Query engines as tools |
-| Assistants API | JSON schema function definitions | Code Interpreter, File Search |
-
-### Multi-Agent Capabilities
-
-| Framework | Pattern | Coordination |
-|-----------|---------|-------------|
-| LangChain | Limited; single agent focus | N/A |
-| LangGraph | Subgraphs, multi-actor state graphs | Graph edges and conditional routing |
-| CrewAI | Crew of role-based agents | Sequential, hierarchical, delegation |
-| AutoGen | Group chat, nested chats | GroupChatManager, speaker selection |
-| Semantic Kernel | Single kernel with multiple plugins | N/A (not multi-agent by design) |
-| LlamaIndex | Limited; single agent with sub-queries | Sub-question decomposition |
-| Assistants API | Single assistant per thread | N/A |
-
-## Recommendations by Use Case
-
-### "I need a simple chatbot with tool access"
-
-**Recommended**: OpenAI Assistants API or LangChain
-
-If you are committed to OpenAI, the Assistants API is the fastest path. If you need provider flexibility, use LangChain with a `create_tool_calling_agent`.
-
-### "I need complex, multi-step agent workflows"
-
-**Recommended**: LangGraph
-
-No other framework gives you the same level of control over branching, cycles, persistence, human-in-the-loop, and state management. It is the industry standard for production agent systems.
-
-### "I need multiple agents collaborating"
-
-**Recommended**: CrewAI (simple teams) or LangGraph (complex orchestration)
-
-CrewAI is faster to set up if your workflow maps to roles and tasks. LangGraph is more powerful if you need conditional routing between agents or complex coordination patterns.
-
-:::tip Combining Frameworks
-You do not have to pick just one. A common production pattern is:
-- **LangGraph** for orchestration and control flow
-- **LlamaIndex** for RAG tools within the graph
-- **LangSmith** for observability
-
-These frameworks are designed to interoperate.
-:::
-
-### "I need intelligent document Q&A"
-
-**Recommended**: LlamaIndex
-
-LlamaIndex's query engines, sub-question decomposition, and index variety make it the best choice for complex document retrieval and synthesis.
-
-### "I need to build for a .NET / Azure enterprise"
-
-**Recommended**: Semantic Kernel
-
-Native .NET support, deep Azure OpenAI integration, and a clean plugin model make it the natural choice for Microsoft-stack enterprises.
-
-### "I need agents that write and execute code"
-
-**Recommended**: AutoGen or OpenAI Assistants API
-
-AutoGen's built-in code execution with Docker sandboxing is purpose-built for this. The Assistants API Code Interpreter is simpler but less customizable.
-
-### "I need a production-grade system with observability"
-
-**Recommended**: LangGraph + LangSmith
-
-The combination of LangGraph's explicit state management and LangSmith's tracing provides the most comprehensive production story.
-
-## Migration Considerations
-
-| Migrating From | Migrating To | Difficulty | Key Changes |
-|----------------|-------------|:----------:|-------------|
-| LangChain AgentExecutor | LangGraph | Medium | Rewrite loops as graph nodes and edges |
-| Assistants API | LangGraph | High | Build your own state management and tool execution |
-| CrewAI | LangGraph | Medium | Convert roles/tasks to nodes; add explicit routing |
-| AutoGen | LangGraph | High | Restructure conversation patterns into graph topology |
-
-:::warning Avoid Premature Optimization
-Start with the simplest framework that meets your requirements. A LangChain chain or an Assistants API agent can be built in an afternoon. Only move to LangGraph when you have concrete evidence that you need its control flow primitives. Premature adoption of complex frameworks slows down iteration.
-:::
-
-## Decision Flowchart
-
-Use this flowchart to narrow down your choice:
-
-1. **Do you need multi-agent collaboration?**
-   - Yes, with simple role-based tasks -> **CrewAI**
-   - Yes, with complex coordination -> **LangGraph**
-   - Yes, with code generation focus -> **AutoGen**
-   - No -> Continue to question 2
-
-2. **Is your primary need data retrieval and Q&A?**
-   - Yes, across complex/multiple data sources -> **LlamaIndex**
-   - Yes, simple RAG -> **LangChain**
-   - No -> Continue to question 3
-
-3. **Are you in a Microsoft/.NET enterprise?**
-   - Yes -> **Semantic Kernel**
-   - No -> Continue to question 4
-
-4. **Do you need complex control flow (branching, loops, human-in-the-loop)?**
-   - Yes -> **LangGraph**
-   - No -> Continue to question 5
-
-5. **Do you want minimal infrastructure and are committed to OpenAI?**
-   - Yes -> **OpenAI Assistants API**
-   - No -> **LangChain**
+The old AutoGen guide uses `ConversableAgent` / `UserProxyAgent`-era examples. Those are not a guide to the newer Microsoft AutoGen AgentChat API, Microsoft Agent Framework, or the separate AG2 project. Preserve that distinction when maintaining existing applications.
 
 ## Interview Talking Points
 
-- Walk through the **decision flowchart** for a given scenario and justify your framework choice.
-- Explain why **LangGraph has emerged as the production standard** for complex agent systems.
-- Discuss the **trade-off between ease of use and flexibility** across the spectrum (Assistants API vs. LangGraph).
-- Describe a scenario where you would **combine multiple frameworks** (e.g., LangGraph + LlamaIndex).
-- Explain why **starting simple and migrating** is generally better than choosing the most powerful framework upfront.
-- Compare how different frameworks handle **state management** and why this matters for production reliability.
+1. Explain the difference between a high-level agent API, a graph runtime, and a hosted model/tool API.
+2. Choose a framework for a constrained use case and describe the trade-off, not an unmeasured ranking.
+3. Explain how session memory differs from checkpoints and how replay affects external writes.
+4. Compare handoff, agent-as-tool, role-based collaboration, and fixed workflow routing.
+5. Describe why typed output, guardrails, and approval flows do not replace authorization and evaluation.
+6. Outline a migration from a superseded framework, including stored state and regression tests.
+
+## Official Sources
+
+Checked **2026-10-12**: [LangChain overview](https://docs.langchain.com/oss/python/langchain/overview), [LangGraph overview](https://docs.langchain.com/oss/python/langgraph/overview), [CrewAI introduction](https://docs.crewai.com/en/introduction), [Microsoft Agent Framework overview](https://learn.microsoft.com/en-us/agent-framework/overview/), [LlamaIndex agents](https://developers.llamaindex.ai/python/framework/module_guides/deploying/agents/), [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/), [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview), [Google ADK](https://google.github.io/adk-docs/), [PydanticAI](https://ai.pydantic.dev/), [AutoGen repository](https://github.com/microsoft/autogen), [Semantic Kernel repository](https://github.com/microsoft/semantic-kernel), and [Assistants migration](https://developers.openai.com/api/docs/assistants/migration).

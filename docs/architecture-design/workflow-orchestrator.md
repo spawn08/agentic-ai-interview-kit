@@ -2,6 +2,7 @@
 sidebar_position: 13
 title: "Workflow Orchestrator"
 description: "Architecture design for an AI workflow orchestrator with DAG execution, human approval gates, and real-time monitoring"
+last_verified: 2026-10-12
 ---
 
 # Workflow Orchestrator
@@ -20,7 +21,7 @@ An AI Workflow Orchestrator is a system that defines, executes, and monitors com
 
 1. **Workflow complexity** -- What is the expected number of steps per workflow? Are we looking at simple linear chains (3-5 steps) or complex DAGs with 50+ nodes, fan-out/fan-in patterns, and nested sub-workflows?
 2. **Human gate frequency** -- How often do workflows require human approval? Is it every workflow or only for high-risk actions? What is the expected approval turnaround time?
-3. **Agent heterogeneity** -- Do workflows mix different LLM providers and models (e.g., a fast classifier on Haiku followed by a deep reasoner on Opus), or do they use a single model throughout?
+3. **Agent heterogeneity** -- Do workflows mix different LLM providers and models (e.g., a fast-tier classifier followed by a frontier-tier reasoner), or do they use a single model throughout?
 4. **Determinism expectations** -- How do we handle the non-deterministic nature of LLM steps? Should re-runs of the same workflow with the same inputs produce identical routing decisions?
 5. **Multi-tenancy** -- Is this a shared platform serving multiple teams? Do we need tenant-level isolation for budgets, quotas, and workflow definitions?
 6. **Integration surface** -- What external systems must workflows interact with (APIs, databases, message queues, file storage)? Are there compliance requirements around data leaving the system?
@@ -153,7 +154,7 @@ The **Trigger Layer** accepts workflow start signals from four sources: HTTP web
 
 The **Orchestration Engine** is the brain of the system. The Dispatcher validates the trigger payload, creates a workflow instance with initial state, and passes it to the Step Scheduler. The Scheduler performs DAG traversal to identify steps whose dependencies are fully satisfied, then dispatches them to the appropriate worker pool. The State Manager maintains a durable state machine for every workflow and step, persisting transitions to PostgreSQL with Redis caching for hot-path reads. The Budget Enforcer checks cost and latency limits before every step dispatch, pausing workflows that approach their budgets.
 
-The **Execution Layer** contains four specialized worker pools. Agent Workers execute LLM-based steps by invoking the configured model with the step's prompt and context. Tool Workers run deterministic function steps such as API calls, database queries, or file operations. The Human Approval Queue parks workflow execution and notifies the assigned reviewer via the notification service. Sub-Workflow Runners spawn nested workflow instances, treating them as atomic steps in the parent workflow.
+The **Execution Layer** contains four specialized worker pools. Agent Workers execute LLM-based steps by invoking the configured model with the step's prompt and context. Tool Workers run deterministic function steps such as API calls, database queries, or file operations. The Human Approval Queue parks workflow execution and notifies the assigned reviewer vithe notification service. Sub-Workflow Runners spawn nested workflow instances, treating them as atomic steps in the parent workflow.
 
 The **Monitoring** layer provides real-time visibility. The Dashboard consumes events from Kafka and displays live workflow state, per-step timings, token usage, and cost accumulation via WebSocket push. The Alert Manager watches for failures, SLA breaches, and budget warnings. The Cost Tracker aggregates spend per step, per workflow, and per tenant.
 
@@ -193,7 +194,7 @@ Each step has a **type** that determines its execution semantics: `agent` (LLM i
 
 Validation at definition time catches several classes of errors: cycles in the graph, edges referencing nonexistent steps, unreachable steps that no path can reach, and type mismatches between connected steps. This fail-fast approach prevents runtime surprises.
 
-An example workflow for customer support might chain five steps: a classifier agent (Haiku, 30s timeout) feeds into a researcher agent (Sonnet, 120s timeout), whose output goes to a draft-response agent (Sonnet, 60s timeout), then to a human approval gate (assigned to support leads, 4-hour timeout), and finally to an email-sending tool step. The entire workflow carries a budget of $2.00 and a 10-minute wall-clock limit.
+An example workflow for customer support might chain five steps: a classifier agent (fast tier, 30s timeout) feeds into a researcher agent (standard tier, 120s timeout), whose output goes to a draft-response agent (standard tier, 60s timeout), then to a human approval gate (assigned to support leads, 4-hour timeout), and finally to an email-sending tool step. The entire workflow carries a budget of $2.00 and a 10-minute wall-clock limit.
 
 ### 2. Step Scheduler with DAG Traversal
 
@@ -227,7 +228,7 @@ Exponential backoff uses the formula `min(base_delay * 2^attempt, max_delay)`, w
 
 Human approval gates pause workflow execution and create an approval request assigned to a specific role (e.g., "support_lead", "compliance_officer"). The request includes the workflow context, the data produced by upstream steps, and a deadline computed from the step's configured timeout (default: 24 hours).
 
-The notification service delivers the approval request via the configured channels (email, Slack, in-app notification) with a direct link to the approval UI. The UI presents the full context, upstream step outputs, and action buttons for approve or reject. Reviewers can attach notes that flow back into the workflow as additional context for downstream steps.
+The notification service delivers the approval request vithe configured channels (email, Slack, in-app notification) with a direct link to the approval UI. The UI presents the full context, upstream step outputs, and action buttons for approve or reject. Reviewers can attach notes that flow back into the workflow as additional context for downstream steps.
 
 On approval, the scheduler resumes the workflow from the gate step, injecting any reviewer-provided modifications into the step output. On rejection, the step is marked as failed and the workflow-level error policy determines next steps (typically failing the workflow or routing to an exception-handling sub-workflow).
 
@@ -241,7 +242,7 @@ Before every step dispatch, the budget enforcer queries the cost tracker for the
 
 For latency budgets, the enforcer computes elapsed time since workflow start and compares it against the configured maximum duration. This catches runaway workflows that might be stuck in retry loops or waiting on slow external services.
 
-Cost estimation for LLM steps uses historical per-model averages maintained by the cost tracker. When no history exists for a step type, a conservative default estimate of $0.10 is used. As the system accumulates execution data, estimates become increasingly accurate.
+Cost estimation for LLM steps uses historical per-model averages maintained by the cost tracker. When no history exists for a step type, a conservative default estimate (a configured constant) is used. As the system accumulates execution data, estimates become increasingly accurate.
 
 ### 7. Real-Time Monitoring Dashboard
 

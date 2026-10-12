@@ -2,6 +2,7 @@
 sidebar_position: 3
 title: "Multi-Agent System with LangGraph"
 description: "Supervisor-based multi-agent collaboration using LangGraph with specialized agents, human-in-the-loop, and subgraph composition."
+last_verified: 2026-10-12
 ---
 
 # Multi-Agent System with LangGraph
@@ -124,10 +125,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from state import AgentOutput, MultiAgentState
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.2)
+llm = ChatOpenAI(model=MODEL, temperature=0.2)
 
 
 async def researcher_node(state: MultiAgentState) -> dict[str, Any]:
@@ -238,6 +242,7 @@ async def editor_node(state: MultiAgentState) -> dict[str, Any]:
     }
 ```
 
+
 ---
 
 ## Step 3: Build the Supervisor
@@ -255,6 +260,9 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from state import MultiAgentState
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -270,7 +278,7 @@ class SupervisorDecision(BaseModel):
     reasoning: str = Field(description="Why this agent should go next.")
 
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+llm = ChatOpenAI(model=MODEL, temperature=0.0)
 
 
 async def supervisor_node(state: MultiAgentState) -> dict[str, Any]:

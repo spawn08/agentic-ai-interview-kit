@@ -3,7 +3,10 @@ slug: /
 sidebar_position: 1
 title: "Agentic AI Interview Kit"
 description: "Your complete guide to agentic AI — from foundations to architecture design and real-world projects"
+last_verified: 2026-10-12
 ---
+
+import ModelsReference from './_shared/models.md';
 
 # Agentic AI Interview Kit
 
@@ -26,7 +29,7 @@ Unlike traditional software that follows a predetermined control flow, agentic s
 This matters because agentic AI is rapidly becoming the architecture of choice for building intelligent applications -- from autonomous coding assistants and research agents to multi-agent orchestration platforms that coordinate dozens of specialized agents.
 
 :::tip Why Now?
-The convergence of powerful foundation models, mature tool-use frameworks (LangChain, LlamaIndex, CrewAI, AutoGen), and production-grade infrastructure (vector databases, observability platforms) has made agentic AI practical for real-world systems. Interview questions in this space are growing fast.
+An agent is a **Model + Harness**: a capable foundation model plus the harness around it -- the loop, tools, memory, context management, guardrails, and observability. Models keep getting stronger, and production-grade harness infrastructure (tool protocols, vector databases, observability platforms) has made agentic AI practical for real-world systems. Most of the engineering skill is now in the harness: start with [What Are Agents?](core-concepts/what-are-agents.md) and [Context Engineering](core-concepts/context-engineering.md). Interview questions in this space are growing fast.
 :::
 
 ---
@@ -131,6 +134,14 @@ To get the most from this guide, you should be comfortable with:
 :::warning API Keys Required
 Many code examples call LLM APIs. You will need API keys from providers like OpenAI or Anthropic. Where possible, we provide alternatives using open-source models that run locally.
 :::
+
+---
+
+## Model and Price Reference
+
+Examples in this guide read model IDs from environment variables (`AGENT_MODEL`, `AGENT_EMBEDDING_MODEL`). The current example IDs and list prices live in one place:
+
+<ModelsReference />
 
 ---
 

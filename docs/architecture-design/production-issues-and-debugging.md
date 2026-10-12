@@ -2,6 +2,7 @@
 sidebar_position: 10
 title: "Production Issues and Debugging"
 description: "Common failure modes, debugging strategies, and incident playbooks for agentic AI systems in production"
+last_verified: 2026-10-12
 ---
 
 # Production Issues and Debugging
@@ -492,7 +493,7 @@ Redis, in-memory stores, or database tables grow unbounded as sessions accumulat
 Response quality drops without any code change, prompt change, or deployment.
 
 **Causes:**
-- Provider model updates: the LLM provider silently updates the model behind a version string (e.g., `gpt-4o` pointing to a different snapshot)
+- Provider model updates: the LLM provider silently updates the model behind a version string (e.g., a floating alias like the value of `AGENT_MODEL` pointing to a different snapshot)
 - Rate limit throttling returning degraded responses: some providers return shorter or lower-quality completions under heavy load rather than returning 429
 - Infrastructure issues: GPU memory pressure on the provider side causing lower-quality sampling
 
@@ -502,7 +503,7 @@ Response quality drops without any code change, prompt change, or deployment.
 - Token distribution monitoring: if the average completion length changes significantly, the model behavior has shifted
 
 **Fix:**
-- Pin model versions to specific snapshots (e.g., `gpt-4o-2024-11-20` instead of `gpt-4o`)
+- Pin model versions to specific snapshots (set `AGENT_MODEL` to the dated snapshot ID rather than a floating alias)
 - Quality regression alerts: if the evaluation score drops more than 10% from the 7-day rolling average, alert on-call
 - Fallback to previous version: maintain a mapping of "current" and "fallback" model versions, and switch automatically on quality drop
 
@@ -712,19 +713,19 @@ Traditional distributed tracing (Jaeger, Zipkin) tracks request flow across micr
 ```mermaid
 graph TD
     A["session<br/>trace_id: abc-123<br/>duration: 45s | cost: $0.12"]
-    B["agent_loop<br/>span: agent.run<br/>steps: 6 | model: gpt-4o"]
+    B["agent_loop<br/>span: agent.run<br/>steps: 6 | model: AGENT_MODEL"]
     C["step_1: plan<br/>span: agent.step<br/>type: planning"]
     D["step_2: act<br/>span: agent.step<br/>type: tool_call"]
     E["step_3: observe<br/>span: agent.step<br/>type: reasoning"]
     F["step_4: act<br/>span: agent.step<br/>type: tool_call"]
     G["step_5: act<br/>span: agent.step<br/>type: tool_call"]
     H["step_6: synthesize<br/>span: agent.step<br/>type: synthesis"]
-    I["llm_call<br/>span: llm.generate<br/>tokens: 1200 | cost: $0.02"]
+    I["llm_call<br/>span: llm.generate<br/>tokens: 1200 | cost: c1"]
     J["tool_call<br/>span: tool.execute<br/>tool: search_docs<br/>latency: 230ms"]
     K["llm_call<br/>span: llm.generate<br/>tokens: 800"]
     L["tool_call<br/>span: tool.execute<br/>tool: query_db<br/>latency: 45ms"]
     M["tool_call<br/>span: tool.execute<br/>tool: send_email<br/>latency: 120ms"]
-    N["llm_call<br/>span: llm.generate<br/>tokens: 950 | cost: $0.018"]
+    N["llm_call<br/>span: llm.generate<br/>tokens: 950 | cost: c2"]
 
     A --> B
     B --> C
@@ -757,8 +758,12 @@ Every span in the trace hierarchy should carry a standard set of attributes for 
 #### Instrumentation Code
 
 ```python
+import os
 from opentelemetry import trace
 from opentelemetry.trace import StatusCode
+
+MODEL = os.environ["AGENT_MODEL"]
+
 
 tracer = trace.get_tracer("agent-service")
 
@@ -772,7 +777,7 @@ async def instrumented_agent_loop(task: str, session_id: str):
         step_count = 0
 
         with tracer.start_as_current_span("agent.run") as agent_span:
-            agent_span.set_attribute("agent.model", "gpt-4o-2024-11-20")
+            agent_span.set_attribute("agent.model", MODEL)
 
             for step_num in range(MAX_STEPS):
                 with tracer.start_as_current_span("agent.step") as step_span:
@@ -1050,6 +1055,9 @@ Effective debugging of agentic systems requires structured logging with a consis
 ```python
 import structlog
 import uuid
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = structlog.get_logger()
 
@@ -1073,7 +1081,7 @@ log = create_session_logger("sess-abc123", "user-456")
 log.info("agent.step.start", step_number=3, step_type="tool_call")
 log.info("tool.call", tool_name="search_docs", parameters={"query": "refund policy"})
 log.info("tool.result", tool_name="search_docs", result_count=5, latency_ms=230)
-log.info("llm.call", model="gpt-4o", prompt_tokens=1200, completion_tokens=350, cost_usd=0.02)
+log.info("llm.call", model=MODEL, prompt_tokens=1200, completion_tokens=350, cost_usd=0.02)
 log.warning("loop.detected", repeated_tool="search_docs", repeat_count=3)
 log.error("budget.exceeded", spent_usd=1.05, limit_usd=1.00)
 ```
@@ -1086,7 +1094,7 @@ log.error("budget.exceeded", spent_usd=1.05, limit_usd=1.00)
 | Why did this response hallucinate? | `session_id:sess-abc123 (event:tool.result OR event:llm.call)` | Compare retrieval results against the LLM's response -- did the LLM use the retrieved context or fabricate content? |
 | Why did this cost so much? | `session_id:sess-abc123 event:llm.call \| stats sum(cost_usd) by step_number` | Identify the most expensive step; check for unexpectedly high prompt token counts |
 | Why did this session time out? | `session_id:sess-abc123 event:tool.result \| sort latency_ms desc` | Find the slowest tool call; check if it cascaded |
-| Why did quality drop across all sessions? | `event:llm.call model:gpt-4o \| timechart avg(completion_tokens)` | Sudden change in completion token distribution suggests a model update |
+| Why did quality drop across all sessions? | `event:llm.call model:$AGENT_MODEL \| timechart avg(completion_tokens)` | Sudden change in completion token distribution suggests a model update |
 
 ---
 
@@ -1111,7 +1119,7 @@ log.error("budget.exceeded", spent_usd=1.05, limit_usd=1.00)
 
 **Mitigation:**
 
-1. If a single session: kill it via the admin API and notify the user with a summary of partial progress
+1. If a single session: kill it vithe admin API and notify the user with a summary of partial progress
 2. If multiple sessions: check for a systematic cause (tool outage, prompt regression) before killing
 3. Increase the loop detection threshold temporarily if the detection is too aggressive
 

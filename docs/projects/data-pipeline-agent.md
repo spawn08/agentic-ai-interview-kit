@@ -2,6 +2,7 @@
 sidebar_position: 4
 title: "Project: Data Pipeline Agent"
 description: "Build a data analysis agent with LangChain — natural language to SQL, sandboxed Python execution, and automated visualization"
+last_verified: 2026-10-12
 ---
 
 # Project: Data Pipeline Agent
@@ -104,7 +105,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sample_data.db")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.environ["AGENT_MODEL_FAST"]
 MAX_ROWS = 1000
 SQL_TIMEOUT_SECONDS = 30
 SANDBOX_TIMEOUT_SECONDS = 30
@@ -299,6 +300,8 @@ The validator blocks mutation keywords, but the real defense is the database con
 Generated Python code is untrusted. The sandbox runs it inside an ephemeral Docker container with no network access, hard CPU/memory limits, and a strict timeout. If Docker is unavailable (local dev), it falls back to a subprocess with `resource` limits on Linux/macOS.
 
 ```python
+import os
+
 # ---------------------------------------------------------------------------
 # Step 3: Python Execution Sandbox
 # ---------------------------------------------------------------------------

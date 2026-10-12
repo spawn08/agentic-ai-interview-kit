@@ -2,6 +2,7 @@
 sidebar_position: 10
 title: "Autonomous DevOps Agent"
 description: "Architecture design for an AI-powered incident diagnosis and remediation agent with deterministic safety gates"
+last_verified: 2026-10-12
 ---
 
 # Autonomous DevOps Agent
@@ -300,7 +301,7 @@ The agent must be more reliable than the systems it monitors. It runs in a separ
 | Component | Specification | Monthly Cost |
 |-----------|--------------|-------------|
 | Agent infrastructure (3 replicas, separate cluster) | Diagnosis + execution services | $1,500 |
-| LLM API calls (diagnosis) | ~3,000 incidents/month, avg $0.05/diagnosis | $150 |
+| LLM API calls (diagnosis) | ~3,000 incidents/month, avg `c_diag` per diagnosis (tokens x assumed rates) | 3,000 x `c_diag` |
 | Vector store (incident knowledge base) | Milvus / pgvector, 10K incidents | $100 |
 | Log/metric query costs | Elasticsearch/Prometheus API calls | $200 |
 | Monitoring stack integration | Webhook receivers, API connectors | $100 |

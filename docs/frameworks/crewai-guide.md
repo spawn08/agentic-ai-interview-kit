@@ -1,6 +1,7 @@
 ---
 sidebar_position: 3
 title: "CrewAI"
+last_verified: 2026-10-12
 ---
 
 # CrewAI
@@ -16,13 +17,14 @@ CrewAI organizes work around four primitives:
 | **Agent** | An autonomous unit with a role, goal, backstory, and optional tools |
 | **Task** | A discrete unit of work assigned to a specific agent |
 | **Crew** | A team of agents working together on a set of tasks |
-| **Process** | The execution strategy: sequential, hierarchical, or consensual |
+| **Process** | The execution strategy: sequential or hierarchical (the Processes page lists only these two) |
 
 ### Agents
 
 An agent in CrewAI is defined by its persona and capabilities. The role, goal, and backstory shape the LLM's behavior through careful prompt engineering under the hood.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from crewai import Agent
 from crewai_tools import SerperDevTool, ScrapeWebsiteTool
 
@@ -59,6 +61,7 @@ The backstory is not decorative -- it significantly influences agent behavior. A
 Tasks define what needs to be done, who does it, and what the expected output looks like.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from crewai import Task
 
 research_task = Task(
@@ -94,6 +97,7 @@ The `context` parameter creates explicit data dependencies between tasks. When `
 The crew brings agents and tasks together under a defined process.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from crewai import Crew, Process
 
 crew = Crew(
@@ -119,6 +123,7 @@ The process defines how tasks are assigned and executed.
 Tasks execute one after another in the order they are listed. Each task can access the outputs of previous tasks through the `context` parameter.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 crew = Crew(
     agents=[researcher, analyst, writer],
     tasks=[research_task, analysis_task, writing_task],
@@ -133,13 +138,18 @@ crew = Crew(
 A manager agent automatically coordinates the crew, delegating tasks to the most appropriate agent and reviewing outputs.
 
 ```python
-from langchain_openai import ChatOpenAI
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
+import os
+from crewai import LLM
+
+MODEL = os.environ["AGENT_MODEL"]
+
 
 crew = Crew(
     agents=[researcher, analyst, writer],
     tasks=[research_task, analysis_task, writing_task],
     process=Process.hierarchical,
-    manager_llm=ChatOpenAI(model="gpt-4o", temperature=0),
+    manager_llm=LLM(model=MODEL, temperature=0),  # crewai.LLM or a model string; LangChain chat models are rejected
     manager_agent=None,  # Auto-creates a manager, or provide a custom one
 )
 ```
@@ -165,6 +175,7 @@ Hierarchical process adds a manager agent that makes additional LLM calls for co
 When `allow_delegation=True`, an agent can ask other agents in the crew for help. This enables dynamic collaboration.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 lead_developer = Agent(
     role="Lead Developer",
     goal="Design and implement the system architecture",
@@ -187,13 +198,16 @@ When the lead developer encounters a question it cannot answer, it can delegate 
 CrewAI supports multiple memory types that persist across task executions.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
+import os
+
 crew = Crew(
     agents=[researcher, writer],
     tasks=[research_task, writing_task],
     memory=True,          # Enable all memory types
     embedder={            # Custom embedding configuration
         "provider": "openai",
-        "config": {"model": "text-embedding-3-small"},
+        "config": {"model": os.environ["AGENT_EMBEDDING_MODEL"]},
     },
 )
 ```
@@ -209,6 +223,7 @@ crew = Crew(
 CrewAI provides a library of built-in tools and supports custom tool creation.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from crewai import Agent
 from crewai_tools import (
     SerperDevTool,
@@ -245,6 +260,7 @@ data_agent = Agent(
 Here is a full example of a content production crew with three specialized agents.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from crewai import Agent, Task, Crew, Process
 from crewai_tools import SerperDevTool
 
@@ -336,3 +352,7 @@ CrewAI is ideal when your problem maps naturally to a **team of specialists with
 - Describe how the **context parameter** on tasks creates an implicit data pipeline between agents.
 - Discuss when **delegation** helps vs. when it creates unpredictable behavior.
 - Contrast CrewAI's **task-centric** model with LangGraph's **graph-centric** model.
+
+## Official Sources
+
+Checked **2026-10-12** against CrewAI 1.15.27 ([crews](https://docs.crewai.com/concepts/crews), [processes](https://docs.crewai.com/concepts/processes), [LLMs](https://docs.crewai.com/concepts/llms)). Install `crewai` and `crewai-tools`; the snippets on this page are illustrative and were only import-checked, plus object construction in an offline smoke test (no model calls).

@@ -1,6 +1,7 @@
 ---
 sidebar_position: 3
 title: "Tool Use Pattern"
+last_verified: 2026-10-12
 ---
 
 # Tool Use Pattern
@@ -56,6 +57,9 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +134,7 @@ class ToolSelectionDecision(BaseModel):
 
 def tool_selector_node(state: ToolUseState) -> dict[str, Any]:
     """Dynamically select relevant tools for the current query context."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     tool_descriptions = "\n".join(
         f"- {t.name}: {t.description}" for t in ALL_TOOLS
     )
@@ -163,7 +167,7 @@ def tool_selector_node(state: ToolUseState) -> dict[str, Any]:
 
 def agent_node(state: ToolUseState) -> dict[str, Any]:
     """Call the LLM with all tools bound; let the model pick which to call."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0).bind_tools(ALL_TOOLS)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0).bind_tools(ALL_TOOLS)
     response: AIMessage = llm.invoke(state["messages"])
 
     new_count = state["tool_call_count"]

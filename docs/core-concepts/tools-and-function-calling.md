@@ -2,6 +2,7 @@
 sidebar_position: 2
 title: Tools and Function Calling
 description: How agents interact with external systems through tool use, function calling APIs, MCP, tool schemas, selection strategies, and error handling.
+last_verified: 2026-10-12
 ---
 
 # Tools and Function Calling
@@ -9,6 +10,10 @@ description: How agents interact with external systems through tool use, functio
 An LLM on its own can only generate text. **Tools** are the bridge between an agent's reasoning and the real world -- they let the model search the web, query databases, execute code, send emails, and interact with any external system.
 
 Function calling is the mechanism by which an LLM signals *which* tool it wants to use and *with what arguments*, allowing the host application to execute the function and return the result.
+
+:::note Example verification
+Python examples are illustrative: syntax and SDK imports were checked in the recorded environment, but complete tool loops were not executed against live services. The middleware example marked `# Runnable:` has an offline regression test under `examples/langchain-v1/`; provider calls still require credentials and an appropriate `AGENT_MODEL`.
+:::
 
 ---
 
@@ -98,8 +103,10 @@ The quality of your tool descriptions directly impacts how well the agent uses t
 OpenAI's Chat Completions API supports tool use through the `tools` parameter. The model does not execute the function itself; it returns a structured JSON object indicating which function to call and with what arguments.
 
 ```python
-from openai import OpenAI
 import json
+import os
+
+from openai import OpenAI
 
 client = OpenAI()
 
@@ -133,7 +140,7 @@ tools = [
 messages = [{"role": "user", "content": "What is the parental leave policy?"}]
 
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model=os.environ["AGENT_MODEL"],
     messages=messages,
     tools=tools,
     tool_choice="auto",  # Let the model decide whether to call a tool
@@ -160,7 +167,7 @@ if message.tool_calls:
 
     # Step 6: Get the final response
     final_response = client.chat.completions.create(
-        model="gpt-4o",
+        model=os.environ["AGENT_MODEL"],
         messages=messages,
         tools=tools,
     )
@@ -178,8 +185,10 @@ OpenAI models can request **multiple tool calls** in a single response. Your age
 Anthropic's Messages API takes a similar approach but with slightly different schema conventions.
 
 ```python
-import anthropic
 import json
+import os
+
+import anthropic
 
 client = anthropic.Anthropic()
 
@@ -206,7 +215,7 @@ tools = [
 
 # Send request
 response = client.messages.create(
-    model="claude-sonnet-4-20250514",
+    model=os.environ["AGENT_MODEL"],
     max_tokens=1024,
     tools=tools,
     messages=[{"role": "user", "content": "What is Apple's stock price right now?"}],
@@ -222,9 +231,9 @@ for block in response.content:
         # Execute the tool
         result = get_stock_price(tool_input["ticker"])
 
-        # Return result to Claude
+        # Return result to the model
         followup = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model=os.environ["AGENT_MODEL"],
             max_tokens=1024,
             tools=tools,
             messages=[
@@ -290,10 +299,12 @@ graph TD
 ### Building an MCP Server (Python)
 
 ```python
-from mcp.server.fastmcp import FastMCP
+# Official MCP Python SDK, v2 (`pip install "mcp>=2"`). In v1 this class was
+# `mcp.server.fastmcp.FastMCP`; v2 renamed it to `MCPServer` (same decorator API).
+from mcp.server.mcpserver import MCPServer
 
 # Create a server
-mcp = FastMCP("demo-tools")
+mcp = MCPServer("demo-tools")
 
 @mcp.tool()
 def calculate_bmi(weight_kg: float, height_m: float) -> str:
@@ -317,8 +328,14 @@ def convert_currency(amount: float, from_currency: str, to_currency: str) -> str
     return f"{amount} {from_currency} = {converted:.2f} {to_currency}"
 
 if __name__ == "__main__":
+    # Runnable: `python server.py` serves over stdio; hosts launch it as a subprocess.
+    # (Tested offline by calling mcp.call_tool(...) in examples/langchain-v1.)
     mcp.run(transport="stdio")
 ```
+
+:::note SDK naming
+The official SDK's v2 migration guide renames `FastMCP` to `MCPServer` and moves it from `mcp.server.fastmcp` to `mcp.server.mcpserver` (importing the old path raises `ModuleNotFoundError`). Code written for v1 needs only the import and class name changed. If you prefer the separately maintained [FastMCP](https://gofastmcp.com) project, it is a different package (`pip install fastmcp`, `from fastmcp import FastMCP`) with the same `@mcp.tool()` style, but it has its own releases and features, so pin the one you choose.
+:::
 
 :::info Why MCP Matters
 Without MCP, every agent framework has its own tool definition format. MCP provides a single standard so tools can be written once and used by Claude, ChatGPT, open-source agents, or any compliant host. This is especially powerful for enterprise environments with many internal tools.
@@ -335,11 +352,12 @@ LangGraph provides first-class support for tool use through **`@tool`-decorated 
 ```python
 from __future__ import annotations
 
+import os
 from typing import Annotated, TypedDict
 
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import AnyMessage
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -372,7 +390,7 @@ tools = [search_knowledge_base, get_current_weather]
 
 # --- Bind tools to the LLM ---------------------------------------------
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(tools)
+llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0).bind_tools(tools)
 
 
 # --- Build a LangGraph agent that uses ToolNode ------------------------
@@ -408,44 +426,35 @@ Key points:
 - **`.bind_tools(tools)`** converts tool schemas into the format the model expects (OpenAI-style or Anthropic-style, depending on the chat model class).
 - **`ToolNode(tools)`** is a prebuilt LangGraph node that automatically dispatches incoming `tool_calls` to the matching function and returns `ToolMessage` results.
 
-### MCP Integration with LangGraph
+### MCP Integration with LangChain Agents
 
-LangGraph agents can consume tools served over MCP using `langchain-mcp-adapters`, which wraps MCP tool servers as LangChain tools.
+LangChain agents can consume tools served over MCP. In current LangChain (`langchain[mcp]>=1.4.0`, beta) the `MCPAdapter` discovers a server's tools and adapts them into LangChain tools you pass straight to `create_agent`. The older `langchain-mcp-adapters` package (`MultiServerMCPClient`) is the pre-1.4 route; see the official "Migrate from langchain-mcp-adapters" guide if you have existing code.
 
 ```python
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
-from langchain_openai import ChatOpenAI
+# pip install "langchain[mcp]"   (langchain.mcp is beta and may change)
+import os
+from pathlib import Path
 
-# Configure MCP server connections
+from langchain.agents import create_agent
+from langchain.mcp import MCPAdapter
+
+
 async def build_mcp_agent():
-    async with MultiServerMCPClient(
-        {
-            "filesystem": {
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/safe"],
-                "transport": "stdio",
-            },
-            "weather": {
-                "url": "http://localhost:8080/sse",
-                "transport": "sse",
-            },
-        }
-    ) as mcp_client:
-        # MCP tools are automatically converted to LangChain tools
-        mcp_tools = mcp_client.get_tools()
+    # A Path launches a local server over stdio; an https:// URL string
+    # connects to a remote server over streamable HTTP.
+    async with MCPAdapter(Path("weather_server.py")) as adapter:
+        # MCP tools are converted to LangChain tools
+        mcp_tools = await adapter.list_tools()
 
-        # Build a LangGraph ReAct agent with MCP-sourced tools
-        llm = ChatOpenAI(model="gpt-4o", temperature=0)
-        agent = create_react_agent(llm, mcp_tools)
+        agent = create_agent(os.environ["AGENT_MODEL"], mcp_tools)
 
-        result = await agent.ainvoke(
-            {"messages": [{"role": "user", "content": "List files in /tmp/safe"}]}
+        # The tools hold the client, so the agent stays usable after the context exits.
+        return await agent.ainvoke(
+            {"messages": [{"role": "user", "content": "What is the weather in Paris?"}]}
         )
-        return result
 ```
 
-This pattern means any MCP server -- whether local (stdio) or remote (SSE) -- can supply tools to a LangGraph agent with no custom glue code.
+This pattern means any MCP server -- whether local (stdio) or remote (streamable HTTP) -- can supply tools to a LangChain agent with no custom glue code. For several servers behind one adapter, pass an `MCPConfig` dict (`{"mcpServers": {...}}`).
 
 ---
 
@@ -462,8 +471,12 @@ Pass all tool schemas to the model and let it choose. This works well when you h
 When you have dozens or hundreds of tools, embed tool descriptions in a vector store and retrieve the most relevant tools based on the user's query before passing them to the model.
 
 ```python
+import os
 from openai import OpenAI
 import numpy as np
+
+EMBEDDING_MODEL = os.environ["AGENT_EMBEDDING_MODEL"]
+
 
 client = OpenAI()
 
@@ -471,14 +484,14 @@ def select_relevant_tools(query: str, all_tools: list, top_k: int = 5) -> list:
     """Use semantic similarity to select the most relevant tools for a query."""
     # Embed the query
     query_embedding = client.embeddings.create(
-        model="text-embedding-3-small",
+        model=EMBEDDING_MODEL,
         input=query,
     ).data[0].embedding
 
     # Embed tool descriptions (in production, pre-compute and cache these)
     tool_descriptions = [t["function"]["description"] for t in all_tools]
     tool_embeddings = client.embeddings.create(
-        model="text-embedding-3-small",
+        model=EMBEDDING_MODEL,
         input=tool_descriptions,
     ).data
 
@@ -515,7 +528,7 @@ Tools fail. APIs time out, databases go down, and models generate invalid argume
 | **Invalid arguments** | Model produces malformed JSON or wrong types | Validate with Pydantic; return a clear error message so the model can retry |
 | **Tool not found** | Model hallucinates a tool name | Validate against the known tool list; return available tool names |
 | **Execution error** | API timeout, rate limit, permission denied | Catch exceptions; return structured error info; implement retry logic |
-| **Unexpected output** | Tool returns data the model cannot parse | Normalize tool outputs to a consistent format |
+| **Unexpected output** | Tool returns datthe model cannot parse | Normalize tool outputs to a consistent format |
 
 ### Robust Tool Execution Pattern
 

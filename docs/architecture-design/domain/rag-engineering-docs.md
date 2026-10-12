@@ -2,6 +2,7 @@
 sidebar_position: 5
 title: "RAG Platform for Engineering Documents"
 description: "System design for a RAG platform serving engineering documents with multi-format ingestion, specialized chunking, and citation-level retrieval"
+last_verified: 2026-10-12
 ---
 
 # RAG Platform for Engineering Documents
@@ -263,11 +264,11 @@ The query data flow proceeds as: user query leads to intent classification and q
 | Storage (originals) | $2,000 | Object store, avg 5MB/doc |
 | Vector DB | $5,000 | Managed service, 100M vectors |
 | Embedding compute | $3,000 | One-time + incremental |
-| LLM generation | $15,000 | 500K queries/month |
+| LLM generation | 500K x `c_llm` | 500K queries/month; `c_llm` from assumed rates |
 | Search infrastructure | $4,000 | Elasticsearch + reranker GPU |
-| **Total** | **$29,000/month** | $0.06 per query at 500K queries |
+| **Total** | **sum of the rows** | divide by 500K queries for the per-query cost |
 
-For engineering firms, $0.06 per query is trivial compared to an engineer spending 30 minutes manually searching through specifications. If the platform saves 10 minutes per query and engineers cost $80/hour, the ROI is roughly 200x.
+For engineering firms, the per-query cost is trivial compared to an engineer spending 30 minutes manually searching through specifications. If the platform saves 10 minutes per query and engineers cost $80/hour, the ROI is roughly 200x.
 
 ---
 

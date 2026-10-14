@@ -2,6 +2,7 @@
 sidebar_position: 11
 title: "Agent Memory System"
 description: "Architecture design for a production agent memory system with multi-tier storage and semantic retrieval"
+last_verified: 2026-10-12
 ---
 
 # Agent Memory System
@@ -633,7 +634,7 @@ The dominant cost is the ANN index living in RAM. Assume embeddings need indexin
 
 | Quantity | Value | Notes |
 |----------|-------|-------|
-| Vector dimensions | 1,536 | OpenAI `text-embedding-3-small` class |
+| Vector dimensions | 1,536 | set by `AGENT_EMBEDDING_MODEL` (example size; read yours from the model card) |
 | Bytes per dimension | 4 | float32 |
 | Raw bytes per vector | 1,536 x 4 = **6 KiB** | before graph overhead |
 | Indexed vectors | 300M | ~30% of 1B carry a live embedding |

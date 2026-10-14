@@ -2,6 +2,7 @@
 sidebar_position: 7
 title: "Project: Multi-Agent Orchestration with Temporal"
 description: "Build a durable multi-agent orchestration system using Temporal for fault-tolerant, long-running agent workflows with human-in-the-loop approval"
+last_verified: 2026-10-12
 ---
 
 # Project: Multi-Agent Orchestration with Temporal
@@ -81,7 +82,10 @@ pip install temporalio langchain langchain-openai pydantic python-dotenv
 ```bash
 OPENAI_API_KEY=your-key
 TEMPORAL_HOST=localhost:7233
-OPENAI_MODEL=gpt-4o
+AGENT_MODEL=<standard-tier model id>   # see docs/_shared/models.md
+# Token prices: USD per 1M tokens, from the vendor pricing page (required, no defaults)
+PRICING_INPUT_PER_MILLION=<number>
+PRICING_OUTPUT_PER_MILLION=<number>
 ```
 
 ---
@@ -114,7 +118,7 @@ from temporalio.worker import Worker
 
 load_dotenv()
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENAI_MODEL = os.environ["AGENT_MODEL"]
 TEMPORAL_HOST = os.getenv("TEMPORAL_HOST", "localhost:7233")
 
 WORKFLOW_TASK_QUEUE = "research-workflows"
@@ -337,7 +341,7 @@ async def call_llm(request: LLMRequest) -> LLMResponse:
        only 2 workflow workers for orchestration.
     2. Activities have built-in retry with configurable backoff. This handles
        LLM provider rate limits (429s) without custom retry logic.
-    3. Activities support heartbeating. For long LLM calls (o1 thinking, large
+    3. Activities support heartbeating. For long LLM calls (reasoning-model thinking, large
        context), the activity heartbeats to prove it is still alive. If
        heartbeats stop, Temporal marks the activity as failed and retries it
        on a different worker.
@@ -371,13 +375,10 @@ async def call_llm(request: LLMRequest) -> LLMResponse:
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
 
-    # Approximate cost calculation (GPT-4o pricing as of 2025)
-    cost_per_1k_prompt = 0.0025
-    cost_per_1k_completion = 0.01
-    cost_usd = (
-        (prompt_tokens / 1000) * cost_per_1k_prompt
-        + (completion_tokens / 1000) * cost_per_1k_completion
-    )
+    # Cost calculation: USD per 1M tokens from your pricing config (required; no defaults)
+    p_in = float(os.environ["PRICING_INPUT_PER_MILLION"])
+    p_out = float(os.environ["PRICING_OUTPUT_PER_MILLION"])
+    cost_usd = (prompt_tokens * p_in + completion_tokens * p_out) / 1_000_000
 
     return LLMResponse(
         content=response.content,
@@ -1349,7 +1350,7 @@ The choice is not either/or. A common production pattern is LangGraph for the re
 | Approval timeout with configurable duration | Business workflows have SLAs. A 48-hour default timeout prevents workflows from waiting indefinitely. The timeout returns a structured `APPROVAL_TIMEOUT` status that the calling system can escalate. |
 | `workflow.patched()` for versioning | Deploying new synthesis logic should not break in-flight workflows that started with the old logic. The patched API creates a branch point: old workflows take the old path, new workflows take the new path. Once all old workflows complete, the old path can be removed. |
 | Saga compensation in reverse order | Later steps depend on earlier steps. Compensating in reverse ensures that a notification referencing a draft document is retracted before the draft itself is deleted. |
-| Heartbeating on long activities | LLM calls to models like o1 can take 30+ seconds. Without heartbeating, Temporal cannot distinguish "slow" from "stuck". Heartbeats let the server detect genuinely stuck activities and reschedule them. |
+| Heartbeating on long activities | LLM calls to reasoning-tier models can take 30+ seconds. Without heartbeating, Temporal cannot distinguish "slow" from "stuck". Heartbeats let the server detect genuinely stuck activities and reschedule them. |
 
 ---
 
@@ -1357,7 +1358,7 @@ The choice is not either/or. A common production pattern is LangGraph for the re
 
 ### Worker Crash Mid-LLM-Call
 
-**Scenario**: The activity worker calls GPT-4o, the response is halfway through streaming, and the worker process is killed (OOM, deployment, hardware failure).
+**Scenario**: The activity worker calls the standard-tier model, the response is halfway through streaming, and the worker process is killed (OOM, deployment, hardware failure).
 
 **Recovery**: Temporal detects that the activity's heartbeat stopped. After the heartbeat timeout, it marks the activity as failed and schedules it for retry on a different worker. The workflow does not know or care which worker runs the activity -- it just awaits the result. The LLM call is made again from scratch (the partial response is lost, but this is idempotent).
 

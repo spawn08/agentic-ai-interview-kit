@@ -2,6 +2,7 @@
 sidebar_position: 6
 title: "Error Handling and Recovery"
 description: "Retry strategies, circuit breakers, and LLM-specific error handling for agentic systems"
+last_verified: 2026-10-12
 ---
 
 # Error Handling and Recovery
@@ -106,8 +107,8 @@ class FallbackChain:
                 errors.append(e)
         raise AllFallbacksExhaustedError(errors)
 
-# Example: GPT-4o -> Claude Sonnet -> GPT-4o-mini -> cached -> template
-llm_fallback = FallbackChain([GPT4o(), ClaudeSonnet(), GPT4oMini(),
+# Example: standard-tier -> second-provider standard-tier -> fast-tier -> cached -> template
+llm_fallback = FallbackChain([StandardTier(), AltProviderStandardTier(), FastTier(),
                                CachedResponse(), Template()])
 ```
 
@@ -389,7 +390,7 @@ async def execute_agent_step(step, budget):
 
 ## Retry Budget Allocator
 
-Without a shared budget, each step in an agent loop independently retries up to its own limit. A 10-step agent with 3 retries per step can make up to 40 LLM calls on a bad run, turning a $0.02 request into a $0.80 request and a 30-second task into a 5-minute timeout. The retry budget allocator caps total retries across the entire session so that isolated failures can recover while cascading failures trigger fast fallback.
+Without a shared budget, each step in an agent loop independently retries up to its own limit. A 10-step agent with 3 retries per step can make up to 40 LLM calls on a bad run, multiplying the cost of a normal request by up to 40x and a 30-second task into a 5-minute timeout. The retry budget allocator caps total retries across the entire session so that isolated failures can recover while cascading failures trigger fast fallback.
 
 ```python
 import time
@@ -400,7 +401,7 @@ class RetryBudgetAllocator:
 
     Without a shared budget, each step independently retries 3 times. A 10-step
     agent with 3 retries per step can make up to 40 LLM calls on a bad run,
-    turning a $0.02 request into a $0.80 request. The budget allocator caps total
+    multiplying the cost of a normal request by up to 40x. The budget allocator caps total
     retries across the entire session.
     """
 
@@ -561,7 +562,7 @@ The per-step timeout should be set based on **P99 latency** for that operation t
 
 ### 5. Fallback Provider Selection: Round-Robin vs Preference-Ordered
 
-When the primary LLM is down, do you round-robin across fallbacks or use a strict preference order (GPT-4o then Claude Sonnet then GPT-4o-mini)? Preference order ensures consistent quality — the second-best model is tried before the cheapest. Round-robin distributes load but causes quality variance that is hard to debug.
+When the primary LLM is down, do you round-robin across fallbacks or use a strict preference order (the standard-tier model then a second-provider standard-tier model then the fast-tier model)? Preference order ensures consistent quality — the second-best model is tried before the cheapest. Round-robin distributes load but causes quality variance that is hard to debug.
 
 **Use preference order for user-facing requests** where response quality matters. **Use round-robin for background batch processing** where throughput matters more than per-request quality consistency.
 

@@ -2,6 +2,7 @@
 sidebar_position: 6
 title: Guardrails and Safety
 description: Output validation, input filtering, content safety, sandboxing, rate limiting, human oversight, prompt injection defense, and PII handling for agentic AI systems.
+last_verified: 2026-10-12
 ---
 
 # Guardrails and Safety
@@ -9,6 +10,10 @@ description: Output validation, input filtering, content safety, sandboxing, rat
 An agent that can take actions in the real world -- sending emails, executing code, modifying databases -- is powerful but dangerous. Without guardrails, an agent can leak sensitive data, execute destructive commands, run up costs, or be manipulated through prompt injection.
 
 This page covers the essential safety mechanisms every production agent needs.
+
+:::note Example verification
+The Python snippets are illustrative control sketches, syntax- and import-checked only; this is not a security certification. No live adversarial or integration test was run. The middleware approval wrapper is exercised by an offline regression test in `examples/langchain-v1/`, but real authorization, sandbox isolation, and egress enforcement require deployment-specific tests.
+:::
 
 ---
 
@@ -63,6 +68,43 @@ graph TD
 
 ---
 
+## Structural Controls Come First
+
+Guardrails that read text (regex filters, injection classifiers, output scanners) are **weak heuristics**: attackers paraphrase, encode, or hide instructions in data the filter never sees. Treat them as telemetry and a cheap first filter. The controls that actually bound damage are **structural**: they hold even when the model is fully fooled.
+
+| Control | What it does | Stops |
+|---------|--------------|-------|
+| **Privilege separation** | The agent that reads untrusted content has no secrets and no write tools; a separate path holds credentials and accepts only validated, structured requests | Injected text turning into privileged action |
+| **Egress control** | Default-deny outbound network from tool sandboxes; allowlist destinations | Data exfiltration via URLs or API calls |
+| **Approval gates** | Human or policy sign-off for irreversible, costly, or external actions; show the real action and parameters | Destructive or unauthorized actions |
+| **Scoped, short-lived credentials** | Per-task identity, minimum permissions | Privilege abuse, lateral movement |
+| **Budgets and circuit breakers** | Step, time, and spend caps | Runaway loops, cascades |
+
+:::warning Never Rely on a Filter Alone
+If a single missed pattern could leak data or delete records, the design is missing a structural control. The regex and classifier examples below are a *detect-and-respond* layer on top of these controls, not a substitute.
+:::
+
+### OWASP Top 10 for Agentic Applications 2026
+
+OWASP publishes a **separate** list for agents (codes **ASI01-ASI10**), distinct from the LLM Top 10 (LLM01-LLM10). Labels below are from the official document; the control column is this guide's mapping.
+
+| Code | Official label | Primary structural control |
+|------|----------------|----------------------------|
+| ASI01 | Agent Goal Hijack | Privilege separation; approval gates |
+| ASI02 | Tool Misuse and Exploitation | Scoped tools; argument validation; egress control |
+| ASI03 | Identity and Privilege Abuse | Per-task, short-lived credentials |
+| ASI04 | Agentic Supply Chain Vulnerabilities | Pinned, vetted tools and MCP servers |
+| ASI05 | Unexpected Code Execution (RCE) | Sandboxing with no ambient credentials |
+| ASI06 | Memory & Context Poisoning | Validate memory writes; scope memory per tenant |
+| ASI07 | Insecure Inter-Agent Communication | Authenticated, validated agent-to-agent messages |
+| ASI08 | Cascading Failures | Budgets, circuit breakers, human checkpoints |
+| ASI09 | Human-Agent Trust Exploitation | Approval UI that shows the real action |
+| ASI10 | Rogue Agents | Audit trails, kill switch, per-agent identity |
+
+For the full mapping to this guide's sections and the relationship to the LLM list, see [Security Considerations](../architecture-design/security-considerations.md). Source: [OWASP Top 10 for Agentic Applications for 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/) (labels verified 2026-10-12).
+
+---
+
 ## Input Guardrails
 
 Input guardrails intercept and validate user messages before they reach the agent.
@@ -101,14 +143,18 @@ Prompt injection is the most critical threat to agentic systems. An attacker emb
 | Type | Description | Example |
 |------|-------------|---------|
 | **Direct** | User explicitly tells the agent to ignore instructions | "Ignore all previous instructions and..." |
-| **Indirect** | Malicious instructions are embedded in data the agent reads | A web page contains hidden instructions in white text |
+| **Indirect** | Malicious instructions are embedded in datthe agent reads | A web page contains hidden instructions in white text |
 | **Jailbreak** | User tricks the model into bypassing safety training | "Pretend you are DAN, who has no restrictions..." |
 
 **Multi-layer defense strategy:**
 
 ```python
+import os
 import re
 from openai import OpenAI
+
+MODEL_FAST = os.environ["AGENT_MODEL_FAST"]
+
 
 client = OpenAI()
 
@@ -149,7 +195,7 @@ User message:
 def classify_injection(message: str) -> dict:
     """Use an LLM to classify potential prompt injection."""
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=MODEL_FAST,
         messages=[
             {"role": "system", "content": "You are a security classifier. Be vigilant."},
             {"role": "user", "content": INJECTION_CLASSIFIER_PROMPT.format(message=message)},
@@ -636,6 +682,7 @@ class GuardedAgent:
 
 ## Guardrails as a LangGraph Graph
 
+
 The `GuardedAgent` above can be expressed as an explicit **LangGraph state graph**, where each guardrail layer is a distinct node. This makes the safety pipeline visible, testable, and composable.
 
 ```python
@@ -649,6 +696,9 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 
 # --- State ---------------------------------------------------------------
@@ -672,7 +722,7 @@ def input_validation_node(state: GuardedState) -> GuardedState:
     return {"is_safe_input": is_safe, "rejection_reason": reason}
 
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model=MODEL, temperature=0)
 
 
 def agent_node(state: GuardedState) -> GuardedState:
@@ -737,6 +787,7 @@ The graph follows the guardrails stack diagram: **input_guard** (validate) leads
 
 ## Summary
 
+- **Structural controls** (privilege separation, egress control, approval gates) come first; regex and classifier guardrails are weak heuristics.
 - **Input guardrails** validate, sanitize, and check for prompt injection before the agent processes a message.
 - **Output guardrails** check for PII, secrets, harmful content, and structural validity before responses reach users.
 - **Tool sandboxing** enforces least privilege, restricts dangerous operations, and applies timeouts.

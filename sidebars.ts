@@ -58,11 +58,15 @@ const sidebars: SidebarsConfig = {
         'frameworks/langchain-overview',
         'frameworks/langgraph-deep-dive',
         'frameworks/crewai-guide',
-        'frameworks/autogen-guide',
-        'frameworks/semantic-kernel',
+        'frameworks/microsoft-agent-framework',
         'frameworks/llamaindex-agents',
-        'frameworks/openai-assistants-api',
+        'frameworks/openai-responses-and-agents-sdk',
         'frameworks/framework-comparison',
+        {
+          type: 'category',
+          label: 'Legacy',
+          items: ['frameworks/autogen-guide', 'frameworks/semantic-kernel'],
+        },
       ],
     },
     {

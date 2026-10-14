@@ -2,6 +2,7 @@
 sidebar_position: 5
 title: "Multi-Agent Communication"
 description: "Message passing, event-driven architectures, and protocol design for multi-agent systems"
+last_verified: 2026-10-12
 ---
 
 # Multi-Agent Communication
@@ -578,7 +579,7 @@ The blackboard pattern (shared state) is natural when agents build on each other
 
 ### Fan-Out Parallelism: Latency vs Token Cost
 
-Running 5 research agents in parallel reduces wall-clock time from 5xT to T, but costs 5x the tokens. If each parallel agent uses 4K tokens at $2.50/1M (GPT-4o input), a 5-way fan-out costs ~$0.05 per invocation vs ~$0.01 sequential. At 10K daily requests, that is $400/day extra -- $146K/year in additional token spend for the latency improvement. The question is whether latency or cost is the binding constraint.
+Running 5 research agents in parallel reduces wall-clock time from 5xT to T, but costs 5x the tokens. If each parallel agent uses 4K input tokens at `p_in` per 1M (the standard-tier model input rate, from your pricing config), a 5-way fan-out costs 5 x 4,000 x `p_in` / 1M per invocation vs one-fifth of that sequentially. At 10K daily requests, the extra is 10,000 x 4 x 4,000 x `p_in` / 1M per day in additional token spend for the latency improvement. The question is whether latency or cost is the binding constraint.
 
 For user-facing requests where latency directly impacts UX and conversion, parallelize aggressively. For background tasks (batch processing, offline analysis, pre-computation), serialize and save the token budget. For mixed workloads, use adaptive fan-out: start with 2 parallel agents and only fan out further if the first results are low-confidence (using the consensus algorithm above to decide).
 

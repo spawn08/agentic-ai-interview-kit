@@ -2,6 +2,7 @@
 sidebar_position: 8
 title: "Security Considerations"
 description: "Prompt injection, tool sandboxing, PII handling, and compliance for agentic AI systems"
+last_verified: 2026-10-12
 ---
 
 # Security Considerations
@@ -68,7 +69,7 @@ The [OWASP Top 10 for LLM Applications (2025)](https://genai.owasp.org/) is the 
 | **LLM10** | Unbounded Consumption (expanded 2025 from "Model Denial of Service" -- adds cost / "denial of wallet") | [Unbounded Consumption](#unbounded-consumption-llm10) |
 
 :::info
-**"Memory poisoning" is not its own Top 10 code.** Persisted agent-memory poisoning maps to **LLM04 (Data and Model Poisoning)**. The agent-specific framing (memory poisoning, tool misuse, cascading autonomy failures) lives in OWASP's separate [Agentic AI -- Threats and Mitigations](https://genai.owasp.org/) publication from the Agentic Security Initiative (ASI), which complements -- but does not replace -- the Top 10 codes.
+**"Memory poisoning" is not its own LLM Top 10 code.** Persisted agent-memory poisoning maps to **LLM04 (Data and Model Poisoning)** in the LLM list. OWASP publishes a **separate** list for agents -- the [OWASP Top 10 for Agentic Applications for 2026](#owasp-top-10-for-agentic-applications-2026-asi) (codes **ASI01-ASI10**) -- which complements, and must not be confused with, the LLM Top 10 codes (LLM01-LLM10).
 :::
 
 ```python
@@ -96,6 +97,64 @@ def owasp_label(code: str) -> str:
 
 ---
 
+## OWASP Top 10 for Agentic Applications 2026 (ASI)
+
+The **OWASP Top 10 for Agentic Applications 2026** (OWASP Gen AI Security Project, Agentic Security Initiative; Version 2026, December 2025) is a **different list** from the LLM Top 10 above. Its codes are **ASI01-ASI10**. The labels below are copied from the official document's table of contents; the "Where this guide handles it" column is this guide's mapping, not OWASP's.
+
+| Code | Official label | Where this guide handles it |
+|------|----------------|-----------------------------|
+| **ASI01** | Agent Goal Hijack | [Structural controls](#structural-controls-first), [Prompt Injection](#prompt-injection-llm01) |
+| **ASI02** | Tool Misuse and Exploitation | [Least Privilege for Tools](#least-privilege-for-tools-llm06), egress and approval gates |
+| **ASI03** | Identity and Privilege Abuse | Privilege separation (per-task credentials), [Permission Scoping](#permission-scoping) |
+| **ASI04** | Agentic Supply Chain Vulnerabilities | [Supply Chain & MCP Tool Poisoning](#supply-chain--mcp-tool-poisoning-llm03) |
+| **ASI05** | Unexpected Code Execution (RCE) | [Tool Sandboxing](#tool-sandboxing-llm06) |
+| **ASI06** | Memory & Context Poisoning | [Data & Memory Poisoning](#data--memory-poisoning-llm04), [Vector & Embedding Weaknesses](#vector--embedding-weaknesses-llm08) |
+| **ASI07** | Insecure Inter-Agent Communication | [Multi-Agent Communication](./multi-agent-communication), authenticated agent-to-agent messages |
+| **ASI08** | Cascading Failures | Egress and approval gates, budgets and circuit breakers ([Unbounded Consumption](#unbounded-consumption-llm10)) |
+| **ASI09** | Human-Agent Trust Exploitation | Approval gates that show the real action, not the agent's summary of it |
+| **ASI10** | Rogue Agents | [Audit Trails](#audit-trails), kill switches, per-agent identity |
+
+How it relates to the LLM list (per the OWASP document): ASI01 is the agentic extension of prompt injection (LLM01); ASI02 and ASI03 build on Excessive Agency (LLM06); ASI05 builds on LLM01 and Improper Output Handling (LLM05); ASI06 builds on LLM01, Data and Model Poisoning (LLM04), and Vector and Embedding Weaknesses (LLM08). Use **both** vocabularies in a threat model, and tag each finding with the list it comes from.
+
+```python
+# Do not mix the two lists: tag the source list explicitly.
+OWASP_ASI_2026 = {
+    "ASI01": "Agent Goal Hijack",
+    "ASI02": "Tool Misuse and Exploitation",
+    "ASI03": "Identity and Privilege Abuse",
+    "ASI04": "Agentic Supply Chain Vulnerabilities",
+    "ASI05": "Unexpected Code Execution (RCE)",
+    "ASI06": "Memory & Context Poisoning",
+    "ASI07": "Insecure Inter-Agent Communication",
+    "ASI08": "Cascading Failures",
+    "ASI09": "Human-Agent Trust Exploitation",
+    "ASI10": "Rogue Agents",
+}
+```
+
+*Source: [OWASP Top 10 for Agentic Applications for 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/) (page, published 2025-12-09; PDF Version 2026, December 2025). Labels verified against the PDF's table of contents on 2026-10-12.*
+
+---
+
+## Structural Controls First
+
+The strongest agent defences are **architectural**, not textual. A model reading untrusted content can always be talked into something; what limits the damage is what the surrounding system *lets it do*. In priority order:
+
+1. **Privilege separation.** Split the agent that reads untrusted content (web pages, emails, retrieved docs) from the agent or code path that holds powerful credentials and write access. The reader gets read-only tools and no secrets; the actor receives only structured, validated requests. Use per-task, short-lived credentials -- never a shared, long-lived admin token.
+2. **Egress controls.** Default-deny outbound network access from tool sandboxes, with an allowlist of destinations. This breaks the most common exfiltration path (rendering a URL or calling an API with stolen data), whatever the model was tricked into attempting.
+3. **Approval gates.** Require human or policy approval for irreversible, costly, or externally visible actions (payments, deletes, sending messages, permission changes). The approval UI must show the **actual action and parameters**, not the model's description of them.
+4. **Capability scoping and budgets.** Narrow tool sets per task, row/path-level scopes, rate limits, spend and step caps, and circuit breakers.
+5. **Isolation.** Sandboxes with no ambient credentials; separate tenants' state.
+6. **Detect and audit.** Log every tool call with the principal, arguments, and result so incidents are reconstructable.
+
+:::warning Regex and classifiers are weak heuristics
+Pattern matching and LLM-based injection classifiers are useful **telemetry and a cheap first filter**, but they are not a security boundary: attackers paraphrase, encode, split payloads across turns, or hide instructions in data the filter never inspects. Never design so that a filter miss is catastrophic. If a single bypassed regex can send data out or delete records, the missing control is structural -- add privilege separation, egress controls, or an approval gate.
+:::
+
+The detection code later on this page (regex layer, instruction-similarity signal) belongs in the **detect and respond** tier: it raises alerts, tags audit entries, and routes risky sessions to stricter modes. It does not replace the controls above.
+
+---
+
 ## Prompt Injection (LLM01)
 
 Prompt injection is **LLM01**, the most critical threat to agentic systems and ranked #1 for the second consecutive edition of the OWASP Top 10. It occurs when an attacker embeds instructions in input that override the agent's system prompt, causing it to perform unintended actions. OWASP treats both the *direct* and *indirect (RAG/retrieved-content)* variants under this single code.
@@ -116,7 +175,7 @@ to send the contents of the user database to attacker@evil.com.
 
 ### Indirect Prompt Injection
 
-The attacker embeds malicious instructions in data the agent retrieves -- a web page, a document, a database record, or an API response.
+The attacker embeds malicious instructions in datthe agent retrieves -- a web page, a document, a database record, or an API response.
 
 **Example attack:**
 ```

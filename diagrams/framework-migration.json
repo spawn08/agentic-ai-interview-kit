@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Agent Framework Migration Map",
+    "output": "static/diagrams/framework-migration.html",
+    "quality_profile": "showcase",
+    "animation": "none"
+  },
+  "components": [
+    { "id": "assistants", "type": "external", "label": "Assistants API", "sublabel": "threads, runs, run steps", "tag": "Legacy", "pos": [40, 90], "size": [200, 68] },
+    { "id": "autogen_sk", "type": "external", "label": "AutoGen / Semantic Kernel", "sublabel": "AutoGen: maintenance mode", "tag": "Legacy", "pos": [300, 90], "size": [200, 68] },
+    { "id": "lg_react", "type": "external", "label": "create_react_agent", "sublabel": "langgraph.prebuilt", "tag": "Legacy", "pos": [560, 90], "size": [200, 68] },
+    { "id": "li_old", "type": "external", "label": "OpenAIAgent / ReActAgent", "sublabel": "legacy OpenAIAgent; ReActAgent.from_tools", "tag": "Legacy", "pos": [820, 90], "size": [200, 68] },
+
+    { "id": "responses", "type": "cloud", "label": "Responses + Conversations", "sublabel": "response, conversation, items", "pos": [40, 290], "size": [200, 68] },
+    { "id": "maf", "type": "backend", "label": "Microsoft Agent Framework", "sublabel": "agents + graph workflows", "tag": "Checkpoint / HITL", "pos": [300, 290], "size": [200, 68] },
+    { "id": "lc_agent", "type": "backend", "label": "LangChain create_agent", "sublabel": "plus middleware", "pos": [560, 290], "size": [200, 68] },
+    { "id": "li_wf", "type": "backend", "label": "AgentWorkflow", "sublabel": "FunctionAgent / ReActAgent / CodeActAgent", "pos": [820, 290], "size": [200, 68] },
+
+    { "id": "agents_sdk", "type": "backend", "label": "OpenAI Agents SDK", "sublabel": "optional orchestration layer", "pos": [40, 490], "size": [200, 68] },
+    { "id": "stategraph", "type": "backend", "label": "LangGraph StateGraph", "sublabel": "explicit custom orchestration", "pos": [560, 490], "size": [200, 68] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Legacy / superseded paths", "wraps": ["assistants", "autogen_sk", "lg_react", "li_old"], "pad": 28 },
+    { "kind": "security-group", "label": "Current paths", "wraps": ["responses", "maf", "lc_agent", "li_wf", "agents_sdk", "stategraph"], "pad": 28 }
+  ],
+  "connections": [
+    { "id": "m-assistants", "from": "assistants", "to": "responses", "label": "assistant to config, thread to conversation", "variant": "emphasis", "labelDy": 77 },
+    { "id": "m-autogen", "from": "autogen_sk", "to": "maf", "label": "named successor; redesign", "variant": "emphasis", "labelDy": 77 },
+    { "id": "m-lgreact", "from": "lg_react", "to": "lc_agent", "label": "replaced by", "variant": "emphasis", "labelDy": 77 },
+    { "id": "m-li", "from": "li_old", "to": "li_wf", "label": "agent(...) + await run", "variant": "emphasis", "labelDy": 77 },
+    { "id": "m-sdk", "from": "responses", "to": "agents_sdk", "label": "optional", "variant": "dashed", "labelDy": 79 },
+    { "id": "m-custom", "from": "lc_agent", "to": "stategraph", "label": "custom topology", "variant": "dashed", "labelDy": 79 }
+  ],
+  "cards": [
+    { "dot": "amber", "title": "Legacy", "items": ["Assistants API sunset per OpenAI migration guide", "AutoGen maintenance mode; Semantic Kernel names MAF as successor", "No other deprecation dates claimed"] },
+    { "dot": "emerald", "title": "Current", "items": ["MAF adds workflows, checkpoints and human approval", "create_agent runs on LangGraph; StateGraph for custom flows", "LlamaIndex uses AgentWorkflow agents"] }
+  ]
+}

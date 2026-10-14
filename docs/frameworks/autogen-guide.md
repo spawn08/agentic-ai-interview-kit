@@ -1,9 +1,19 @@
 ---
 sidebar_position: 4
 title: "AutoGen"
+last_verified: 2026-10-12
 ---
 
 # AutoGen
+
+:::warning Superseded: AutoGen is in maintenance mode
+**Verified against official sources: 2026-10-12.** The [AutoGen repository README](https://github.com/microsoft/autogen) states that AutoGen is in maintenance mode, will not receive new features or enhancements, and is community managed. It directs new users to [Microsoft Agent Framework](./microsoft-agent-framework.md) and existing users to the official [AutoGen to Agent Framework migration guide](https://learn.microsoft.com/en-us/agent-framework/migration-guide/from-autogen/). The README fetched did not give a date for the status change, so none is claimed here.
+
+The legacy section below describes `ConversableAgent` / `AssistantAgent` / `UserProxyAgent` / `GroupChatManager` patterns as an interview history. Its code is **not verified against any current release**. Do not treat it as the AgentChat API, Agent Framework, or the separate AG2 project.
+:::
+
+<details>
+<summary>Legacy AutoGen 0.2-era content (historical interview reference; do not use for new projects)</summary>
 
 AutoGen, developed by Microsoft Research, is a framework for building multi-agent systems through **conversable agents** that communicate via message passing. Its core design principle is that complex tasks can be solved by having specialized agents engage in structured conversations, much like a team collaborating in a group chat.
 
@@ -15,11 +25,12 @@ Every agent in AutoGen inherits from `ConversableAgent`, which provides a unifie
 
 ```python
 from autogen import ConversableAgent
+import os
 
 agent = ConversableAgent(
     name="assistant",
     system_message="You are a helpful AI assistant.",
-    llm_config={"model": "gpt-4o", "temperature": 0},
+    llm_config={"model": os.environ["AGENT_MODEL"], "temperature": 0},
 )
 ```
 
@@ -42,6 +53,7 @@ The most common AutoGen pattern pairs an `AssistantAgent` (the AI) with a `UserP
 
 ```python
 from autogen import AssistantAgent, UserProxyAgent
+import os
 
 assistant = AssistantAgent(
     name="analyst",
@@ -49,7 +61,7 @@ assistant = AssistantAgent(
     Python code to analyze the data and answer it. Always include 
     visualizations when appropriate.""",
     llm_config={
-        "model": "gpt-4o",
+        "model": os.environ["AGENT_MODEL"],
         "temperature": 0,
     },
 )
@@ -135,20 +147,21 @@ Group chat enables multiple agents to collaborate in a shared conversation, mana
 
 ```python
 from autogen import GroupChat, GroupChatManager
+import os
 
 # Define specialized agents
 researcher = AssistantAgent(
     name="researcher",
     system_message="""You are a research specialist. Search for information 
     and present findings with citations. Always be thorough.""",
-    llm_config={"model": "gpt-4o"},
+    llm_config={"model": os.environ["AGENT_MODEL"]},
 )
 
 coder = AssistantAgent(
     name="coder",
     system_message="""You are a Python developer. Write clean, well-documented 
     code. Always include error handling and type hints.""",
-    llm_config={"model": "gpt-4o"},
+    llm_config={"model": os.environ["AGENT_MODEL"]},
 )
 
 reviewer = AssistantAgent(
@@ -156,7 +169,7 @@ reviewer = AssistantAgent(
     system_message="""You are a code reviewer. Review code for correctness, 
     performance, and security. Be constructive and specific. When the solution 
     is satisfactory, respond with TERMINATE.""",
-    llm_config={"model": "gpt-4o"},
+    llm_config={"model": os.environ["AGENT_MODEL"]},
 )
 
 user_proxy = UserProxyAgent(
@@ -176,7 +189,7 @@ group_chat = GroupChat(
 
 manager = GroupChatManager(
     groupchat=group_chat,
-    llm_config={"model": "gpt-4o"},
+    llm_config={"model": os.environ["AGENT_MODEL"]},
 )
 
 # Start the multi-agent collaboration
@@ -203,7 +216,6 @@ def custom_speaker_selection(last_speaker, groupchat):
     if last_speaker.name == "coder":
         return reviewer
     return "auto"  # Fall back to LLM selection for other cases
-
 group_chat = GroupChat(
     agents=[user_proxy, researcher, coder, reviewer],
     messages=[],
@@ -216,14 +228,16 @@ group_chat = GroupChat(
 Nested chats allow an agent to trigger a separate, contained conversation as part of its reply generation. This is useful for complex sub-tasks.
 
 ```python
+import os
+
 researcher = AssistantAgent(
     name="researcher",
-    llm_config={"model": "gpt-4o"},
+    llm_config={"model": os.environ["AGENT_MODEL"]},
 )
 
 analyst = AssistantAgent(
     name="analyst",
-    llm_config={"model": "gpt-4o"},
+    llm_config={"model": os.environ["AGENT_MODEL"]},
 )
 
 # Register a nested chat: when user_proxy receives a message from the 
@@ -351,3 +365,11 @@ AutoGen's ecosystem has fragmented. The original Microsoft Research project and 
 - Walk through a **group chat** scenario: how does the `GroupChatManager` decide who speaks next?
 - Discuss **code execution sandboxing** -- why is Docker important, and what are the risks without it?
 - Compare **nested chats** with LangGraph's subgraphs as mechanisms for hierarchical agent composition.
+
+</details>
+
+## Current Interview Framing
+
+- Know the *concepts* AutoGen popularized: conversational multi-agent collaboration, group-chat speaker selection, and code-execution agents. Expect to discuss why unbounded agent conversations are hard to terminate, test, and audit.
+- For current work, the successor path is [Microsoft Agent Framework](./microsoft-agent-framework.md), where explicit workflows, checkpoints, and request/response human approval address those operational gaps. A migration is a redesign with regression tests, not a mechanical import rename.
+- See the [Framework Comparison](./framework-comparison.md) for current alternatives.

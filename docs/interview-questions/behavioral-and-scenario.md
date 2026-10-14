@@ -2,6 +2,7 @@
 sidebar_position: 7
 title: "Behavioral and Scenario Questions"
 description: "10 scenario-based questions for senior agentic AI roles with structured responses."
+last_verified: 2026-10-12
 ---
 
 # Behavioral and Scenario Questions
@@ -85,11 +86,11 @@ These questions separate senior engineers from mid-level ones. The interviewer i
 **Diagnosis (first day):**
 1. Analyze cost per conversation, per agent, and per tool call. Identify the top cost drivers.
 2. Check for runaway loops: are some conversations consuming hundreds of LLM calls? Set a hard max of 10 iterations per conversation if not already in place.
-3. Check model usage: are you using GPT-4o for everything, including simple routing decisions?
+3. Check model usage: are you using the standard-tier model for everything, including simple routing decisions?
 4. Check prompt sizes: how many tokens are in each request? Are you sending full conversation history every time?
 
 **Quick Wins (ship this week, typical savings 40-50%):**
-1. **Model tiering**: Route simple queries (greetings, FAQ, routing decisions) to GPT-4o-mini (10-20x cheaper). Use GPT-4o only for complex reasoning, multi-tool tasks, and quality-sensitive responses. This alone often cuts costs 30-40%.
+1. **Model tiering**: Route simple queries (greetings, FAQ, routing decisions) to the fast-tier model (10-20x cheaper). Use the standard-tier model only for complex reasoning, multi-tool tasks, and quality-sensitive responses. This alone often cuts costs 30-40%.
 2. **Semantic caching**: Cache responses for semantically similar queries. If a user asks "what is your return policy?" and you answered that 5 minutes ago, serve the cache.
 3. **Prompt compression**: Audit every system prompt. Remove redundant instructions, shorten examples, use concise formatting. Every token counts at scale.
 4. **Conversation summarization**: Instead of sending the full conversation history, summarize older messages to reduce input token count.

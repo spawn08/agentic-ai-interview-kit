@@ -2,6 +2,7 @@
 sidebar_position: 4
 title: "Tool Registry Design"
 description: "Dynamic discovery, versioning, and lifecycle management for agent tools"
+last_verified: 2026-10-12
 ---
 
 # Tool Registry Design
@@ -480,7 +481,7 @@ Every tool registry forces a set of design decisions that have measurable impact
 
 50 granular tools (`get_user_name`, `get_user_email`, `get_user_address`) give the LLM precise control but consume 5000+ tokens in schemas and increase the chance of hallucinated tool names. 10 coarse tools (`get_user_profile(fields=["name","email"])`) are token-efficient but require the LLM to construct complex parameters correctly.
 
-In practice, group related operations into a single tool with a `fields` or `action` parameter. The sweet spot is 10-20 tools per agent, each handling a coherent domain operation. If you exceed 30 tools in a single prompt, the LLM's tool selection accuracy drops measurably: GPT-4o accuracy drops from ~95% to ~82% between 15 and 50 tools in internal benchmarks.
+In practice, group related operations into a single tool with a `fields` or `action` parameter. The sweet spot is 10-20 tools per agent, each handling a coherent domain operation. If you exceed 30 tools in a single prompt, the LLM's tool selection accuracy drops measurably: The standard-tier model accuracy drops from ~95% to ~82% between 15 and 50 tools in internal benchmarks.
 
 ### Static Tool Lists vs Dynamic Tool Selection
 

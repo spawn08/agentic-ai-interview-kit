@@ -2,6 +2,7 @@
 sidebar_position: 4
 title: Memory Systems
 description: Why agents need memory, types of memory (short-term, long-term, episodic, semantic, working), memory architectures, and practical implementation with code.
+last_verified: 2026-10-12
 ---
 
 # Memory Systems
@@ -77,7 +78,7 @@ The simplest form of memory: the conversation history that fits within the LLM's
 def manage_context_window(messages: list, max_tokens: int = 120000) -> list:
     """Simple context window management with sliding window + system message preservation."""
     from tiktoken import encoding_for_model
-    enc = encoding_for_model("gpt-4o")
+    enc = get_encoding("o200k_base")
 
     # Always keep the system message
     system_msgs = [m for m in messages if m["role"] == "system"]
@@ -305,6 +306,10 @@ from openai import OpenAI
 from datetime import datetime
 import json
 import hashlib
+import os
+
+MODEL_FAST = os.environ["AGENT_MODEL_FAST"]
+EMBEDDING_MODEL = os.environ["AGENT_EMBEDDING_MODEL"]
 
 client = OpenAI()
 
@@ -315,7 +320,7 @@ class MemorySystem:
     def __init__(
         self,
         max_short_term_messages: int = 50,
-        embedding_model: str = "text-embedding-3-small",
+        embedding_model: str = EMBEDDING_MODEL,
     ):
         self.short_term: list[dict] = []
         self.max_short_term = max_short_term_messages
@@ -353,7 +358,7 @@ class MemorySystem:
             f"{m['role']}: {m['content']}" for m in old_messages
         )
         summary_response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL_FAST,
             messages=[
                 {
                     "role": "system",
@@ -496,6 +501,7 @@ context = memory.build_context(
 
 LangGraph provides **built-in state persistence** through checkpointers -- pluggable backends that snapshot the entire graph state after every node execution. This enables short-term memory (within a thread), long-term memory (across threads), and time-travel debugging out of the box.
 
+
 ### In-Memory Checkpointing (Development)
 
 `MemorySaver` stores state in process memory. Ideal for prototyping and tests.
@@ -511,13 +517,16 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 
 class ConversationState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
 
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm = ChatOpenAI(model=MODEL, temperature=0)
 
 
 def agent_node(state: ConversationState) -> ConversationState:
@@ -609,6 +618,65 @@ Use **checkpointers** for within-session and across-session conversation state (
 
 ---
 
+## Filesystem Memory and Progress Files
+
+Not all agent memory lives in a vector store. A simple and increasingly common pattern is **memory as files**: the agent reads and writes plain files in a directory, and a fresh context window rebuilds its bearings by reading them.
+
+- **Memory directory.** Anthropic's client-side memory tool exposes a directory of memory files that Claude can create, read, update, and delete across sessions. Your application implements the handlers, so **your code must reject paths that escape the memory directory** (path traversal) and decide what is allowed to persist.
+- **Progress files for long-running work.** Anthropic's long-running-agent harness guidance has each session leave artifacts for the next: a `claude-progress.txt` log of what has been done, an `init.sh` to start the environment, a structured feature list, and git commits. A new session starts with an empty context window and gets oriented from the progress file plus git history, then makes incremental progress and leaves a clean state.
+
+| Pattern | Good for | Watch out for |
+|---------|----------|---------------|
+| Progress file + git history | Multi-session coding or research tasks | Stale or optimistic notes; an agent declaring "done" too early |
+| Memory directory (agent-edited) | Preferences, learned conventions, project facts | Prompt injection persisting into memory; unbounded growth; sensitive data in plain files |
+| Vector store | Fuzzy recall over large corpora | Derived data that must also be deleted (see below) |
+
+Files are easy to inspect, diff, and delete, which makes them easier to govern than opaque embeddings -- but they are still persistent storage and need the same retention rules.
+
+*Sources: Anthropic, [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) and the [memory tool docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool) (checked 2026-10-12).*
+
+---
+
+## Retention and Deletion
+
+Memory is data. In an enterprise deployment, every persistent store needs a **retention period** and a working **DELETE policy** -- the ability to erase a user's or tenant's data on request or on expiry, not just stop reading it.
+
+The hard part is that one conversation leaves data in many places:
+
+| Artifact | Example location | Deletion mechanism |
+|----------|------------------|--------------------|
+| Raw messages / conversation history | Application DB | Delete by `user_id` / `thread_id` |
+| **Checkpoints** (full state snapshots, including every message and tool result) | LangGraph checkpointer tables | `checkpointer.delete_thread(thread_id)` deletes all checkpoints for a thread; prune old checkpoints on a schedule |
+| Long-term memories | LangGraph store namespaces, memory files | Delete by namespace/key or directory |
+| **Embeddings** of messages or memories | Vector index | Delete vectors by source ID -- deleting the source row does *not* remove its vector |
+| **Derived artifacts**: summaries, extracted facts, profile snapshots, caches, evaluation datasets built from traces | Summary tables, Redis, S3 | Track lineage (source ID on every derived record) so deletion can cascade |
+| Logs and traces | Observability backend | Redact at write time; apply a shorter retention period |
+| Backups | Snapshots | Document the expiry window; expired backups age out rather than being edited |
+
+```python
+# Deletion orchestration (pseudocode): one entry point, every store, an audit record.
+def delete_user_data(user_id: str) -> dict:
+    report = {}
+    for thread_id in threads.list_ids(user_id):
+        checkpointer.delete_thread(thread_id)           # checkpoints
+    report["checkpoints"] = "deleted"
+    report["memories"] = memory_store.delete_namespace((user_id,))
+    report["embeddings"] = vector_index.delete(filter={"user_id": user_id})
+    report["derived"] = derived_store.delete_by_source(user_id)   # summaries, caches
+    audit_log.record("user_data_deleted", user_id=user_id, result=report)  # no raw content
+    return report
+```
+
+:::warning Retention Is a Design Input, Not a Cleanup Job
+Tag every record with `user_id`, `created_at`, and a source ID **when it is written**. Without lineage, you cannot honor a delete request for embeddings or summaries derived from the original data. Pick retention periods with your legal and compliance owners; this guide does not prescribe numbers.
+:::
+
+For TTL tiers and per-state retention periods, see [Memory and State Management](../architecture-design/memory-and-state-management.md).
+
+*Sources: LangGraph [persistence](https://docs.langchain.com/oss/python/langgraph/persistence) and [memory](https://docs.langchain.com/oss/python/langgraph/add-memory) docs (checked 2026-10-12): `delete_thread`, and the guidance to prune old checkpoints. Store-level and vector-index delete calls above are illustrative -- check your backend's API.*
+
+---
+
 ## Memory Design Decisions
 
 When designing a memory system for your agent, consider these trade-offs:
@@ -623,7 +691,7 @@ When designing a memory system for your agent, consider these trade-offs:
 
 :::warning Privacy Considerations
 Long-term memory stores can contain sensitive user data. Implement:
-- Data retention policies (auto-delete after N days)
+- Data retention policies with a working DELETE path that covers checkpoints, embeddings, and derived artifacts (summaries, caches) -- see [Retention and Deletion](#retention-and-deletion)
 - User control (ability to view and delete their stored memories)
 - Encryption at rest
 - PII detection and redaction before storage
@@ -639,6 +707,8 @@ See [Guardrails and Safety](./guardrails-and-safety.md) for more.
 - **Long-term memory** persists across sessions via vector stores and databases.
 - **Episodic memory** recalls past experiences; **semantic memory** retrieves general knowledge; **procedural memory** encodes learned skills.
 - **Consolidation** (summarizing old context into long-term storage) is essential for long-running agents.
+- **Files are memory too**: progress files and memory directories help fresh context windows resume work.
+- Retention needs a **DELETE policy** that reaches checkpoints, embeddings, and derived artifacts.
 - Always consider **privacy, cost, and retrieval quality** when designing memory systems.
 
 ---

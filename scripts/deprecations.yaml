@@ -1,0 +1,84 @@
+# Denylist of stale APIs/patterns, checked by `npm run check:content` over every routed docs page.
+#
+#   id                      unique rule name
+#   pattern                 JS regex (matched across the whole page, code and prose)
+#   flags                   optional JS regex flags (e.g. "i")
+#   hint                    what to use instead (shown in the failure message)
+#   allow_in                EXACT page paths where historical/deprecation PROSE may mention it.
+#                           Covers text outside code fences only (inline code naming the API is
+#                           prose; an inline import/call or any fenced code is NOT covered).
+#                           A path that does not exist, or has no match for the pattern, fails the
+#                           check (stale allowance). No globs.
+#   allow_in_legacy_details true = additionally allowed (code included) inside a real
+#                           <details><summary>Legacy...</summary> ... </details> block, or an
+#                           explicit "Legacy" heading section (up to the next heading of the same
+#                           or higher level), on any page.
+#
+# Do not add a page just to silence a failure: fix the page instead.
+deprecations:
+  - id: agent-executor
+    pattern: '\bAgentExecutor\b'
+    allow_in_legacy_details: true
+    hint: Use langchain.agents.create_agent (LangChain v1); AgentExecutor only lives in langchain-classic.
+    allow_in:
+      - docs/frameworks/langchain-overview.md   # "Legacy: AgentExecutor" section and migration notes
+      - docs/frameworks/langgraph-deep-dive.md  # one-line note that AgentExecutor is legacy
+      - docs/interview-questions/framework-qa.md # historical handle_parsing_errors comparison
+
+  - id: llm-chain
+    pattern: '\bLLMChain\b'
+    hint: Compose runnables (prompt | model | parser) instead of legacy chains.
+    allow_in_legacy_details: true
+    allow_in:
+      - docs/frameworks/langchain-overview.md   # shows the langchain_classic import boundary
+
+  - id: openai-agent-llamaindex
+    pattern: '\bOpenAIAgent\b'
+    hint: Use the current LlamaIndex agent API (see docs/frameworks/llamaindex-agents.md), not OpenAIAgent.
+    allow_in:
+      - docs/frameworks/llamaindex-agents.md    # prose explaining that older material used it
+
+  - id: react-agent-from-tools
+    pattern: 'ReActAgent\.from_tools'
+    hint: Use the current LlamaIndex agent workflow API.
+    allow_in:
+      - docs/frameworks/llamaindex-agents.md
+
+  # Covers every spelling: single-line, multiline/parenthesized and aliased imports
+  # (`import create_react_agent as x`), `langgraph.prebuilt.create_react_agent` attribute access and
+  # bare calls all contain the bare name. Prose may mention it as history on the pages below.
+  - id: create-react-agent
+    pattern: '\bcreate_react_agent\b'
+    hint: Use langchain.agents.create_agent; langgraph.prebuilt.create_react_agent is replaced (and langchain_classic's text-parsing variant is legacy-only).
+    allow_in:
+      - docs/frameworks/langchain-overview.md   # migration/legacy notes
+      - docs/design-patterns/react-pattern.md   # "replaces the older ..." notes
+      - docs/implementations/basic-react-agent.md
+    allow_in_legacy_details: true
+
+  - id: legacy-langchain-imports
+    pattern: 'from\s+langchain\.(?:chains|llms|memory)\b|\binitialize_agent\b|\bConversationBufferMemory\b|\bRetrievalQA\b'
+    hint: Removed from the langchain v1 namespace; use create_agent, LangGraph checkpointers/stores, and runnables.
+    allow_in_legacy_details: true
+
+  - id: assistants-api-calls
+    pattern: '\bbeta\.(?:assistants|threads)\b'
+    hint: The OpenAI Assistants API was sunset; use the Responses API / Agents SDK.
+    allow_in:
+      - docs/frameworks/openai-responses-and-agents-sdk.md  # sunset notice names client.beta.assistants
+    allow_in_legacy_details: true
+
+  - id: openai-chat-completion-v0
+    pattern: '\bopenai\.ChatCompletion\b|\btext-davinci-\d+'
+    hint: Use the current OpenAI SDK client (Responses API).
+    allow_in_legacy_details: true
+
+  - id: semantic-kernel-planners
+    pattern: 'from\s+semantic_kernel\.planners\b|\b(?:Sequential|Stepwise)Planner\b'
+    hint: Use automatic function calling instead of explicit planners.
+    allow_in_legacy_details: true
+
+  - id: anthropic-budget-tokens
+    pattern: '\bbudget_tokens\b|"type"\s*:\s*"enabled"'
+    hint: Use adaptive thinking with output_config.effort; fixed thinking budgets are legacy-only.
+    allow_in_legacy_details: true

@@ -2,6 +2,7 @@
 sidebar_position: 6
 title: "Coding Challenges"
 description: "8 hands-on coding problems for agentic AI interviews, from simple tool-calling loops to mini agent systems."
+last_verified: 2026-10-12
 ---
 
 # Coding Challenges
@@ -100,127 +101,100 @@ print("All assertions passed.")
 
 ---
 
-## Challenge 2: Parse ReAct Output
+## Challenge 2: Validate and Execute Native Tool Calls
 
-**Problem:** Write a function that parses an LLM's ReAct-format output and returns either an action (tool + input) or a final answer. Handle malformed outputs by raising a `ValueError` with a helpful message.
+**Problem:** Modern chat APIs return tool calls as structured objects (`{"id", "name", "args"}`), not as text to regex-parse. Write `execute_tool_calls(tool_calls, registry)` that takes a list of tool calls from one model turn (there may be several, i.e. **parallel tool calls**), validates each call's arguments against the tool's schema, executes the valid ones, and returns one result message per call. Invalid calls (unknown tool, missing or wrongly-typed argument) must **not raise**; they return an error message the model can read and correct.
 
 **Hints:**
-- Use regex to extract `Action:`, `Action Input:`, and `Final Answer:` fields
-- Check for Final Answer first (if both appear, prioritize based on position)
-- The Thought field is optional for parsing but useful to extract
+- Every `tool_call_id` needs a matching result message, even for failures
+- Validate args with a Pydantic model per tool (`model_validate`)
+- Independent calls in one turn can run concurrently, but keep results in the original order
 
 <details>
 <summary>View Solution</summary>
 
 ```python
-import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Union
+from typing import Any, Callable
+
+from pydantic import BaseModel, ValidationError
 
 
 @dataclass
-class AgentAction:
-    tool: str
-    tool_input: str
-    thought: str = ""
+class Tool:
+    schema: type[BaseModel]
+    fn: Callable[..., Any]
 
 
-@dataclass
-class AgentFinish:
-    output: str
-    thought: str = ""
+def _run_one(call: dict[str, Any], registry: dict[str, Tool]) -> dict[str, str]:
+    base = {"role": "tool", "tool_call_id": call["id"]}
+    tool = registry.get(call["name"])
+    if tool is None:
+        return {**base, "content": f"Error: unknown tool '{call['name']}'. "
+                                   f"Available: {sorted(registry)}"}
+    try:
+        args = tool.schema.model_validate(call["args"])
+    except ValidationError as exc:
+        # Schema validation failure goes back to the model, not up the stack.
+        return {**base, "content": f"Error: invalid arguments: {exc.errors(include_url=False)}"}
+    try:
+        return {**base, "content": str(tool.fn(**args.model_dump()))}
+    except Exception as exc:  # tool bug or external failure
+        return {**base, "content": f"Error: tool failed: {exc}"}
 
 
-def parse_react_output(text: str) -> Union[AgentAction, AgentFinish]:
-    """Parse ReAct-formatted LLM output.
-
-    Expected formats:
-        Thought: ...
-        Action: tool_name
-        Action Input: input_string
-    OR:
-        Thought: ...
-        Final Answer: answer_string
-
-    Raises ValueError if neither format is found.
-    """
-    # Extract thought (optional)
-    thought = ""
-    thought_match = re.search(
-        r"Thought:\s*(.+?)(?=\n(?:Action:|Final Answer:)|$)",
-        text, re.DOTALL
-    )
-    if thought_match:
-        thought = thought_match.group(1).strip()
-
-    # Check for Final Answer
-    final_match = re.search(r"Final Answer:\s*(.+)", text, re.DOTALL)
-    action_match = re.search(r"Action:\s*(.+?)(?:\n|$)", text)
-    input_match = re.search(r"Action Input:\s*(.+?)(?:\n|$)", text, re.DOTALL)
-
-    # If both exist, check which comes first
-    if final_match and action_match:
-        if text.index("Final Answer:") < text.index("Action:"):
-            return AgentFinish(output=final_match.group(1).strip(), thought=thought)
-        else:
-            if input_match:
-                return AgentAction(
-                    tool=action_match.group(1).strip(),
-                    tool_input=input_match.group(1).strip(),
-                    thought=thought,
-                )
-
-    if final_match:
-        return AgentFinish(output=final_match.group(1).strip(), thought=thought)
-
-    if action_match and input_match:
-        return AgentAction(
-            tool=action_match.group(1).strip(),
-            tool_input=input_match.group(1).strip(),
-            thought=thought,
-        )
-
-    if action_match and not input_match:
-        raise ValueError(
-            f"Found 'Action: {action_match.group(1).strip()}' but no 'Action Input:'. "
-            "Both are required."
-        )
-
-    raise ValueError(
-        "Could not parse output. Expected either:\n"
-        "  'Action: <tool>\\nAction Input: <input>'\n"
-        "or:\n"
-        "  'Final Answer: <answer>'\n"
-        f"Got:\n{text[:200]}"
-    )
+def execute_tool_calls(
+    tool_calls: list[dict[str, Any]], registry: dict[str, Tool]
+) -> list[dict[str, str]]:
+    """Validate and run all tool calls from one model turn; keep input order."""
+    if not tool_calls:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(tool_calls))) as pool:
+        return list(pool.map(lambda c: _run_one(c, registry), tool_calls))
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
-# Test action parsing
-result = parse_react_output(
-    "Thought: I need to search.\nAction: wikipedia\nAction Input: AI agents"
+class AddArgs(BaseModel):
+    a: int
+    b: int
+
+
+class UpperArgs(BaseModel):
+    text: str
+
+
+registry = {
+    "add": Tool(AddArgs, lambda a, b: a + b),
+    "upper": Tool(UpperArgs, lambda text: text.upper()),
+}
+
+results = execute_tool_calls(
+    [
+        {"id": "c1", "name": "add", "args": {"a": 2, "b": 3}},          # valid
+        {"id": "c2", "name": "upper", "args": {"text": "hi"}},          # valid, parallel
+        {"id": "c3", "name": "add", "args": {"a": "x", "b": 3}},        # schema error
+        {"id": "c4", "name": "nope", "args": {}},                       # unknown tool
+    ],
+    registry,
 )
-assert isinstance(result, AgentAction)
-assert result.tool == "wikipedia"
-assert result.tool_input == "AI agents"
-
-# Test final answer
-result = parse_react_output("Thought: I know the answer.\nFinal Answer: 42")
-assert isinstance(result, AgentFinish)
-assert result.output == "42"
-
-# Test error on malformed output
-try:
-    parse_react_output("Just some random text")
-    assert False, "Should have raised ValueError"
-except ValueError:
-    pass
-
+assert [r["tool_call_id"] for r in results] == ["c1", "c2", "c3", "c4"]
+assert results[0]["content"] == "5"
+assert results[1]["content"] == "HI"
+assert results[2]["content"].startswith("Error: invalid arguments")
+assert results[3]["content"].startswith("Error: unknown tool")
+assert execute_tool_calls([], registry) == []
 print("All assertions passed.")
 ```
 
 </details>
+
+:::tip Interview Point: why native tool calls?
+Follow-up you should expect: *why did the industry move away from parsing `Action:` text?* Reliability. Structured calls remove brittle regexes and hallucinated formats, allow **parallel tool calls** in a single turn, and let you **validate arguments against a schema** before executing anything, returning failures to the model as readable errors.
+:::
+
+For the historical `Thought:` / `Action:` text format (and why it was replaced), see the single collapsed legacy example in [ReAct Pattern](../design-patterns/react-pattern#native-tool-calls-vs-text-parsed-react). It is deliberately not repeated here.
 
 ---
 
@@ -434,31 +408,36 @@ print("All assertions passed.")
 
 ## Challenge 5: Build a Simple Agent Loop
 
-**Problem:** Implement a complete agent loop that takes a user question, calls a mock LLM function, parses the response for tool calls, executes tools, and repeats until a final answer is produced. Use dependency injection for the LLM function so the solution is testable.
+**Problem:** Implement a complete agent loop that takes a user question, calls a mock LLM function, executes any native tool calls it returns, and repeats until the model answers without tool calls. Use dependency injection for the LLM function so the solution is testable.
 
 **Hints:**
-- Define a `LLMFunction` protocol (callable that takes messages and returns a string)
+- Define an `LLMFunction` protocol (callable that takes messages and returns an assistant message dict with `content` and optional `tool_calls`)
+- The loop ends when the assistant message has no tool calls
 - The loop should have a max iteration limit
-- Use the parser from Challenge 2 or a simplified version
+- Reuse the dispatcher idea from Challenge 2; every tool call needs a matching tool message
 
 <details>
 <summary>View Solution</summary>
 
 ```python
-from typing import Callable, Protocol
 from dataclasses import dataclass
+from typing import Any, Callable, Protocol
 
 
 class LLMFunction(Protocol):
-    """Protocol for the LLM call - enables testing with mocks."""
-    def __call__(self, messages: list[dict[str, str]]) -> str: ...
+    """Protocol for the LLM call - enables testing with mocks.
+
+    Returns an assistant message: {"role": "assistant", "content": str,
+    "tool_calls": [{"id": str, "name": str, "args": dict}, ...]} (tool_calls optional).
+    """
+    def __call__(self, messages: list[dict[str, Any]]) -> dict[str, Any]: ...
 
 
 @dataclass
 class ToolDef:
     name: str
     description: str
-    fn: Callable
+    fn: Callable[..., Any]
 
 
 def run_agent_loop(
@@ -467,91 +446,60 @@ def run_agent_loop(
     tools: list[ToolDef],
     max_iterations: int = 5,
 ) -> str:
-    """Execute an agent loop with tool calling.
+    """Execute an agent loop with native tool calling.
 
-    Args:
-        query: The user's question.
-        llm: A callable that takes messages and returns LLM output text.
-        tools: Available tools.
-        max_iterations: Safety limit on loop iterations.
-
-    Returns:
-        The agent's final answer string.
+    Returns the assistant's final text, or a message if the iteration cap is hit.
     """
     tool_map = {t.name: t for t in tools}
-    tool_desc = "\n".join(f"- {t.name}: {t.description}" for t in tools)
-
-    system_prompt = (
-        f"You have these tools:\n{tool_desc}\n\n"
-        "Use format:\nAction: <tool>\nAction Input: <input>\n\n"
-        "Or:\nFinal Answer: <answer>"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": "Use the available tools when needed."},
         {"role": "user", "content": query},
     ]
 
-    for i in range(max_iterations):
-        response = llm(messages)
+    for _ in range(max_iterations):
+        reply = llm(messages)
+        messages.append(reply)
 
-        # Check for final answer
-        if "Final Answer:" in response:
-            idx = response.index("Final Answer:") + len("Final Answer:")
-            return response[idx:].strip()
+        tool_calls = reply.get("tool_calls") or []
+        if not tool_calls:
+            return reply["content"]  # no tool calls -> final answer
 
-        # Parse action
-        if "Action:" in response and "Action Input:" in response:
-            action_line = ""
-            input_line = ""
-            for line in response.split("\n"):
-                if line.strip().startswith("Action:"):
-                    action_line = line.split("Action:", 1)[1].strip()
-                elif line.strip().startswith("Action Input:"):
-                    input_line = line.split("Action Input:", 1)[1].strip()
-
-            if action_line and action_line in tool_map:
-                try:
-                    observation = str(tool_map[action_line].fn(input_line))
-                except Exception as e:
-                    observation = f"Error: {e}"
-            elif action_line:
-                observation = f"Unknown tool: {action_line}"
+        for call in tool_calls:  # may be several in one turn
+            tool = tool_map.get(call["name"])
+            if tool is None:
+                result = f"Error: unknown tool '{call['name']}'"
             else:
-                observation = "Could not parse action."
-
-            messages.append({"role": "assistant", "content": response})
-            messages.append({"role": "user", "content": f"Observation: {observation}"})
-        else:
-            # Malformed output -- ask for correction
-            messages.append({"role": "assistant", "content": response})
-            messages.append({
-                "role": "user",
-                "content": "Please respond with Action/Action Input or Final Answer.",
-            })
+                try:
+                    result = str(tool.fn(**call["args"]))
+                except Exception as exc:  # includes bad/missing arguments
+                    result = f"Error: {exc}"
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
 
     return "Max iterations reached without a final answer."
 
 
 # ── Test with Mock LLM ───────────────────────────────────────────────────────
 
-call_num = 0
+def make_mock_llm() -> LLMFunction:
+    turns = iter([
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "name": "add", "args": {"a": 2, "b": 2}}]},
+        {"role": "assistant", "content": "The answer is 4."},
+    ])
+    return lambda messages: next(turns)
 
-def mock_llm(messages: list[dict[str, str]]) -> str:
-    global call_num
-    call_num += 1
-    if call_num == 1:
-        return "Thought: I need to calculate.\nAction: calc\nAction Input: 2+2"
-    else:
-        return "Thought: Got it.\nFinal Answer: The answer is 4."
 
-tools = [
-    ToolDef("calc", "Calculate a math expression", lambda expr: eval(expr)),
-]
+tools = [ToolDef("add", "Add two integers", lambda a, b: a + b)]
 
-call_num = 0
-result = run_agent_loop("What is 2+2?", mock_llm, tools)
+result = run_agent_loop("What is 2+2?", make_mock_llm(), tools)
 assert result == "The answer is 4."
+
+# A model that keeps calling tools hits the iteration cap
+looping = lambda messages: {
+    "role": "assistant", "content": "",
+    "tool_calls": [{"id": "x", "name": "add", "args": {"a": 1, "b": 1}}],
+}
+assert run_agent_loop("loop", looping, tools, max_iterations=3).startswith("Max iterations")
 print(f"Agent returned: {result}")
 print("All assertions passed.")
 ```
@@ -648,12 +596,13 @@ class SemanticRouter:
 
 # ── Test with a simple mock embedder ─────────────────────────────────────────
 
-# Mock embedding: use character frequency as a simple embedding
+# Mock embedding: keyword presence over a tiny fixed vocabulary. (A character-frequency
+# embedding looks similar for almost any English text, so it cannot separate routes.)
+KEYWORDS = ["bill", "invoice", "payment", "refund", "bug", "error", "crash", "system"]
+
 def mock_embed(text: str) -> list[float]:
-    chars = "abcdefghijklmnopqrstuvwxyz "
-    vec = [text.lower().count(c) for c in chars]
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / norm for v in vec]
+    lowered = text.lower()
+    return [1.0 if kw in lowered else 0.0 for kw in KEYWORDS]
 
 router = SemanticRouter(embed_fn=mock_embed, threshold=0.3)
 
@@ -674,6 +623,11 @@ print(f"Routed to: {name} (score={score:.3f})")
 
 name, result, score = router.route("My application keeps crashing with an error")
 assert name == "technical", f"Expected technical, got {name}"
+print(f"Routed to: {name} (score={score:.3f})")
+
+# No keyword overlap -> best score is below the threshold -> default handler
+name, result, score = router.route("What is the weather today?")
+assert name == "default" and result == "I cannot handle that request."
 print(f"Routed to: {name} (score={score:.3f})")
 
 print("All assertions passed.")
@@ -700,6 +654,8 @@ print("All assertions passed.")
 import json
 from dataclasses import dataclass
 from typing import Optional
+
+FENCE = "`" * 3  # built at runtime: a literal triple backtick inside this snippet can end the markdown fence early in naive renderers/checkers
 
 
 @dataclass
@@ -764,9 +720,9 @@ Respond ONLY with valid JSON:
     try:
         # Handle potential markdown code fences
         cleaned = raw.strip()
-        if cleaned.startswith("```"):
+        if cleaned.startswith(FENCE):
             cleaned = cleaned.split("\n", 1)[1]
-            cleaned = cleaned.rsplit("```", 1)[0]
+            cleaned = cleaned.rsplit(FENCE, 1)[0]
 
         parsed = json.loads(cleaned)
         scores = parsed.get("scores", {})
@@ -846,6 +802,8 @@ import json
 from typing import Protocol
 from dataclasses import dataclass
 
+FENCE = "`" * 3  # built at runtime: a literal triple backtick inside this snippet can end the markdown fence early in naive renderers/checkers
+
 
 class LLMFunction(Protocol):
     def __call__(self, prompt: str) -> str: ...
@@ -889,8 +847,8 @@ class ResearchAssistant:
         try:
             # Handle potential markdown fences
             cleaned = response.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0]
+            if cleaned.startswith(FENCE):
+                cleaned = cleaned.split("\n", 1)[1].rsplit(FENCE, 1)[0]
             sub_questions = json.loads(cleaned)
 
             if not isinstance(sub_questions, list):

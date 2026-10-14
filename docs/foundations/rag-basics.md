@@ -2,6 +2,7 @@
 sidebar_position: 4
 title: "RAG Basics"
 description: "Retrieval-Augmented Generation pipeline, chunking strategies, retrieval methods, and evaluation"
+last_verified: 2026-10-12
 ---
 
 # RAG Basics
@@ -66,6 +67,8 @@ The pipeline has two phases:
 Documents come in many formats. A robust RAG pipeline handles all of them.
 
 ```python
+# Loaders: no standalone partner package exists for these; the official integrations
+# page still lists them under langchain-community (pip install langchain-community pypdf).
 from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
@@ -105,7 +108,8 @@ Raw documents are too long to embed effectively. **Chunking** splits them into s
 The simplest approach: split text into chunks of a fixed number of characters or tokens, with optional overlap.
 
 ```python
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+# pip install langchain-text-splitters  (langchain.text_splitter no longer exists in v1)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=512,
@@ -137,11 +141,14 @@ for i, chunk in enumerate(chunks):
 Uses embedding similarity to find natural topic boundaries within a document. Adjacent sentences with low similarity are split into separate chunks.
 
 ```python
-from langchain_experimental.text_splitter import SemanticChunker
-from langchain_openai import OpenAIEmbeddings
+import os
 
+from langchain.embeddings import init_embeddings
+from langchain_experimental.text_splitter import SemanticChunker
+
+# AGENT_EMBEDDINGS is "<provider>:<embedding-model>"
 semantic_splitter = SemanticChunker(
-    OpenAIEmbeddings(model="text-embedding-3-small"),
+    init_embeddings(os.environ["AGENT_EMBEDDINGS"]),
     breakpoint_threshold_type="percentile",
     breakpoint_threshold_amount=90,
 )
@@ -185,13 +192,16 @@ Mitigation: De-duplicate retrieved chunks before passing them to the LLM. Use me
 The standard RAG approach: embed the query and find the most similar chunk embeddings.
 
 ```python
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
+# pip install langchain-chroma
+import os
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+from langchain.embeddings import init_embeddings
+from langchain_chroma import Chroma
 
-# Build index from chunks
-vectorstore = FAISS.from_texts(
+embeddings = init_embeddings(os.environ["AGENT_EMBEDDINGS"])
+
+# Build index from chunks (langchain_community.vectorstores is superseded by partner packages)
+vectorstore = Chroma.from_texts(
     texts=chunks,
     embedding=embeddings,
     metadatas=[{"source": "rag_guide", "chunk_id": i} for i in range(len(chunks))],
@@ -210,6 +220,8 @@ for doc, score in results:
 Traditional keyword-based retrieval. Excels at exact term matching that vector search sometimes misses (e.g., product codes, acronyms, proper nouns).
 
 ```python
+# No partner package for BM25 was found in the official integrations index;
+# this stays in langchain-community (pip install langchain-community rank_bm25).
 from langchain_community.retrievers import BM25Retriever
 
 bm25_retriever = BM25Retriever.from_texts(
@@ -226,7 +238,8 @@ bm25_results = bm25_retriever.invoke("RAG indexing pipeline")
 Combines dense and sparse retrieval for the best of both worlds. Uses **Reciprocal Rank Fusion (RRF)** or weighted score combination to merge results.
 
 ```python
-from langchain.retrievers import EnsembleRetriever
+# pip install langchain-classic  (langchain.retrievers moved out of langchain in v1)
+from langchain_classic.retrievers import EnsembleRetriever
 
 # Create individual retrievers
 dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
@@ -263,8 +276,9 @@ Initial retrieval is fast but approximate. A **re-ranker** (typically a cross-en
 
 ```python
 from sentence_transformers import CrossEncoder
+import os
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+reranker = CrossEncoder(os.environ["AGENT_RERANKER_MODEL"])
 
 # Re-rank retrieved chunks
 query = "How does the indexing phase of RAG work?"
@@ -290,17 +304,19 @@ for doc, score in reranked[:3]:
 The final step assembles the retrieved context and user query into a prompt for the LLM.
 
 ```python
+import os
+
 from openai import OpenAI
 
 client = OpenAI()
 
 
-def rag_generate(query: str, context_chunks: list[str], model: str = "gpt-4o") -> str:
+def rag_generate(query: str, context_chunks: list[str], model: str | None = None) -> str:
     """Generate an answer using retrieved context."""
     context = "\n\n---\n\n".join(context_chunks)
 
     response = client.chat.completions.create(
-        model=model,
+        model=model or os.environ["AGENT_MODEL"],
         messages=[
             {
                 "role": "system",
@@ -337,17 +353,19 @@ Here is the full pipeline assembled end to end:
 ```python
 """Complete RAG pipeline from document to answer."""
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings
+import os
+
+from langchain.embeddings import init_embeddings
+from langchain_chroma import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
 
 client = OpenAI()
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+embeddings = init_embeddings(os.environ["AGENT_EMBEDDINGS"])
 
 
-def build_index(documents: list[str]) -> FAISS:
-    """Chunk documents and build a FAISS index."""
+def build_index(documents: list[str]) -> Chroma:
+    """Chunk documents and build an in-memory Chroma index."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=512,
         chunk_overlap=50,
@@ -356,11 +374,11 @@ def build_index(documents: list[str]) -> FAISS:
     for doc in documents:
         chunks.extend(splitter.split_text(doc))
 
-    vectorstore = FAISS.from_texts(texts=chunks, embedding=embeddings)
+    vectorstore = Chroma.from_texts(texts=chunks, embedding=embeddings)
     return vectorstore
 
 
-def query_rag(vectorstore: FAISS, question: str, k: int = 4) -> str:
+def query_rag(vectorstore: Chroma, question: str, k: int = 4) -> str:
     """Retrieve context and generate an answer."""
     # Retrieve
     results = vectorstore.similarity_search(question, k=k)
@@ -368,7 +386,7 @@ def query_rag(vectorstore: FAISS, question: str, k: int = 4) -> str:
 
     # Generate
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model=os.environ["AGENT_MODEL"],
         messages=[
             {
                 "role": "system",
@@ -425,6 +443,11 @@ RAG evaluation measures the quality of both retrieval and generation.
 ### Using RAGAS for Evaluation
 
 ```python
+# Illustrative: running evaluate() calls an evaluator LLM, so it needs provider credentials
+# (ragas defaults to OpenAI via OPENAI_API_KEY); the printed scores are example values only.
+# Verified to import with ragas 0.4.3 + datasets 5 (needs langchain-community<0.4.2, see
+# examples/langchain-v1/requirements.txt). These `ragas.metrics` objects are the legacy API,
+# deprecated in favour of `ragas.metrics.collections`; check the ragas docs before adopting.
 from ragas import evaluate
 from ragas.metrics import (
     answer_relevancy,
@@ -512,7 +535,7 @@ RAG evaluation is not a one-time activity. As you add new documents, change chun
 <details>
 <summary><strong>Q: Walk me through how you would design a RAG system for a company's internal knowledge base with 50,000 documents.</strong></summary>
 
-I would design the system in phases. **Indexing:** Use format-specific loaders (PDF, DOCX, Confluence API). Parse with Unstructured.io for complex layouts. Chunk with recursive splitting at 512 tokens with 50-token overlap. Embed with text-embedding-3-large for high accuracy. Store in Qdrant or Pinecone with metadata (department, date, author, access permissions). **Query:** Implement hybrid retrieval (BM25 + vector search) with RRF fusion. Add a cross-encoder re-ranker. Assemble top-5 chunks as context. Generate with GPT-4o at temperature 0. **Evaluation:** Build a test set of 200+ question-answer pairs with ground truth. Measure faithfulness, relevance, and context precision using RAGAS. Run evaluation after every pipeline change. **Production:** Add access control (users can only retrieve documents they have permission to view). Implement caching for frequent queries. Add observability (log queries, retrieval results, and generation quality).
+I would design the system in phases. **Indexing:** Use format-specific loaders (PDF, DOCX, Confluence API). Parse with Unstructured.io for complex layouts. Chunk with recursive splitting at 512 tokens with 50-token overlap. Embed with a high-accuracy embedding model (`AGENT_EMBEDDING_MODEL`). Store in Qdrant or Pinecone with metadata (department, date, author, access permissions). **Query:** Implement hybrid retrieval (BM25 + vector search) with RRF fusion. Add a cross-encoder re-ranker. Assemble top-5 chunks as context. Generate with the standard-tier model at temperature 0. **Evaluation:** Build a test set of 200+ question-answer pairs with ground truth. Measure faithfulness, relevance, and context precision using RAGAS. Run evaluation after every pipeline change. **Production:** Add access control (users can only retrieve documents they have permission to view). Implement caching for frequent queries. Add observability (log queries, retrieval results, and generation quality).
 
 </details>
 

@@ -2,6 +2,7 @@
 sidebar_position: 1
 title: "LLM Fundamentals"
 description: "Transformer architecture, attention, tokenization, inference, and sampling strategies"
+last_verified: 2026-10-12
 ---
 
 # LLM Fundamentals
@@ -40,10 +41,10 @@ graph TB
     style Output fill:#f0f8e8,stroke:#2c3e50
 ```
 
-Modern LLMs like GPT-4, Claude, and Llama are **decoder-only** transformers. They are trained to predict the next token in a sequence, one token at a time. During inference, they generate text **autoregressively** -- each new token is appended to the input and the model runs again.
+Modern frontier, hosted, and open-weight LLMs are **decoder-only** transformers. They are trained to predict the next token in a sequence, one token at a time. During inference, they generate text **autoregressively** -- each new token is appended to the input and the model runs again.
 
 :::info Encoder vs Decoder
-The original transformer had both an encoder and a decoder. **Encoder-only** models (like BERT) are used for classification and embedding tasks. **Decoder-only** models (like GPT) are used for text generation. **Encoder-decoder** models (like T5) are used for sequence-to-sequence tasks like translation.
+The original transformer had both an encoder and a decoder. **Encoder-only** models (like BERT) are used for classification and embedding tasks. **Decoder-only** models (like most chat models) are used for text generation. **Encoder-decoder** models (like T5) are used for sequence-to-sequence tasks like translation.
 :::
 
 ---
@@ -92,9 +93,9 @@ LLMs do not operate on raw text. Text is first converted into **tokens** -- inte
 
 | Tokenizer | Used By | Vocabulary Size |
 |---|---|---|
-| `cl100k_base` | GPT-4, GPT-4o | ~100,000 |
-| Claude tokenizer | Claude 3/3.5/4 | ~100,000 |
-| SentencePiece | Llama, Mistral | 32,000-128,000 |
+| `o200k_base` / `cl100k_base` | OpenAI-style BPE tokenizers | ~100,000-200,000 |
+| Provider-specific BPE | Other hosted model families | varies by model |
+| SentencePiece | Many open-weight models | tens of thousands to ~128,000 |
 | WordPiece | BERT | ~30,000 |
 
 ### How BPE Works
@@ -108,7 +109,7 @@ LLMs do not operate on raw text. Text is first converted into **tokens** -- inte
 # Counting tokens with tiktoken (OpenAI's tokenizer)
 import tiktoken
 
-encoding = tiktoken.encoding_for_model("gpt-4o")
+encoding = tiktoken.get_encoding("o200k_base")
 text = "Agentic AI systems use tool calling to interact with external APIs."
 
 tokens = encoding.encode(text)
@@ -134,13 +135,7 @@ Every LLM has a **context window** -- the maximum number of tokens it can proces
 
 The context window is the total number of tokens (input + output) that a model can handle in a single inference call.
 
-| Model | Context Window | Approx. Words |
-|---|---|---|
-| GPT-3.5 Turbo | 16,384 | ~12,000 |
-| GPT-4o | 128,000 | ~96,000 |
-| Claude 4 Opus/Sonnet | 200,000 | ~150,000 |
-| Llama 3.1 405B | 128,000 | ~96,000 |
-| Gemini 2.5 Pro | 1,000,000 | ~750,000 |
+Providers advertise a maximum context size per model, and those numbers change often, so this guide does not list them -- check the model card for your `AGENT_MODEL`. What matters more is the difference between **advertised** and **effective** context: recall of any single fact degrades as the window fills (**context rot**), so a model rarely uses its full advertised window reliably. Plan around the effective window, and use **compaction** (summarize, then reinitialize the run) and selective retrieval to stay inside it. See [Context Engineering](../core-concepts/context-engineering.md).
 
 **Why this matters for agents:** Agents accumulate context over multiple reasoning steps. Each tool call, observation, and thought consumes tokens. A poorly designed agent can exhaust its context window mid-task, leading to failures or hallucinations as important context falls out of scope.
 
@@ -225,7 +220,11 @@ Lower temperature concentrates probability on the top token. Higher temperature 
 ## Practical Code Example: OpenAI API with Sampling Parameters
 
 ```python
+import os
 from openai import OpenAI
+
+MODEL = os.environ["AGENT_MODEL"]
+
 
 client = OpenAI()  # Reads OPENAI_API_KEY from environment
 
@@ -235,7 +234,7 @@ def generate_with_params(
     temperature: float = 0.7,
     top_p: float = 1.0,
     max_tokens: int = 256,
-    model: str = "gpt-4o",
+    model: str = MODEL,
 ) -> str:
     """Generate text with explicit sampling parameters."""
     response = client.chat.completions.create(

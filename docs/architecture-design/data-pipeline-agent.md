@@ -2,6 +2,7 @@
 sidebar_position: 4
 title: "Data Pipeline Agent"
 description: "Architecture design for an AI agent that builds, manages, and monitors data pipelines"
+last_verified: 2026-10-12
 ---
 
 # Data Pipeline Agent

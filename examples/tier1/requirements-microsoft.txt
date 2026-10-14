@@ -1,0 +1,12 @@
+# Tier 1 / microsoft-agent-framework.md. Own environment; floors only (latest otherwise).
+# agent-framework-core provides every agent_framework.* import on the page. The umbrella
+# `agent-framework` package pulls in every provider integration and is NOT needed.
+# Add the provider package matching your client class only if you run an agent (none is imported).
+# observability: configure_otel_providers() needs opentelemetry-sdk, and the OTLP exporter when
+# OTEL_EXPORTER_OTLP_* is set.
+# Run: python examples/langchain-v1/check_doc_imports.py docs/frameworks/microsoft-agent-framework.md
+#      pytest examples/tier1/microsoft
+agent-framework-core
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+pytest

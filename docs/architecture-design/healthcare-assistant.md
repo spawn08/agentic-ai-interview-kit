@@ -2,6 +2,7 @@
 sidebar_position: 9
 title: "Multi-Modal AI Assistant for Healthcare"
 description: "Architecture design for a HIPAA-compliant, on-premises AI clinical assistant with doctor-in-the-loop always"
+last_verified: 2026-10-12
 ---
 
 # Multi-Modal AI Assistant for Healthcare
@@ -79,7 +80,7 @@ graph TB
     end
 
     subgraph "Agent Layer (On-Premises)"
-        DiagAgent[Diagnostic Agent<br/>Llama 3 / Mistral<br/>Medical Fine-Tuned]
+        DiagAgent[Diagnostic Agent<br/>Open-weight model<br/>Medical Fine-Tuned]
         TreatAgent[Treatment Planner Agent<br/>Guidelines-Aware]
         DrugCheck[Drug Interaction Checker<br/>Deterministic Rules + LLM]
     end
@@ -154,7 +155,7 @@ The **Data Ingestion Layer** connects to the hospital's EMR system via HL7 FHIR 
 
 The **Knowledge Layer** provides the clinical evidence base. A Clinical RAG System indexes clinical practice guidelines (from UpToDate, WHO, CDC, specialty societies), drug interaction databases (RxNorm, DrugBank), and medical literature (PubMed-indexed papers). These are stored in an on-premises vector store (Milvus or pgvector) and refreshed quarterly as new guidelines are published. The RAG system retrieves relevant guidelines and evidence for each patient case.
 
-The **Agent Layer** runs entirely on-premises using open-source models (Llama 3 70B or Mistral Large) fine-tuned on de-identified medical data. The Diagnostic Agent analyzes the patient context against retrieved guidelines and generates a differential diagnosis -- a ranked list of possible conditions with supporting evidence. The Treatment Planner Agent takes the diagnosis candidates and the patient's specific factors (allergies, comorbidities, current medications, renal/hepatic function) and recommends treatment options. The Drug Interaction Checker uses both deterministic rules (from the drug interaction database) and LLM reasoning to identify potential interactions and contraindications.
+The **Agent Layer** runs entirely on-premises using open-weight models (a large, self-hosted model) fine-tuned on de-identified medical data. The Diagnostic Agent analyzes the patient context against retrieved guidelines and generates a differential diagnosis -- a ranked list of possible conditions with supporting evidence. The Treatment Planner Agent takes the diagnosis candidates and the patient's specific factors (allergies, comorbidities, current medications, renal/hepatic function) and recommends treatment options. The Drug Interaction Checker uses both deterministic rules (from the drug interaction database) and LLM reasoning to identify potential interactions and contraindications.
 
 The **Safety and Explainability** layer enforces the evidence-required architecture. The Output Validator inspects every claim in the agent's output and checks that it cites either a specific patient data point or a clinical guideline. The Hallucination Guard blocks any ungrounded claim -- statements that the model generates without supporting evidence are replaced with "insufficient data to determine." The Explainability Layer creates a structured mapping from each diagnostic claim to its supporting evidence, enabling physicians to trace any suggestion back to its source. The Confidence Scorer assigns a probability to each diagnosis based on the strength of supporting evidence.
 
@@ -265,7 +266,7 @@ A patient presents with vague symptoms (fatigue, headache, mild nausea) and unre
 
 ## Scaling Considerations
 
-On-premises deployment constrains scaling to the hospital's available hardware. A typical deployment uses 4-8 NVIDIA A100 GPUs for model inference, running Llama 3 70B with 4-bit quantization (fits in approximately 40GB VRAM). This configuration handles approximately 15-20 concurrent inference requests with 10-15 second latency per request.
+On-premises deployment constrains scaling to the hospital's available hardware. A typical deployment uses 4-8 NVIDIA A100 GPUs for model inference, running a ~70B-parameter open-weight model with 4-bit quantization (fits in approximately 40GB VRAM). This configuration handles approximately 15-20 concurrent inference requests with 10-15 second latency per request.
 
 **Priority queuing** is essential: ICU patients and emergency department consultations get priority over routine outpatient chart reviews. A three-tier priority system (emergency, urgent, routine) ensures critical cases are processed first, even during peak usage.
 
@@ -667,7 +668,7 @@ Each stage in the pipeline is independent and any stage can halt the response or
 
 | Decision | Rationale | Alternative | Why Not |
 |----------|-----------|-------------|---------|
-| On-premises deployment with open-source models | PHI never leaves hospital network; full HIPAA compliance without cloud BAA complexities; hospital retains data sovereignty | Cloud-based LLM (GPT-4o, Claude) | PHI sent to cloud requires BAA, network egress, and creates regulatory risk; many hospitals prohibit cloud processing of PHI; latency and availability depend on internet connectivity |
+| On-premises deployment with open-source models | PHI never leaves hospital network; full HIPAA compliance without cloud BAA complexities; hospital retains data sovereignty | Cloud-based LLM (frontier or standard tier) | PHI sent to cloud requires BAA, network egress, and creates regulatory risk; many hospitals prohibit cloud processing of PHI; latency and availability depend on internet connectivity |
 | Differential diagnoses (ranked list), not definitive | Matches clinical reasoning practice; prevents anchoring bias on a single AI-suggested diagnosis; physician retains diagnostic authority | Single "most likely" diagnosis | A single diagnosis creates dangerous anchoring bias; physicians may skip considering alternatives; does not reflect clinical reality where multiple diagnoses are possible |
 | Evidence-required architecture (Hallucination Guard) | Zero tolerance for fabricated medical claims; every suggestion is traceable to patient data or guidelines; builds physician trust | Allow ungrounded suggestions with disclaimers | Even with disclaimers, ungrounded medical claims can mislead physicians, especially under time pressure; a single hallucinated diagnosis could cause patient harm |
 | Doctor-in-the-loop always (mandatory approval) | System is a suggestion engine, not a decision-maker; maintains physician liability and agency; regulatory compliance | Auto-apply high-confidence suggestions | FDA SaMD regulations require physician oversight; auto-applied medical decisions create liability issues; physician judgment incorporates factors the AI cannot access (patient demeanor, social context) |

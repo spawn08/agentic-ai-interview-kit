@@ -2,6 +2,7 @@
 sidebar_position: 6
 title: "Project: Agent Evaluation & Testing Framework"
 description: "Build a production evaluation and regression testing platform for agentic AI systems — LLM-as-judge, statistical significance testing, CI/CD gating, and automated regression detection"
+last_verified: 2026-10-12
 ---
 
 # Project: Agent Evaluation & Testing Framework
@@ -60,7 +61,7 @@ pip install openai scipy numpy pydantic pytest pytest-asyncio python-dotenv
 `.env`:
 ```bash
 OPENAI_API_KEY=your-key
-JUDGE_MODEL=gpt-4o
+AGENT_MODEL=<judge model id; use a different tier or provider than the agent under test>
 JUDGE_CONCURRENCY=10
 ```
 
@@ -304,6 +305,9 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from openai import AsyncOpenAI
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 
 @dataclass
@@ -423,7 +427,7 @@ Respond in this exact JSON format:
 
     def __init__(
         self,
-        model: str = "gpt-4o",
+        model: str = MODEL,
         concurrency: int = 10,
         cache_dir: Optional[str] = None,
     ) -> None:
@@ -619,7 +623,7 @@ Respond in this exact JSON format:
 ```
 
 :::warning Judge Model Selection
-Use the strongest model available as your judge. A GPT-4o judge evaluating GPT-4o-mini agent outputs is a valid setup -- the judge sees the full context and scores against explicit criteria, which is a simpler task than generating the original response. A GPT-4o-mini judge evaluating GPT-4o outputs is unreliable: the judge cannot assess quality it cannot produce.
+Use the strongest model available as your judge. A the standard-tier model judge evaluating the fast-tier model agent outputs is a valid setup -- the judge sees the full context and scores against explicit criteria, which is a simpler task than generating the original response. A the fast-tier model judge evaluating the standard-tier model outputs is unreliable: the judge cannot assess quality it cannot produce.
 :::
 
 ---
@@ -2262,7 +2266,7 @@ python -m eval_framework gate \
 The `asyncio.Semaphore` bounds concurrent agent calls. Without it, 200 concurrent LLM API calls would trigger rate limits. The semaphore defaults to 10 -- enough to saturate a typical rate limit without exceeding it. Adjust based on your provider's limits.
 
 **Caching judge results:**
-The judge cache keys on `sha256(case_id + response + dimension)`. If the agent produces the same output for the same input, the judge score is reused. This matters during iterative development: you change a prompt, 80% of outputs are identical, only 20% need re-judging. Cost drops from $5 per run to $1.
+The judge cache keys on `sha256(case_id + response + dimension)`. If the agent produces the same output for the same input, the judge score is reused. This matters during iterative development: you change a prompt, 80% of outputs are identical, only 20% need re-judging. Cost drops to roughly 20% of a full run.
 
 **Incremental evaluation:**
 When a dataset has 500 cases but only 20 changed between versions, you do not need to re-evaluate all 500. The content hash on `DatasetVersion` enables a diff: load both versions, identify changed cases by `case_id`, evaluate only those. Unchanged cases carry forward their previous scores. Implementation is straightforward -- diff case IDs, run only the delta, merge with cached results.

@@ -2,11 +2,16 @@
 sidebar_position: 7
 title: "Reasoning Models & Test-Time Compute"
 description: "How reasoning-tier LLMs trade inference-time compute for accuracy, and how to control reasoning depth per request."
+last_verified: 2026-10-12
 ---
 
 # Reasoning Models & Test-Time Compute
 
-**Reasoning models** -- OpenAI's o-series and GPT-5, Anthropic's extended-thinking Claude, Gemini's thinking models, and DeepSeek-R1 -- are LLMs trained to spend extra *inference-time* compute generating an internal chain of thought before they answer. They trade latency and token cost for markedly higher accuracy on hard, multi-step problems (math, coding, planning, proofs). Crucially, this **test-time compute** is a dial you control: OpenAI exposes a `reasoning_effort` setting, Anthropic a `budget_tokens` thinking budget -- so engineers can tune reasoning depth per request and route only the hard steps to an expensive reasoning tier.
+**Reasoning models** -- OpenAI's reasoning models, Anthropic's thinking-capable models, Google's thinking models, and open-weight reasoning models -- are LLMs trained to spend extra *inference-time* compute generating an internal chain of thought before they answer. They trade latency and token cost for higher accuracy on hard, multi-step problems (math, coding, planning, proofs). This **test-time compute** is a dial you control per request: OpenAI exposes `reasoning.effort`, and Anthropic exposes **adaptive thinking** steered by `output_config.effort`. Engineers can tune depth and route only the hard steps to a reasoning tier.
+
+:::info Verified 2026-10-12
+Parameters below were checked against the live [OpenAI reasoning guide](https://developers.openai.com/api/docs/guides/reasoning), Anthropic [effort](https://platform.claude.com/docs/en/build-with-claude/effort) and [thinking](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost) pages. **Supported values and defaults are model-dependent**; read the per-model table before shipping. This page deliberately names no model IDs and no prices: set the model via environment variables and read prices from the provider's pricing page.
+:::
 
 ---
 
@@ -42,48 +47,42 @@ On a base model you *ask* for step-by-step reasoning. On a reasoning model the r
 
 ## Controlling Reasoning Depth
 
-Both major vendors let you set how hard the model thinks. OpenAI uses discrete **effort levels**; Anthropic uses an explicit **token budget**.
+Both major vendors now steer depth with **effort levels**, not a hand-picked token budget. Treat effort as a behavioral signal, not a strict token cap.
 
-| Provider | Control | Values / Range | Reasoning trace visible? | Where billed |
+| Provider | Control | Values | Reasoning visible? | Billing |
 |---|---|---|---|---|
-| OpenAI (o-series, GPT-5) | `reasoning_effort` | `minimal`, `low`, `medium`, `high` (`minimal` added with GPT-5) | No (hidden CoT) | Counted as output tokens |
-| Anthropic (extended thinking) | `budget_tokens` | Min 1024; normally `< max_tokens` | Yes (summarized thinking blocks) | Counted as output tokens |
+| OpenAI (Responses API) | `reasoning.effort` (Chat Completions: flat `reasoning_effort`) | Model-dependent; may include `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Some models reject `none` or `minimal` with HTTP 400 | Raw trace hidden; optional `summary` where the model supports it | Reasoning tokens billed as output tokens |
+| Anthropic (Messages API) | `thinking: {"type": "adaptive"}` plus `output_config.effort` | `low`, `medium`, `high`, `xhigh`, `max`; availability and default vary by model | Summarized or omitted via a display setting; billing is for the full thinking | Thinking tokens billed as output tokens |
 
 ```python
+import os
 from openai import OpenAI
 
 client = OpenAI()
-
-# Responses API: `reasoning` is a nested object
 resp = client.responses.create(
-    model="gpt-5",
-    reasoning={"effort": "high"},
+    model=os.environ["OPENAI_REASONING_MODEL"],  # set per environment
+    reasoning={"effort": "medium"},  # confirm this level for your model
+    max_output_tokens=4000,  # caps reasoning + visible output together
     input="Prove there are infinitely many primes.",
 )
 print(resp.output_text)
-
-# Chat Completions API: `reasoning_effort` is a flat top-level parameter
-chat = client.chat.completions.create(
-    model="o4-mini",
-    reasoning_effort="medium",
-    messages=[{"role": "user", "content": "Explain the halting problem."}],
-)
-print(chat.choices[0].message.content)
+if resp.status == "incomplete":
+    print(resp.incomplete_details)  # may happen before any visible text
+print(resp.usage.output_tokens_details.reasoning_tokens)
 ```
 
 ```python
+import os
 import anthropic
 
 client = anthropic.Anthropic()
-
 msg = client.messages.create(
-    model="claude-sonnet-4-5",
-    max_tokens=16000,
-    thinking={"type": "enabled", "budget_tokens": 10000},  # >=1024 and < max_tokens
+    model=os.environ["ANTHROPIC_MODEL"],  # set per environment
+    max_tokens=16000,  # hard limit on thinking + answer
+    thinking={"type": "adaptive"},
+    output_config={"effort": "high"},  # effort is NOT inside `thinking`
     messages=[{"role": "user", "content": "Solve this logic puzzle: ..."}],
 )
-
-# The response contains both `thinking` and `text` content blocks
 for block in msg.content:
     if block.type == "thinking":
         print("[reasoning]", block.thinking[:200])
@@ -91,15 +90,31 @@ for block in msg.content:
         print("[answer]", block.text)
 ```
 
+**Illustrative, not executed here.** Whether your installed SDK version types `output_config` as a keyword is **unverified**; if not, pass it through the SDK's extra-body mechanism or upgrade. The Chat Completions usage field name for reasoning tokens was not re-verified in this pass.
+
+Operational points confirmed in the docs:
+
+- **Effort affects all output tokens**, including text, tool-call arguments, and thinking, so it works with or without thinking. Lower effort also means fewer and terser tool calls.
+- **Defaults differ by model.** Setting effort to the model's default is the same as omitting it. Changing effort between requests can invalidate prompt-cache breakpoints; pick a level per conversation.
+- **Set a generous `max_tokens` / `max_output_tokens`** at high effort. A response can end `incomplete` after spending the whole cap on reasoning.
+- On OpenAI's stateless mode (`store: false` or ZDR), reasoning items carry `encrypted_content` so reasoning can be passed back across turns; Anthropic similarly asks you to return thinking blocks during tool use (**details not re-verified here**).
+
+<details>
+<summary>Legacy: fixed thinking budgets (<code>budget_tokens</code>)</summary>
+
+Older Claude models used `thinking: {"type": "enabled", "budget_tokens": N}`. Per Anthropic's extended-thinking page this manual mode is **deprecated on the Claude 4.6 family** (requests still succeed) and **rejected with HTTP 400 on 4.7 and later**. It remains the only thinking mode on 4.5 and earlier models. Use it only when you must support such models; for new work use adaptive thinking with `output_config.effort`.
+
+</details>
+
 :::info Model IDs drift
-Model identifiers like `gpt-5`, `o4-mini`, and `claude-sonnet-4-5` are used here for illustration. Always confirm the current model IDs and parameter names in the provider docs before shipping.
+Every snippet reads the model from an environment variable on purpose. Confirm current identifiers, supported effort levels, and prices in the provider docs rather than copying them from a tutorial.
 :::
 
 ---
 
 ## Interleaved / Extended Thinking
 
-In an agent loop, reasoning does not have to happen only once at the start. **Interleaved thinking** lets the model reason *between* tool calls -- read a tool result, think about what it means, then decide the next call. Anthropic exposes this via a beta header, and in interleaved mode the thinking budget may even exceed `max_tokens` because thinking is spread across multiple turns.
+In an agent loop, reasoning does not have to happen only once at the start. **Interleaved thinking** lets the model reason *between* tool calls -- read a tool result, think about what it means, then decide the next call. On models with adaptive thinking this interleaving happens automatically with no beta header; model-by-model behavior differs, so check the [thinking docs](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost).
 
 ```mermaid
 graph TD
@@ -131,7 +146,7 @@ Reasoning models are not a free upgrade. They cost more and respond slower, so t
 graph TD
     Q["Incoming request"] --> D{"Hard, multi-step,\nhigh-stakes?"}
     D -->|No| Cheap["Cheap chat model\n(low latency, low cost)"]
-    D -->|Yes| Reason["Reasoning tier\n(high effort / big budget)"]
+    D -->|Yes| Reason["Reasoning tier\n(high effort)"]
     Cheap --> R["Response"]
     Reason --> R
     style Q fill:#40916c,stroke:#2d6a4f,color:#fff
@@ -144,7 +159,7 @@ graph TD
 **Route to a reasoning tier when** the task involves multi-step math, non-trivial code, complex planning, ambiguous requirements, or high-stakes decisions where a wrong answer is expensive. **Stay on a cheap model when** the task is classification, extraction, simple Q&A, formatting, or anything latency-sensitive and user-facing.
 
 :::tip Use effort as a knob, not a switch
-You do not have to choose between "reasoning on" and "off". Start at `low`/`medium` effort or a modest `budget_tokens`, measure accuracy, and only raise the dial for the specific step types that need it.
+You do not have to choose between "reasoning on" and "off". Start at `low`/`medium` effort, measure accuracy, and only raise the dial for the specific step types that need it.
 :::
 
 ---
@@ -154,14 +169,16 @@ You do not have to choose between "reasoning on" and "off". Start at `low`/`medi
 The extra reasoning is not free -- those internal tokens are real tokens the model generates and you pay for them.
 
 :::warning Reasoning tokens are billed
-Reasoning/thinking tokens count as **output tokens** on your bill. OpenAI's reasoning tokens are *hidden* (you never see the trace) but still charged -- surfaced in `usage.completion_tokens_details.reasoning_tokens`. High effort or large budgets can push total cost **3-5x** versus a non-reasoning call, and they dramatically increase time-to-first-token (TTFT) because the model must finish thinking before it emits the visible answer.
+Reasoning/thinking tokens count as **output tokens** on your bill. OpenAI's reasoning tokens are *hidden* (you never see the trace) but still charged -- surfaced in `usage.output_tokens_details.reasoning_tokens` on the Responses API. Higher effort spends more tokens (and money) per call, and it can noticeably increase time-to-first-token (TTFT) because the model must finish thinking before it emits the visible answer.
 :::
 
 | Setting | Accuracy on hard tasks | Latency (TTFT) | Cost |
 |---|---|---|---|
-| No reasoning / `minimal` | Baseline | Fastest | Lowest |
-| `low` effort / small budget | Better | Moderate | ~1.5-2x |
-| `high` effort / large budget | Best | Slowest | ~3-5x |
+| Lowest effort the model supports | Baseline | Fastest | Lowest |
+| `low` / `medium` effort | Better | Moderate | Moderate |
+| `high` and above | Best on hard tasks, not guaranteed | Slowest | Highest |
+
+Exact multipliers depend on the model and task, so **measure your own workload** and take prices from the provider's pricing page (kept out of this page on purpose).
 
 For streaming user experiences, the TTFT hit matters: a reasoning model may appear "stuck" for several seconds while it thinks. Budget for it, show a thinking indicator, or route latency-sensitive paths away from the reasoning tier entirely.
 
@@ -193,21 +210,21 @@ Model-size scaling adds parameters and training data to build a stronger base mo
 <details>
 <summary><strong>Q: How do OpenAI and Anthropic differ in how you control reasoning depth?</strong></summary>
 
-OpenAI exposes discrete `reasoning_effort` levels (`minimal`, `low`, `medium`, `high`) and hides the actual reasoning trace, though it still bills those tokens as output and reports them under `usage.completion_tokens_details.reasoning_tokens`. Anthropic exposes an explicit `budget_tokens` thinking budget (minimum 1024, normally below `max_tokens`) and returns visible/summarized thinking blocks alongside the answer.
+Both steer depth with effort levels, and supported levels and defaults are model-dependent. OpenAI uses `reasoning.effort` (Responses API; flat `reasoning_effort` in Chat Completions), hides the raw reasoning trace, and bills reasoning tokens as output. Anthropic uses adaptive thinking (`thinking: {"type": "adaptive"}`) with `output_config.effort` -- not a field inside `thinking` -- and returns summarized or omitted thinking while billing the full thinking tokens. The older fixed-budget Anthropic mode is covered only in the collapsed Legacy note above.
 
 </details>
 
 <details>
 <summary><strong>Q: A teammate hardcodes "think step by step in detail" into every prompt to a reasoning model. What do you tell them?</strong></summary>
 
-On a reasoning model that instruction is redundant -- the model was reinforcement-trained to produce reasoning traces on its own, and manually forcing verbose prompted CoT can actually degrade quality or waste tokens. The right control is the vendor knob (`reasoning_effort` or `budget_tokens`), not prompt engineering the chain of thought.
+On a reasoning model that instruction is redundant -- the model was reinforcement-trained to produce reasoning traces on its own, and manually forcing verbose prompted CoT can actually degrade quality or waste tokens. The right control is the vendor knob (effort level via `reasoning.effort` or `output_config.effort`), not prompt engineering the chain of thought.
 
 </details>
 
 <details>
 <summary><strong>Q: When would you NOT use a reasoning model?</strong></summary>
 
-For simple, latency-sensitive, or high-volume tasks: classification, extraction, formatting, simple Q&A, and any interactive path where TTFT matters. Reasoning models can cost 3-5x more and add seconds of latency before the first visible token. Route those requests to a cheap chat model and reserve the reasoning tier for genuinely hard, high-stakes steps.
+For simple, latency-sensitive, or high-volume tasks: classification, extraction, formatting, simple Q&A, and any interactive path where TTFT matters. Reasoning models can cost noticeably more and add seconds of latency before the first visible token. Route those requests to a cheap chat model and reserve the reasoning tier for genuinely hard, high-stakes steps.
 
 </details>
 
@@ -227,5 +244,6 @@ Much ReAct/reflection scaffolding existed to coax reasoning and self-correction 
 - [Reflection Pattern](../design-patterns/reflection-pattern.md) -- self-critique that reasoning models partly internalize.
 - [LLM Fundamentals](./llm-fundamentals.md) -- tokens, sampling, and inference basics.
 - [LLM Gateway Project](../projects/llm-gateway.md) -- implementing effort-aware routing.
-- [OpenAI: Reasoning models guide](https://platform.openai.com/docs/guides/reasoning)
-- [Anthropic: Extended thinking](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking)
+- [OpenAI: Reasoning models guide](https://developers.openai.com/api/docs/guides/reasoning) (curl-verified 2026-10-12)
+- [Anthropic: Effort](https://platform.claude.com/docs/en/build-with-claude/effort) and [Thinking](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost) (curl-verified 2026-10-12)
+- [Anthropic: Extended thinking (legacy)](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)

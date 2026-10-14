@@ -2,6 +2,7 @@
 sidebar_position: 7
 title: "Real-Time Trading Agent"
 description: "Architecture design for an AI-powered trading agent with deterministic risk management and sub-100ms execution"
+last_verified: 2026-10-12
 ---
 
 # Real-Time Trading Agent
@@ -240,7 +241,7 @@ sequenceDiagram
 
 ### Happy Path Walkthrough
 
-A price tick for AAPL arrives via the exchange WebSocket. Kafka normalizes the tick and routes it to the Feature Engine, which computes updated technical indicators (RSI has crossed above 30, MACD shows bullish divergence). The Signal Generation Agent receives the features along with recent news context (positive earnings surprise announced 2 hours ago). The LLM analyzes the confluence of signals and generates a BUY signal for 500 shares with a confidence score of 0.82 and a rationale citing the technical setup plus fundamental catalyst.
+A price tick for AAPL arrives vithe exchange WebSocket. Kafka normalizes the tick and routes it to the Feature Engine, which computes updated technical indicators (RSI has crossed above 30, MACD shows bullish divergence). The Signal Generation Agent receives the features along with recent news context (positive earnings surprise announced 2 hours ago). The LLM analyzes the confluence of signals and generates a BUY signal for 500 shares with a confidence score of 0.82 and a rationale citing the technical setup plus fundamental catalyst.
 
 The signal reaches the primary Risk Engine, which runs five checks in under 5ms: position limits (current AAPL exposure plus 500 shares is within the 5% capital limit), daily P&L (current P&L is +0.3%, well within the -2% halt threshold), velocity (only 2 orders in AAPL in the last hour), and sector exposure (technology sector at 18%, below the 25% cap). Because the order notional exceeds $50K, the dual consensus protocol activates: the secondary Risk Engine independently verifies all limits and confirms approval.
 
@@ -273,7 +274,7 @@ Geographic co-location with exchange data centers reduces network latency for th
 | Component | Volume/Day | Unit Cost | Daily Cost |
 |-----------|-----------|-----------|------------|
 | Market data feeds | 5M ticks | $0 (exchange subscription: $2K/mo) | $67 |
-| LLM signal generation | 5,000 analyses | $0.03/analysis (avg 4K tokens) | $150 |
+| LLM signal generation | 5,000 analyses | `c_analysis` = 4K tokens x `p` / 1M per analysis (assumed rates) | 5,000 x `c_analysis` |
 | Infrastructure (Kafka, QuestDB, compute) | -- | -- | $200 |
 | Exchange connectivity (co-location, FIX) | -- | -- | $100 |
 | Monitoring and alerting | -- | -- | $50 |

@@ -2,6 +2,7 @@
 sidebar_position: 5
 title: "Project: LLM Gateway & Model Router"
 description: "Build the foundational infrastructure layer between agents and LLM providers — with semantic caching, circuit breaking, request hedging, and cost controls"
+last_verified: 2026-10-12
 ---
 
 # Project: LLM Gateway & Model Router
@@ -61,10 +62,10 @@ graph TD
 
 ```bash
 pip install httpx redis numpy opentelemetry-api opentelemetry-sdk \
-    opentelemetry-exporter-otlp fastapi uvicorn pydantic tiktoken
+    opentelemetry-exporter-otlp fastapi uvicorn pydantic tiktoken python-dotenv
 ```
 
-Create a `.env` file:
+Create a `.env` file (you own this file; the gateway reads it through `load_dotenv()`, and the How to Run section loads it into your shell):
 
 ```bash
 OPENAI_API_KEY=sk-...
@@ -72,6 +73,27 @@ ANTHROPIC_API_KEY=sk-ant-...
 AZURE_OPENAI_API_KEY=...
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
 REDIS_URL=redis://localhost:6379/0
+
+# Model IDs: one env var per routing role (see docs/_shared/models.md for current examples)
+AGENT_MODEL=<standard-tier model id>
+AGENT_MODEL_FAST=<fast-tier model id>
+AGENT_MODEL_REASONING=<reasoning-tier model id>
+AGENT_MODEL_ALT=<second-provider standard-tier model id>
+AGENT_MODEL_ALT_FAST=<second-provider fast-tier model id>
+AGENT_EMBEDDING_MODEL=<embedding model id>
+
+# Prices: USD per 1M tokens, loaded from a file you maintain from each vendor's pricing page
+GATEWAY_PRICING_FILE=./pricing.json
+```
+
+`pricing.json` maps provider name to its rates. The gateway exits with a clear message if a provider has no entry or any rate is not a finite, non-negative number -- there are deliberately **no default prices** and no zero fallback. The placeholders below are **not valid numbers**: replace each with the numeric USD-per-1M-token rate from the vendor's pricing page, or the gateway will refuse to start:
+
+```json
+{
+  "openai": {"in_per_1m": "<from vendor pricing page>", "out_per_1m": "<from vendor pricing page>"},
+  "anthropic": {"in_per_1m": "<from vendor pricing page>", "out_per_1m": "<from vendor pricing page>"},
+  "azure_openai": {"in_per_1m": "<from vendor pricing page>", "out_per_1m": "<from vendor pricing page>"}
+}
 ```
 
 ---
@@ -80,7 +102,7 @@ REDIS_URL=redis://localhost:6379/0
 
 ### Step 1: Configuration & Provider Registry
 
-The configuration layer defines every provider the gateway knows about: its base URL, API key, supported models, pricing per token, and rate limits. The provider registry resolves a model name (like `gpt-4o`) to the correct provider configuration and handles fallback ordering.
+The configuration layer defines every provider the gateway knows about: its base URL, API key, supported models, pricing per token, and rate limits. The provider registry resolves a model name (like the standard-tier model ID in `AGENT_MODEL`) to the correct provider configuration and handles fallback ordering.
 
 ```python
 """llm_gateway.py -- Production LLM Gateway & Model Router."""
@@ -90,6 +112,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import time
 import uuid
@@ -114,6 +137,63 @@ load_dotenv()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+# One env var per routing role; there are no hardcoded model IDs in this file.
+MODEL = os.environ["AGENT_MODEL"]
+MODEL_FAST = os.environ["AGENT_MODEL_FAST"]
+MODEL_REASONING = os.environ["AGENT_MODEL_REASONING"]
+MODEL_ALT = os.environ["AGENT_MODEL_ALT"]
+MODEL_ALT_FAST = os.environ["AGENT_MODEL_ALT_FAST"]
+
+
+REQUIRED_PRICING_PROVIDERS = ("openai", "anthropic", "azure_openai")
+
+
+def _parse_rate(provider: str, key: str, value: object, path: str) -> float:
+    """Parse one rate; reject placeholders, booleans, NaN/inf and negatives. No fallback value."""
+    fix = f"edit {path} and enter the current rate from the vendor's pricing page"
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise SystemExit(f"Pricing for '{provider}.{key}' must be a number, got {value!r}; {fix}.")
+    try:
+        rate = float(value)
+    except ValueError:
+        raise SystemExit(f"Pricing for '{provider}.{key}' is not numeric ({value!r}); {fix}.") from None
+    if not math.isfinite(rate) or rate < 0:
+        raise SystemExit(f"Pricing for '{provider}.{key}' must be a finite, non-negative number, got {value!r}; {fix}.")
+    return rate
+
+
+def load_pricing(path: str | None = None) -> dict[str, dict[str, float]]:
+    """Load per-provider token prices (USD per 1M tokens) from an explicit JSON file.
+
+    Exits with a clear message when the file is missing, malformed, or any rate is
+    not a non-negative number. Placeholders are never replaced with invented prices.
+    """
+    path = path or os.environ.get("GATEWAY_PRICING_FILE", "")
+    if not path:
+        raise SystemExit("GATEWAY_PRICING_FILE is not set; point it at your pricing JSON file.")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except OSError as exc:
+        raise SystemExit(f"Cannot read pricing file {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Pricing file {path} is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise SystemExit(f"Pricing file {path} must be a JSON object keyed by provider name.")
+    pricing: dict[str, dict[str, float]] = {}
+    for provider in REQUIRED_PRICING_PROVIDERS:
+        entry = raw.get(provider)
+        if not isinstance(entry, dict):
+            raise SystemExit(f"Pricing file {path} has no entry for provider '{provider}'.")
+        pricing[provider] = {
+            key: _parse_rate(provider, key, entry.get(key), path)
+            for key in ("in_per_1m", "out_per_1m")
+        }
+    return pricing
+
+
+PRICING = load_pricing()
+
 
 class ProviderConfig(BaseModel):
     """Configuration for a single LLM provider."""
@@ -122,8 +202,8 @@ class ProviderConfig(BaseModel):
     base_url: str
     api_key: str = ""
     models: list[str] = Field(default_factory=list)
-    cost_per_1k_input: float = 0.0
-    cost_per_1k_output: float = 0.0
+    price_in_per_1m: float   # USD per 1M input tokens -- from pricing config, no default
+    price_out_per_1m: float  # USD per 1M output tokens -- from pricing config, no default
     rpm_limit: int = 500
     tpm_limit: int = 150_000
     timeout_seconds: float = 30.0
@@ -151,11 +231,10 @@ PROVIDER_CONFIGS: dict[str, ProviderConfig] = {
         base_url="https://api.openai.com/v1",
         api_key=os.getenv("OPENAI_API_KEY", ""),
         models=[
-            "gpt-4o", "gpt-4o-mini", "gpt-4-turbo",
-            "gpt-3.5-turbo", "o1-preview", "o1-mini",
+            MODEL, MODEL_FAST, MODEL_REASONING,
         ],
-        cost_per_1k_input=0.005,
-        cost_per_1k_output=0.015,
+        price_in_per_1m=PRICING["openai"]["in_per_1m"],
+        price_out_per_1m=PRICING["openai"]["out_per_1m"],
         rpm_limit=500,
         tpm_limit=150_000,
         timeout_seconds=30.0,
@@ -165,12 +244,11 @@ PROVIDER_CONFIGS: dict[str, ProviderConfig] = {
         base_url="https://api.anthropic.com/v1",
         api_key=os.getenv("ANTHROPIC_API_KEY", ""),
         models=[
-            "claude-sonnet-4-20250514",
-            "claude-haiku-4-20250414",
-            "claude-3-5-haiku-20241022",
+            MODEL_ALT,
+            MODEL_ALT_FAST,
         ],
-        cost_per_1k_input=0.003,
-        cost_per_1k_output=0.015,
+        price_in_per_1m=PRICING["anthropic"]["in_per_1m"],
+        price_out_per_1m=PRICING["anthropic"]["out_per_1m"],
         rpm_limit=400,
         tpm_limit=100_000,
         timeout_seconds=60.0,
@@ -181,9 +259,9 @@ PROVIDER_CONFIGS: dict[str, ProviderConfig] = {
         name="azure_openai",
         base_url=os.getenv("AZURE_OPENAI_ENDPOINT", "https://your-resource.openai.azure.com"),
         api_key=os.getenv("AZURE_OPENAI_API_KEY", ""),
-        models=["gpt-4o", "gpt-4o-mini"],
-        cost_per_1k_input=0.005,
-        cost_per_1k_output=0.015,
+        models=[MODEL, MODEL_FAST],
+        price_in_per_1m=PRICING["azure_openai"]["in_per_1m"],
+        price_out_per_1m=PRICING["azure_openai"]["out_per_1m"],
         rpm_limit=300,
         tpm_limit=120_000,
         timeout_seconds=30.0,
@@ -194,17 +272,25 @@ PROVIDER_CONFIGS: dict[str, ProviderConfig] = {
 
 # Model-to-provider mapping with fallback ordering.
 # The first provider in the list is the primary; others are fallbacks.
-MODEL_PROVIDER_MAP: dict[str, list[str]] = {
-    "gpt-4o": ["openai", "azure_openai"],
-    "gpt-4o-mini": ["openai", "azure_openai"],
-    "gpt-4-turbo": ["openai", "azure_openai"],
-    "gpt-3.5-turbo": ["openai", "azure_openai"],
-    "o1-preview": ["openai"],
-    "o1-mini": ["openai"],
-    "claude-sonnet-4-20250514": ["anthropic"],
-    "claude-haiku-4-20250414": ["anthropic"],
-    "claude-3-5-haiku-20241022": ["anthropic"],
-}
+# Roles may share a model ID (e.g. MODEL == MODEL_FAST); provider lists are merged
+# with setdefault and de-duplicated so no fallback is lost to a dict-key collision.
+def build_model_provider_map(routes: list[tuple[str, list[str]]]) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {}
+    for model_id, providers in routes:
+        slot = merged.setdefault(model_id, [])
+        for provider in providers:
+            if provider not in slot:
+                slot.append(provider)
+    return merged
+
+
+MODEL_PROVIDER_MAP: dict[str, list[str]] = build_model_provider_map([
+    (MODEL, ["openai", "azure_openai"]),
+    (MODEL_FAST, ["openai", "azure_openai"]),
+    (MODEL_REASONING, ["openai"]),
+    (MODEL_ALT, ["anthropic"]),
+    (MODEL_ALT_FAST, ["anthropic"]),
+])
 
 
 class ProviderRegistry:
@@ -521,6 +607,16 @@ Key design decisions:
 # ---------------------------------------------------------------------------
 
 
+def get_embedding_model() -> str:
+    """Return the embedding model ID, read lazily (only the semantic cache upgrade needs it)."""
+    try:
+        return os.environ["AGENT_EMBEDDING_MODEL"]
+    except KeyError:
+        raise SystemExit(
+            "AGENT_EMBEDDING_MODEL is not set; export it before enabling embedding-based caching."
+        ) from None
+
+
 class CachePolicy(str, Enum):
     """Controls caching behavior for a request."""
 
@@ -576,14 +672,16 @@ class SemanticCache:
     def _compute_embedding(text: str) -> list[float]:
         """Compute a lightweight embedding for cache lookup.
 
-        In production, use a dedicated embedding model (e.g., text-embedding-3-small).
+        In production, use a dedicated embedding model. Its ID is read lazily from
+        AGENT_EMBEDDING_MODEL by get_embedding_model(), so the gateway starts
+        without that variable unless you opt into the embedding upgrade.
         For the gateway cache, we use a fast hash-based embedding that captures
         token-level n-gram features. This avoids an additional API call per request
         while still providing reasonable semantic matching.
 
         For higher quality semantic matching, replace this with:
             response = await openai_client.embeddings.create(
-                model="text-embedding-3-small", input=text
+                model=get_embedding_model(), input=text
             )
             return response.data[0].embedding
         """
@@ -726,7 +824,7 @@ class SemanticCache:
 ```
 
 :::tip Cache Hit Rate Matters
-At 100K requests/day with an average cost of $0.02 per request, a 30% cache hit rate saves $600/day ($219K/year). Semantic caching typically achieves 25-40% hit rates on customer-facing workloads where users ask variations of the same questions. The gateway pays for itself in the first week.
+At 100K requests/day with an average cost of `c_req` per request (assumption: from `pricing.json` and your token counts), a 30% cache hit rate saves 30,000 x `c_req` per day. Semantic caching typically achieves 25-40% hit rates on customer-facing workloads where users ask variations of the same questions. The gateway pays for itself in the first week.
 :::
 
 ---
@@ -901,11 +999,15 @@ This is the core of the gateway. Every LLM request follows this path:
 3. For each provider in order: check rate limiter, check circuit breaker.
 4. Send the request with a timeout.
 5. On failure: try the next provider.
+
+
 6. On success: cache the response, record metrics, return.
 
 For latency-critical requests, **request hedging** sends the request to two providers simultaneously and returns whichever responds first. This trades cost for latency -- a deliberate tradeoff that must be explicitly opted into.
 
 ```python
+# (MODEL and MODEL_FAST are the module-level constants from Step 1.)
+
 # ---------------------------------------------------------------------------
 # Step 5: Request Router with Failover and Hedging
 # ---------------------------------------------------------------------------
@@ -915,7 +1017,7 @@ class GatewayRequest(BaseModel):
     """Incoming request to the LLM Gateway."""
 
     prompt: str
-    model: str = "gpt-4o-mini"
+    model: str = MODEL_FAST
     temperature: float = 0.0
     max_tokens: int = 1024
     session_id: Optional[str] = None
@@ -943,7 +1045,7 @@ class GatewayResponse(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-def estimate_tokens(text: str, model: str = "gpt-4o") -> int:
+def estimate_tokens(text: str, model: str = MODEL) -> int:
     """Estimate the number of tokens in a text string.
 
     Uses tiktoken for OpenAI models; falls back to a word-count heuristic
@@ -987,7 +1089,7 @@ class LLMGateway:
     async def generate(
         self,
         prompt: str,
-        model: str = "gpt-4o-mini",
+        model: str = MODEL_FAST,
         temperature: float = 0.0,
         max_tokens: int = 1024,
         session_id: str | None = None,
@@ -1329,8 +1431,8 @@ class LLMGateway:
         total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
 
         cost = (
-            (input_tokens / 1000) * provider.cost_per_1k_input
-            + (output_tokens / 1000) * provider.cost_per_1k_output
+            (input_tokens * provider.price_in_per_1m
+             + output_tokens * provider.price_out_per_1m) / 1_000_000
         )
 
         return GatewayResponse(
@@ -1389,8 +1491,8 @@ class LLMGateway:
         total_tokens = input_tokens + output_tokens
 
         cost = (
-            (input_tokens / 1000) * provider.cost_per_1k_input
-            + (output_tokens / 1000) * provider.cost_per_1k_output
+            (input_tokens * provider.price_in_per_1m
+             + output_tokens * provider.price_out_per_1m) / 1_000_000
         )
 
         return GatewayResponse(
@@ -1781,7 +1883,7 @@ app = FastAPI(
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request."""
 
-    model: str = "gpt-4o-mini"
+    model: str = MODEL_FAST
     messages: list[dict[str, str]]
     temperature: float = 0.0
     max_tokens: int = 1024
@@ -1802,7 +1904,7 @@ async def chat_completions(request: ChatCompletionRequest):
         from openai import OpenAI
         client = OpenAI(base_url="http://gateway:8000/v1", api_key="unused")
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL_FAST,
             messages=[{"role": "user", "content": "Hello"}],
         )
 
@@ -1959,37 +2061,57 @@ cat > .env <<EOF
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 REDIS_URL=redis://localhost:6379/0
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+AGENT_MODEL=<standard-tier model id>
+AGENT_MODEL_FAST=<fast-tier model id>
+AGENT_MODEL_REASONING=<reasoning-tier model id>
+AGENT_MODEL_ALT=<second-provider standard-tier model id>
+AGENT_MODEL_ALT_FAST=<second-provider fast-tier model id>
+AGENT_EMBEDDING_MODEL=<embedding model id>
+GATEWAY_PRICING_FILE=./pricing.json
 EOF
+# Replace every <...> placeholder (here and in pricing.json) with real values first.
 
-# 5. Run the gateway
+# 5. Load .env into your shell. Run each of these three lines as its own command,
+#    and only source a .env file that you wrote yourself.
+set -a
+source .env
+set +a
+
+# 6. Run the gateway
 uvicorn llm_gateway:app --host 0.0.0.0 --port 8000 --workers 4
 
-# 6. Test with curl
+# 7. Test with curl (in a second terminal, repeat step 5 so AGENT_MODEL_FAST is set there too)
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o-mini",
+    "model": "'"$AGENT_MODEL_FAST"'",
     "messages": [{"role": "user", "content": "What is the capital of France?"}],
     "temperature": 0
   }'
 
-# 7. Check health
+# 8. Check health
 curl http://localhost:8000/v1/health
 
-# 8. View stats
+# 9. View stats
 curl http://localhost:8000/v1/stats
 ```
 
 Use it from any OpenAI-compatible SDK:
 
 ```python
+import os
+
 from openai import OpenAI
+
+MODEL_FAST = os.environ["AGENT_MODEL_FAST"]
 
 # Point the SDK at the gateway instead of OpenAI directly
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
+    model=MODEL_FAST,
     messages=[{"role": "user", "content": "Explain circuit breakers in distributed systems"}],
     temperature=0,
 )
@@ -2056,15 +2178,15 @@ At 100,000 requests/day with an average of 500 input tokens and 300 output token
 
 | Component | Cost/Day | Cost/Month | Notes |
 |-----------|----------|------------|-------|
-| **LLM API calls (no gateway)** | $2,000 | $60,000 | At GPT-4o pricing ($5/M input, $15/M output) |
-| **With 30% cache hit rate** | $1,400 | $42,000 | Semantic cache eliminates 30K requests/day |
-| **Cache savings** | $600 | $18,000 | Pays for all gateway infrastructure |
-| **Hedging overhead (10% of requests hedged)** | $200 | $6,000 | 10K hedged requests cost 2x |
+| **LLM API calls (no gateway)** | `C` = N x (500 x p_in + 300 x p_out) / 1M | 30 x `C` | Symbolic: p_in, p_out are your assumed USD per 1M token rates from `pricing.json`; N = 100,000 |
+| **With 30% cache hit rate** | 0.7 x `C` | 30 x 0.7 x `C` | Semantic cache eliminates 30K requests/day |
+| **Cache savings** | 0.3 x `C` | 30 x 0.3 x `C` | Pays for all gateway infrastructure |
+| **Hedging overhead (10% of requests hedged)** | 0.1 x `C` | 30 x 0.1 x `C` | 10K hedged requests cost 2x |
 | **Redis (r6g.large)** | $8 | $240 | Rate limits + cache + cost tracking |
 | **Gateway compute (2x c6g.large)** | $10 | $300 | Runs 4 uvicorn workers each |
-| **Net savings** | **$382** | **$11,460** | Cache savings minus hedging and infra |
+| **Net savings** | **0.2 x `C` - $18** | **30 x 0.2 x `C` - $540** | Cache savings minus hedging and infra |
 
-The gateway infrastructure costs roughly $540/month. The cache savings alone are $18,000/month. Even with hedging overhead of $6,000/month, the net savings are over $11,000/month. The gateway pays for itself on day one.
+The gateway infrastructure costs roughly $540/month. The cache savings are 0.3 x `C` per day and hedging overhead is 0.1 x `C`, so the gateway pays for itself whenever 0.2 x `C` exceeds the ~$18/day infrastructure cost -- plug in your own rates from `pricing.json` to check.
 
 ---
 
@@ -2090,7 +2212,7 @@ This project demonstrates several Staff/Principal-level signals that interviewer
 
 - **Streaming support**: Add SSE streaming through the gateway using `httpx` streaming responses and `StreamingResponse` in FastAPI. The cache must handle partial responses differently (cache only after stream completes).
 - **Multi-tenant isolation**: Add `tenant_id` to requests. Each tenant gets independent rate limits, budgets, and model access policies. Store tenant configs in Redis for hot reloading.
-- **A/B testing**: Route a percentage of traffic to a new model (e.g., 10% to GPT-4o, 90% to GPT-4o-mini) and compare quality scores. The gateway is the natural place for this because it sees all traffic.
+- **A/B testing**: Route a percentage of traffic to a new model (e.g., 10% to the standard-tier model, 90% to the fast-tier model) and compare quality scores. The gateway is the natural place for this because it sees all traffic.
 - **Prompt transformation**: Add a middleware layer that rewrites prompts before sending to providers. Use cases: inject system prompts, strip PII, add retrieval context.
 - **Admin API**: Add endpoints for manual circuit breaker control (`POST /admin/circuit/{provider}/open`), cache invalidation, and budget overrides.
 - **PostgreSQL rollups**: A background worker that reads hourly Redis cost counters and writes them to PostgreSQL for long-term analytics and billing dashboards.

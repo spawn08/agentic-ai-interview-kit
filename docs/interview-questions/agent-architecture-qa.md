@@ -1,12 +1,13 @@
 ---
 sidebar_position: 2
 title: "Agent Architecture Questions"
-description: "15 Q&A on agent concepts, architectures, tools, and memory for interview preparation."
+description: "19 Q&A on agent concepts, architectures, tools, and memory for interview preparation."
+last_verified: 2026-10-12
 ---
 
 # Agent Architecture Questions
 
-These 15 questions cover the core concepts of agentic AI systems: the agent loop, tool integration, memory architectures, planning strategies, and orchestration patterns. These are the questions that separate candidates who have only used LLM APIs from those who understand how to build autonomous systems.
+These 19 questions cover the core concepts of agentic AI systems: the agent loop, tool integration, memory architectures, planning strategies, and orchestration patterns. These are the questions that separate candidates who have only used LLM APIs from those who understand how to build autonomous systems.
 
 :::info Interview Context
 Agent architecture questions are common in mid-level to senior AI engineering interviews. Interviewers want to see that you understand the fundamental building blocks, not just the frameworks that abstract them away.
@@ -30,7 +31,7 @@ An AI agent is a system where an LLM operates in a loop, deciding which actions 
 <details>
 <summary>View Answer</summary>
 
-The Observe-Think-Act (OTA) loop is the fundamental execution cycle of any agent. In the **Observe** phase, the agent receives information from its environment -- this could be user input, tool results, or sensor data. In the **Think** phase, the LLM reasons about what it has observed and decides on the next action (this is where techniques like chain-of-thought and ReAct reasoning happen). In the **Act** phase, the agent executes the chosen action, which could be calling a tool, generating a response, or modifying its environment. The result of the action becomes the next observation, restarting the cycle. This loop is foundational because every agent framework implements some variant of it. LangChain's `AgentExecutor`, CrewAI's task execution, and LangGraph's node traversal all ultimately reduce to this cycle. Understanding the loop helps you debug agents, design new architectures, and reason about failure modes.
+The Observe-Think-Act (OTA) loop is the fundamental execution cycle of any agent. In the **Observe** phase, the agent receives information from its environment -- this could be user input, tool results, or sensor data. In the **Think** phase, the LLM reasons about what it has observed and decides on the next action (this is where techniques like chain-of-thought and ReAct reasoning happen). In the **Act** phase, the agent executes the chosen action, which could be calling a tool, generating a response, or modifying its environment. The result of the action becomes the next observation, restarting the cycle. This loop is foundational because every agent framework implements some variant of it. LangChain's `create_agent` loop, CrewAI's task execution, and LangGraph's node traversal all ultimately reduce to this cycle. Understanding the loop helps you debug agents, design new architectures, and reason about failure modes.
 
 </details>
 
@@ -176,3 +177,59 @@ Long-running agents accumulate tokens from conversation history, tool results, a
 Production agent metrics span four categories. **Task performance**: task completion rate, answer accuracy, tool selection accuracy, and end-to-end success rate. **Efficiency**: average tokens per query, average LLM calls per task, average latency (time to first token, total response time), and cost per query. **Reliability**: error rate, timeout rate, infinite loop rate, guardrail trigger rate, and fallback/escalation rate. **User experience**: user satisfaction scores (thumbs up/down), conversation length, retry rate (how often users rephrase), and abandonment rate. For each metric, define acceptable thresholds: e.g., task completion rate above 90%, p95 latency under 10 seconds, error rate below 1%. Track these metrics in dashboards and set up alerting for regressions. In interviews, mention that you should also track **cost efficiency** (cost per successful task, not just cost per query) and **safety metrics** (harmful output rate, prompt injection success rate). The most important meta-metric is the ratio of successful tasks to total LLM calls -- this measures the agent's ability to achieve goals efficiently.
 
 </details>
+
+---
+
+## Q16. Where do native tools fit in the agent loop, and what changes architecturally?
+
+**Level: Mid**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** In the loop, a native (server) tool call is executed by the vendor inside the same request, so your loop never sees a pending call for it; client tools return control to your code to execute. Native tools remove infrastructure but also remove your interception point.
+
+**2-minute answer:** With client tools the loop is: model emits a call, your harness validates it, applies permissions and approval gates, executes, and feeds back the result. With server tools the vendor runs the call and the results arrive as part of the model's response. Architectural consequences: (1) **no pre-execution hook** -- you cannot block or approve a native search or code run per call, only enable or disable the tool and constrain it through configuration; (2) **audit** -- log the tool-use blocks you receive, since you did not run them; (3) **data boundary** -- anything sent to a native tool leaves your environment; (4) **injection** -- results from web search are untrusted content entering context, so apply the same structural controls as for any retrieved text; (5) **mixed toolsets** -- keep sensitive or side-effecting actions as client tools so the harness keeps control.
+
+</details>
+
+## Q17. How does the stateless MCP revision (2026-07-28) change how you architect MCP servers and clients?
+
+**Level: Senior**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** There is no protocol session to hold state in. Each request is self-contained (version and capabilities travel with it), so servers can sit behind any load balancer, and cross-call state must be explicit -- typically a server-minted handle the client passes back as a tool argument.
+
+**2-minute answer:** The 2026-07-28 changelog removes protocol-level sessions and `Mcp-Session-Id` from Streamable HTTP, removes the initialize handshake, and states that list endpoints no longer vary per connection. Design implications: (1) **Horizontal scaling** -- no sticky routing; any replica can serve any call. (2) **State as data** -- a multi-step workflow creates a resource (a cart, a job, a draft), returns its handle, and later calls reference it; store it in your database with an owner and TTL, not in process memory. (3) **Authorization per request** -- since there is no session to trust, authenticate and authorize every call and bind handles to the caller to prevent cross-user handle guessing. (4) **Idempotency** -- retries are easier and more likely, so make side-effecting tools idempotent. (5) **Tool lists** -- because they no longer vary per connection, do not rely on per-connection tool visibility; enforce per-user authorization on each call. (6) **Compatibility** -- clients and servers on older revisions need migration or a documented compatibility layer.
+
+</details>
+
+## Q18. How should an agent loop allocate reasoning effort across steps?
+
+**Level: Senior**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** Do not give every step the same budget. Use low effort for routine steps (parsing, simple tool calls) and higher effort for planning, ambiguous decisions, and verification. With adaptive thinking the model also decides per request whether to think at all.
+
+**2-minute answer:** Effort is a harness-level policy decision that interacts with the model's own adaptivity. A practical design: (1) set a default modest effort for the loop; (2) escalate for steps that are high-stakes or have failed once (a retry at higher effort is cheaper than a blind retry loop); (3) cap total cost with step and budget limits in the harness regardless of effort; (4) record effort level in traces so cost and quality can be analyzed per setting; (5) evaluate: run the same tasks at two or three levels and compare success per dollar, not just success. Remember that effort affects overall response length and tool-call behavior, not only hidden reasoning, and that supported levels differ by model -- check the vendor's effort page for the model you deploy.
+
+</details>
+
+## Q19. What belongs to the model and what belongs to the harness in an agent, and why does the distinction matter?
+
+**Level: Senior**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** The model supplies reasoning and decisions about the next action. The harness supplies everything around it: the loop, tool execution, context assembly, memory, permissions, stop conditions, and observability. It matters because failures and improvements need to be attributed correctly to be fixed.
+
+**2-minute answer:** Examples: a wrong tool argument might be a model error or a harness error (a vague tool description, a missing schema constraint). A runaway loop is a harness failure (no step cap). Forgetting earlier work is usually context management (harness) before it is a model limit. A prompt-injection that leads to a destructive action is a missing structural control (harness) even though the model was fooled. Why it matters: (1) **debugging** -- fix the right layer; (2) **portability** -- harness logic that compensates for one model's quirks may hurt another; (3) **evaluation** -- compare models inside a fixed harness, and harnesses with a fixed model; (4) **ownership** -- you cannot improve the vendor's model, but you fully control the harness. See [What Are AI Agents?](../core-concepts/what-are-agents.md) and [Context Engineering](../core-concepts/context-engineering.md).
+
+</details>
+
+*Sources (checked 2026-10-12): [Claude tool use overview](https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview), [OpenAI tools guide](https://developers.openai.com/api/docs/guides/tools), [MCP specification 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and its [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog), [Claude effort](https://platform.claude.com/docs/en/build-with-claude/effort) and [adaptive thinking](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost), [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents).*

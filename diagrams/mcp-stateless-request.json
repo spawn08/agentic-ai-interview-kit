@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "MCP 2026-07-28: Stateless Tool Call",
+    "animation": "none",
+    "quality_profile": "showcase",
+    "output": "static/diagrams/mcp-stateless-request.html",
+    "column_fit": "spread",
+    "viewBox": [
+      1000,
+      590
+    ]
+  },
+  "participants": [
+    {
+      "id": "host",
+      "type": "frontend",
+      "label": "Host",
+      "sublabel": "user + approvals"
+    },
+    {
+      "id": "client",
+      "type": "backend",
+      "label": "MCP client",
+      "sublabel": "connector"
+    },
+    {
+      "id": "auth",
+      "type": "security",
+      "label": "Authorization server",
+      "sublabel": "token source"
+    },
+    {
+      "id": "server",
+      "type": "cloud",
+      "label": "MCP server",
+      "sublabel": "validates every call"
+    },
+    {
+      "id": "api",
+      "type": "external",
+      "label": "Tool API",
+      "sublabel": "tool backend"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m1",
+      "from": "host",
+      "to": "client",
+      "label": "call tool",
+      "y": 165
+    },
+    {
+      "id": "m2",
+      "from": "client",
+      "to": "auth",
+      "label": "get access token",
+      "variant": "dashed",
+      "y": 207
+    },
+    {
+      "id": "m3",
+      "from": "auth",
+      "to": "client",
+      "label": "access token",
+      "variant": "dashed",
+      "y": 249
+    },
+    {
+      "id": "m4",
+      "from": "client",
+      "to": "server",
+      "label": "tools/call + _meta + Bearer",
+      "y": 291
+    },
+    {
+      "id": "m6",
+      "from": "server",
+      "to": "api",
+      "label": "validated: run tool",
+      "y": 333,
+      "variant": "security"
+    },
+    {
+      "id": "m7",
+      "from": "api",
+      "to": "server",
+      "label": "tool output",
+      "y": 375
+    },
+    {
+      "id": "m8",
+      "from": "server",
+      "to": "client",
+      "label": "result + serverInfo _meta",
+      "y": 417
+    },
+    {
+      "id": "m9",
+      "from": "client",
+      "to": "host",
+      "label": "tool result",
+      "y": 459
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Stateless by design",
+      "items": [
+        "No initialize and no Mcp-Session-Id in the 2026-07-28 core",
+        "Request _meta carries protocolVersion, clientCapabilities, clientInfo; the Bearer token is not in _meta, it travels in the Authorization header",
+        "Result _meta: io.modelcontextprotocol/serverInfo. Auth only for protected tools; no model in MCP"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Auth failure (not drawn: success path only)",
+      "items": [
+        "401 unauthenticated / 403 insufficient scope: no tool execution"
+      ]
+    }
+  ]
+}

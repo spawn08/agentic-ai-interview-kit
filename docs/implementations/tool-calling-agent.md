@@ -2,6 +2,7 @@
 sidebar_position: 5
 title: "Tool-Calling Agent with LangGraph"
 description: "Production-grade tool-calling agent using LangGraph's prebuilt ToolNode with Pydantic schemas, parallel execution, validation, and audit logging."
+last_verified: 2026-10-12
 ---
 
 # Tool-Calling Agent with LangGraph
@@ -18,23 +19,79 @@ LangGraph's `ToolNode` handles tool dispatch, error wrapping, and message format
 
 ```mermaid
 graph TD
-    A[START] --> B[agent]
+    A[START] --> S[begin_turn]
+    S --> B[agent]
     B --> C{should_continue}
-    C -->|has tool_calls| D[validate_tool_calls]
-    D --> E[tools]
-    E --> F[audit_log]
-    F --> B
+    C -->|has tool_calls| D[validate]
     C -->|no tool_calls| G[END]
+    C -->|budget spent, calls pending| L[finalize_limit]
+    L --> G
+    D --> V{route_after_validate}
+    V -->|all calls valid| E[tools]
+    V -->|any call invalid: nothing runs| F[audit]
+    E --> F
+    F --> B
 ```
 
-The **agent** node invokes the LLM with bound tools. If tool calls are returned, they pass through a **validation** node before the prebuilt **ToolNode** executes them. An **audit log** node records every tool invocation for compliance.
+A **begin_turn** node resets the per-turn model-call budget. The **agent** node invokes the LLM with bound tools. If tool calls are returned, they pass through an **all-or-nothing validation** node: if any call has an unknown name or fails its Pydantic schema, *no* tool runs, every call gets one error `ToolMessage`, and the graph bypasses `tools` straight to **audit** and back to the agent so it can self-correct. Only a fully valid batch reaches the prebuilt **ToolNode**. When the budget is spent with calls still pending, **finalize_limit** answers each pending call with an error `ToolMessage` plus a fallback `AIMessage`, so the checkpointed history stays well-formed for the next turn.
+
+:::tip Preferred current path: `create_agent` + middleware
+For most production agents, start with LangChain v1's `create_agent` and its middleware instead of hand-writing the graph. It already provides the model/tool loop, per-run call limits, and tool-call wrappers. The explicit `StateGraph` below is kept as the educational view of the same state topology (and for when you need custom routing).
+
+```python
+"""native_agent.py -- Illustrative: the same tools on create_agent + middleware.
+
+Illustrative only: calling build_native_agent() needs AGENT_MODEL and provider credentials.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    ModelCallLimitMiddleware,
+    ToolCallLimitMiddleware,
+    wrap_tool_call,
+)
+from langchain_core.messages import ToolMessage
+
+from tools import ALL_TOOLS
+
+
+@wrap_tool_call
+def tool_safety(request, handler):
+    """Turn tool exceptions into structured error ToolMessages the model can react to."""
+    try:
+        return handler(request)
+    except Exception as exc:  # noqa: BLE001 - boundary: report, never crash the loop
+        return ToolMessage(
+            content=json.dumps({"error": f"{type(exc).__name__}: {exc}"}),
+            tool_call_id=request.tool_call["id"],
+            status="error",
+        )
+
+
+def build_native_agent():
+    return create_agent(
+        model=os.environ["AGENT_MODEL"],  # e.g. "openai:<model-id>"; see the shared models page
+        tools=ALL_TOOLS,
+        middleware=[
+            ModelCallLimitMiddleware(run_limit=10, exit_behavior="end"),  # per invocation
+            ToolCallLimitMiddleware(run_limit=20),
+            tool_safety,
+        ],
+    )
+```
+:::
 
 ---
 
 ## Install Dependencies
 
 ```bash
-pip install langgraph langchain-openai langchain-core pydantic
+pip install langchain langgraph langchain-openai langchain-core pydantic
 ```
 
 ---
@@ -46,8 +103,10 @@ pip install langgraph langchain-openai langchain-core pydantic
 
 from __future__ import annotations
 
+import ast
 import json
 import math
+import operator
 from datetime import datetime, timezone
 
 from langchain_core.tools import tool
@@ -62,7 +121,10 @@ class WeatherInput(BaseModel):
 
 class CalculatorInput(BaseModel):
     """Input schema for the calculator tool."""
-    expression: str = Field(description="A Python-evaluable math expression.")
+    expression: str = Field(
+        max_length=200,
+        description="Arithmetic with numbers, + - * / and parentheses only.",
+    )
 
 
 class DatabaseSearchInput(BaseModel):
@@ -99,18 +161,56 @@ def get_weather(location: str, unit: str = "celsius") -> str:
     return json.dumps({"location": location, "temperature": temp, "unit": unit, **data})
 
 
+MAX_EXPR_CHARS = 200
+MAX_EXPR_NODES = 50
+MAX_ABS_VALUE = 1e12
+
+_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def _check_number(value: object) -> float | int:
+    """Accept only finite, bounded int/float (bool is an int subclass, so reject it first)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("only numeric constants are allowed")
+    if not math.isfinite(value) or abs(value) > MAX_ABS_VALUE:
+        raise ValueError("number is not finite or exceeds the allowed magnitude")
+    return value
+
+
+def _eval_node(node: ast.AST) -> float | int:
+    if isinstance(node, ast.Constant):
+        return _check_number(node.value)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARYOPS:
+        return _check_number(_UNARYOPS[type(node.op)](_eval_node(node.operand)))
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+        return _check_number(_BINOPS[type(node.op)](_eval_node(node.left), _eval_node(node.right)))
+    # Names, attributes, calls, subscripts, exponent, comparisons, ... are all rejected.
+    raise ValueError(f"unsupported syntax: {type(node).__name__}")
+
+
+def safe_arithmetic(expression: str) -> float | int:
+    """Evaluate +, -, *, / over numeric literals with bounded size. Never calls eval()."""
+    if len(expression) > MAX_EXPR_CHARS:
+        raise ValueError("expression too long")
+    tree = ast.parse(expression.strip(), mode="eval")
+    if sum(1 for _ in ast.walk(tree)) > MAX_EXPR_NODES:
+        raise ValueError("expression too complex")
+    return _eval_node(tree.body)
+
+
 @tool(args_schema=CalculatorInput)
 def calculate(expression: str) -> str:
-    """Evaluate a mathematical expression safely and return the result."""
-    allowed = {
-        "abs": abs, "round": round, "min": min, "max": max,
-        "pow": pow, "math": math, "int": int, "float": float,
-    }
+    """Evaluate a basic arithmetic expression (+ - * / and parentheses) and return the result."""
     try:
-        result = eval(expression, {"__builtins__": {}}, allowed)
-        return json.dumps({"expression": expression, "result": result})
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
+        return json.dumps({"expression": expression, "result": safe_arithmetic(expression)})
+    except (ValueError, SyntaxError, ZeroDivisionError, RecursionError, MemoryError) as exc:
+        return json.dumps({"error": f"Invalid expression: {exc}"})
 
 
 @tool(args_schema=DatabaseSearchInput)
@@ -190,7 +290,7 @@ class ToolAgentState(BaseModel):
         default_factory=list,
         description="Ordered log of all tool invocations.",
     )
-    iteration_count: int = 0
+    iteration_count: int = 0  # model calls in the CURRENT user turn (reset by begin_turn)
     total_tool_calls: int = 0
 
     class Config:
@@ -214,16 +314,20 @@ from typing import Any
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
+from pydantic import ValidationError
 
 from state import AuditEntry, ToolAgentState
 from tools import ALL_TOOLS
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 10
 
 
-def create_agent_model(model_name: str = "gpt-4o") -> ChatOpenAI:
+def create_agent_model(model_name: str = MODEL) -> ChatOpenAI:
     """Create the LLM with all tools bound.
 
     Separated for dependency injection in tests.
@@ -245,33 +349,64 @@ async def agent_node(state: ToolAgentState) -> dict[str, Any]:
     }
 
 
-async def validate_tool_calls(state: ToolAgentState) -> dict[str, Any]:
-    """Validate tool call arguments before execution.
+async def begin_turn(state: ToolAgentState) -> dict[str, Any]:
+    """Reset the per-turn model-call budget; the checkpointed counter would otherwise accumulate."""
+    return {"iteration_count": 0}
 
-    Checks that each tool call references a known tool and that
-    required arguments are present. Invalid calls are replaced
-    with error ToolMessages so the LLM can self-correct.
+
+def _tool_error(tc: dict[str, Any], message: str) -> ToolMessage:
+    return ToolMessage(
+        content=json.dumps({"error": message}),
+        tool_call_id=tc["id"],
+        name=tc["name"],
+        status="error",
+    )
+
+
+async def validate_tool_calls(state: ToolAgentState) -> dict[str, Any]:
+    """All-or-nothing validation of the pending tool calls.
+
+    Every call must name a known tool and satisfy that tool's Pydantic input
+    schema. If ANY call is invalid, nothing is executed: each original call
+    gets exactly one error ToolMessage (the invalid ones say why, the valid
+    ones say they were skipped) and the graph routes around ToolNode.
     """
     last_message = state.messages[-1]
-    if not hasattr(last_message, "tool_calls") or not last_message.tool_calls:
+    tool_calls = getattr(last_message, "tool_calls", None)
+    if not tool_calls:
         return {}
 
-    known_tools = {t.name for t in ALL_TOOLS}
-    error_messages = []
-
-    for tc in last_message.tool_calls:
-        if tc["name"] not in known_tools:
+    tools_by_name = {t.name: t for t in ALL_TOOLS}
+    problems: dict[str, str] = {}
+    for tc in tool_calls:
+        tool = tools_by_name.get(tc["name"])
+        if tool is None:
             logger.warning("Unknown tool requested: %s", tc["name"])
-            error_messages.append(
-                ToolMessage(
-                    content=json.dumps({"error": f"Unknown tool: {tc['name']}"}),
-                    tool_call_id=tc["id"],
-                )
-            )
+            problems[tc["id"]] = f"Unknown tool: {tc['name']}"
+            continue
+        try:
+            tool.args_schema.model_validate(tc["args"])
+        except ValidationError as exc:
+            problems[tc["id"]] = f"Invalid arguments for {tc['name']}: {exc.errors(include_url=False, include_input=False)}"
 
-    if error_messages:
-        return {"messages": error_messages}
-    return {}
+    if not problems:
+        return {}
+
+    return {
+        "messages": [
+            _tool_error(
+                tc,
+                problems.get(tc["id"], "Not executed: another tool call in this batch was invalid. Fix it and resend."),
+            )
+            for tc in tool_calls
+        ]
+    }
+
+
+def route_after_validate(state: ToolAgentState) -> str:
+    """Valid batch: the last message is still the AIMessage -> run tools.
+    Rejected batch: validate appended error ToolMessages -> bypass tools."""
+    return "rejected" if isinstance(state.messages[-1], ToolMessage) else "tools"
 
 
 # Prebuilt ToolNode handles dispatch, error wrapping, and parallel execution.
@@ -310,22 +445,36 @@ async def audit_log_node(state: ToolAgentState) -> dict[str, Any]:
 
 
 def should_continue(state: ToolAgentState) -> str:
-    """Conditional edge: route to tools or finish.
-
-    Enforces iteration limits and checks for tool calls.
-    """
-    if state.iteration_count >= MAX_ITERATIONS:
-        logger.warning("Max iterations reached.")
-        return "end"
-
+    """Conditional edge: validate pending tool calls, finish, or stop at the budget."""
     last_message = state.messages[-1]
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        return "validate"
-    return "end"
+    if not getattr(last_message, "tool_calls", None):
+        return "end"
+    if state.iteration_count >= MAX_ITERATIONS:
+        logger.warning("Max iterations reached with tool calls pending.")
+        return "limit"
+    return "validate"
+
+
+async def finalize_limit(state: ToolAgentState) -> dict[str, Any]:
+    """Close out pending tool calls so the persisted history stays well-formed.
+
+    Each pending call gets one ToolMessage, then a fallback AIMessage ends the
+    turn. Without this, the next turn would start with an AIMessage whose
+    tool_calls have no results, which providers reject.
+    """
+    pending = state.messages[-1].tool_calls
+    results = [_tool_error(tc, "Not executed: the iteration limit for this turn was reached.") for tc in pending]
+    fallback = AIMessage(
+        content="I reached the tool-use limit for this request before finishing. "
+        "Please narrow the request or try again."
+    )
+    return {"messages": [*results, fallback]}
+
+
 ```
 
 :::warning Validation Before Execution
-The `validate_tool_calls` node catches invalid tool names before the `ToolNode` runs. This prevents cryptic errors and gives the LLM a structured error message to self-correct.
+The `validate_tool_calls` node checks tool names and Pydantic schemas for the whole batch before `ToolNode` runs. If any call is invalid, **no** call executes (so there are no partial side effects and no duplicate ToolMessages); the model gets one structured error per call and can resend a corrected batch. The calculator never uses `eval`: it walks the parsed AST and allows only bounded numeric literals with unary `+/-` and `+ - * /`.
 :::
 
 ---
@@ -341,7 +490,10 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from state import ToolAgentState
-from nodes import agent_node, validate_tool_calls, tool_node, audit_log_node, should_continue
+from nodes import (
+    agent_node, audit_log_node, begin_turn, finalize_limit,
+    route_after_validate, should_continue, tool_node, validate_tool_calls,
+)
 
 
 def build_tool_agent(checkpointer=None):
@@ -359,21 +511,30 @@ def build_tool_agent(checkpointer=None):
     graph = StateGraph(ToolAgentState)
 
     # -- Nodes --
+    graph.add_node("begin_turn", begin_turn)
     graph.add_node("agent", agent_node)
     graph.add_node("validate", validate_tool_calls)
     graph.add_node("tools", tool_node)
     graph.add_node("audit", audit_log_node)
+    graph.add_node("finalize_limit", finalize_limit)
 
     # -- Edges --
-    graph.add_edge(START, "agent")
+    graph.add_edge(START, "begin_turn")
+    graph.add_edge("begin_turn", "agent")
 
     graph.add_conditional_edges(
         "agent",
         should_continue,
-        {"validate": "validate", "end": END},
+        {"validate": "validate", "limit": "finalize_limit", "end": END},
     )
+    graph.add_edge("finalize_limit", END)
 
-    graph.add_edge("validate", "tools")
+    # A rejected batch bypasses `tools`: validate already answered every call.
+    graph.add_conditional_edges(
+        "validate",
+        route_after_validate,
+        {"tools": "tools", "rejected": "audit"},
+    )
     graph.add_edge("tools", "audit")
     graph.add_edge("audit", "agent")
 
@@ -449,6 +610,7 @@ if __name__ == "__main__":
     asyncio.run(run_conversation())
 ```
 
+
 ---
 
 ## Step 6: Dynamic Tool Selection
@@ -466,6 +628,9 @@ from pydantic import BaseModel, Field
 
 from state import ToolAgentState
 from tools import ALL_TOOLS
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 
 class ToolSelection(BaseModel):
@@ -482,7 +647,7 @@ async def dynamic_tool_selector(state: ToolAgentState) -> dict[str, Any]:
     This reduces the tool schema size in the prompt, improving
     accuracy for models that struggle with large tool sets.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(ToolSelection)
 
     last_human = None
@@ -506,7 +671,7 @@ async def dynamic_tool_selector(state: ToolAgentState) -> dict[str, Any]:
         selected = ALL_TOOLS  # Fallback to all tools
 
     # Rebind the model with the reduced tool set
-    model = ChatOpenAI(model="gpt-4o", temperature=0.0).bind_tools(selected)
+    model = ChatOpenAI(model=os.environ["AGENT_MODEL"], temperature=0.0).bind_tools(selected)
     response = await model.ainvoke(state.messages)
 
     return {"messages": [response]}
@@ -537,8 +702,10 @@ class UsageTracker(BaseModel):
     completion_tokens: int = 0
     tool_calls_count: int = 0
     api_calls_count: int = 0
-    cost_per_1k_prompt: float = Field(default=0.0025, description="GPT-4o pricing")
-    cost_per_1k_completion: float = Field(default=0.01)
+    # USD per 1M tokens, required and non-negative: build from PRICING_INPUT_PER_MILLION /
+    # PRICING_OUTPUT_PER_MILLION (your pricing config). There are deliberately no defaults.
+    price_in_per_million: float = Field(ge=0, description="USD per 1M prompt tokens")
+    price_out_per_million: float = Field(ge=0, description="USD per 1M completion tokens")
 
     @property
     def total_tokens(self) -> int:
@@ -547,9 +714,9 @@ class UsageTracker(BaseModel):
     @property
     def estimated_cost(self) -> float:
         return (
-            (self.prompt_tokens / 1000) * self.cost_per_1k_prompt
-            + (self.completion_tokens / 1000) * self.cost_per_1k_completion
-        )
+            self.prompt_tokens * self.price_in_per_million
+            + self.completion_tokens * self.price_out_per_million
+        ) / 1_000_000
 
     def summary(self) -> str:
         return (
@@ -592,7 +759,7 @@ class RateLimiter:
 :::tip Interview Talking Points
 1. **LangGraph's `ToolNode` is production-ready.** It handles dispatch, error wrapping, and parallel execution out of the box -- no custom tool loop needed.
 2. **Pydantic tool schemas are self-documenting.** The model receives structured descriptions, reducing hallucinated arguments compared to plain-text descriptions.
-3. **Validation before execution** catches invalid calls early and gives the LLM a structured error to self-correct, rather than a Python traceback.
+3. **All-or-nothing validation before execution** rejects a whole batch if any call is invalid, so there are no partial side effects, and gives the LLM a structured error to self-correct. Never `eval` model-provided text: use a bounded AST evaluator.
 4. **Audit logging is non-negotiable in enterprise.** Every tool call must be recorded for compliance, debugging, and cost attribution.
 5. **Multi-turn memory via checkpointing** means the agent remembers context across messages without manually threading conversation history.
 6. **Dynamic tool selection** reduces prompt size and improves accuracy when the tool set is large.

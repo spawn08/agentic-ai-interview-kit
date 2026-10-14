@@ -2,6 +2,7 @@
 sidebar_position: 3
 title: "Project: Code Assistant Agent"
 description: "Build a code assistant agent with custom implementation — repo indexing, context building, multi-file editing, and test-driven iteration"
+last_verified: 2026-10-12
 ---
 
 # Project: Code Assistant Agent
@@ -54,7 +55,8 @@ pip install openai chromadb tiktoken python-dotenv
 `.env`:
 ```bash
 OPENAI_API_KEY=your-key
-OPENAI_MODEL=gpt-4o
+AGENT_MODEL=<standard-tier model id>
+AGENT_EMBEDDING_MODEL=<embedding model id>
 ```
 
 ---
@@ -78,8 +80,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-EMBEDDING_MODEL = "text-embedding-3-small"
+OPENAI_MODEL = os.environ["AGENT_MODEL"]
+EMBEDDING_MODEL = os.environ["AGENT_EMBEDDING_MODEL"]
 MAX_FIX_ITERATIONS = 3
 MAX_CONTEXT_TOKENS = 12000
 CHROMA_COLLECTION = "repo_index"
@@ -239,7 +241,7 @@ class RepoIndexer:
     """Index a repository into ChromaDB for semantic retrieval.
 
     Walks the file tree, extracts symbols and imports, chunks files,
-    generates embeddings via the OpenAI API, and stores everything
+    generates embeddings vithe OpenAI API, and stores everything
     in a local ChromaDB collection.
     """
 

@@ -1,15 +1,20 @@
 ---
 sidebar_position: 2
 title: "LangGraph Deep Dive"
+last_verified: 2026-10-12
 ---
 
 # LangGraph Deep Dive
 
-LangGraph is a framework for building stateful, multi-actor agent applications as directed graphs. Built on top of LangChain primitives, it gives you explicit control over agent control flow, state management, and human-in-the-loop interactions that the older `AgentExecutor` pattern cannot provide.
+LangGraph is a framework for building stateful, multi-actor agent applications as directed graphs. Built on top of LangChain primitives, it gives you explicit control over agent control flow, state management, and human-in-the-loop interactions that a standard agent loop does not expose. LangChain's `create_agent` is built on LangGraph, so you can start with `create_agent` and middleware and drop to a custom `StateGraph` when the topology demands it.
 
-## Why LangGraph Over LangChain Agents?
+:::note Example verification
+The Python snippets are illustrative, syntax- and import-checked with the versions recorded in `reports/batch-2.md`. They are not a fully executed application; assemble the snippets, supply the declared model configuration, and test persistence and approval behavior in your environment before deployment.
+:::
 
-The classic LangChain `AgentExecutor` runs a simple loop: call the LLM, execute tools, repeat until done. This works for straightforward tasks but falls apart when you need:
+## Why LangGraph Over `create_agent`?
+
+LangChain's `create_agent` runs a standard loop: call the model, execute tools, repeat until done, with middleware hooks (`before_model`, `wrap_tool_call`, `after_model`, ...) for summarization, approvals, retries, and guardrails. Reach for a custom `StateGraph` when the topology itself is non-standard:
 
 - **Conditional branching** -- different paths based on intermediate results.
 - **Cycles and loops** -- retrying a step or looping through refinement.
@@ -20,7 +25,9 @@ The classic LangChain `AgentExecutor` runs a simple loop: call the LLM, execute 
 LangGraph addresses all of these by modeling your application as a **state graph** where nodes are functions and edges define the flow between them.
 
 :::info Key Insight
-Think of LangGraph as "React patterns for agents." Where `AgentExecutor` is an implicit loop, LangGraph makes every decision point, branch, and cycle explicit in your graph definition.
+Think of LangGraph as "React patterns for agents." Where `create_agent` gives you a ready-made loop customized through middleware, LangGraph lets you make every decision point, branch, and cycle explicit in your graph definition. The two compose: a `create_agent` agent can be a node in a `StateGraph`.
+
+(The pre-v1 `AgentExecutor` now lives in `langchain-classic` and is legacy.)
 :::
 
 ## Architecture: State Graphs
@@ -67,9 +74,10 @@ The `add_messages` reducer appends new messages to the existing list rather than
 Here is a full LangGraph agent with tool calling, conditional routing, and a maximum iteration guard.
 
 ```python
+import os
 from typing import Annotated, TypedDict, Literal
+from langchain.chat_models import init_chat_model
 from langchain_core.messages import BaseMessage, HumanMessage
-from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -93,7 +101,7 @@ def run_sql(query: str) -> str:
 tools = [search_docs, run_sql]
 
 # --- Nodes ---
-llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(tools)
+llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0).bind_tools(tools)
 
 def agent_node(state: AgentState) -> dict:
     """The reasoning node -- calls the LLM with the current message history."""

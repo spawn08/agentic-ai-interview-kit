@@ -1,0 +1,6 @@
+# Tier 1 / openai-responses-and-agents-sdk.md. Own environment; floors only (latest otherwise).
+# Run: python examples/langchain-v1/check_doc_imports.py docs/frameworks/openai-responses-and-agents-sdk.md
+#      pytest examples/tier1/openai
+openai
+openai-agents
+pytest

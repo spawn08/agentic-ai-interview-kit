@@ -2,6 +2,7 @@
 sidebar_position: 2
 title: "Prompting Techniques"
 description: "Zero-shot, few-shot, chain-of-thought, prompt templates, structured output, and prompt chaining"
+last_verified: 2026-10-12
 ---
 
 # Prompting Techniques
@@ -35,12 +36,14 @@ As you move from left to right, prompts become more complex but also more reliab
 A **zero-shot** prompt provides the task description with no examples. The model relies entirely on its pre-training knowledge.
 
 ```python
+import os
+
 from openai import OpenAI
 
-client = OpenAI()
+client = OpenAI()  # AGENT_MODEL holds the model ID used by every example below
 
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model=os.environ["AGENT_MODEL"],
     messages=[
         {
             "role": "user",
@@ -69,8 +72,10 @@ Zero-shot prompting is unreliable for nuanced tasks. The model may interpret the
 **Few-shot** prompting includes examples of the desired input-output behavior directly in the prompt. This dramatically improves consistency and accuracy.
 
 ```python
+import os
+
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model=os.environ["AGENT_MODEL"],
     messages=[
         {
             "role": "system",
@@ -134,8 +139,10 @@ Few-shot examples consume context tokens. For agentic systems where context is p
 ### Standard CoT
 
 ```python
+import os
+
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model=os.environ["AGENT_MODEL"],
     messages=[
         {
             "role": "system",
@@ -340,8 +347,10 @@ For agentic systems, you almost always need the model to return **structured dat
 ### JSON Mode
 
 ```python
+import os
+
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model=os.environ["AGENT_MODEL"],
     messages=[
         {
             "role": "system",
@@ -372,9 +381,13 @@ print(json.dumps(result, indent=2))
 
 ### Structured Outputs with Pydantic Schema
 
+The OpenAI docs (structured outputs guide, checked 2026-10-12) show `client.chat.completions.parse(...)` for Chat Completions and `client.responses.parse(...)` (with `text_format=`) for the Responses API. The older `client.beta.chat.completions.parse` path is the pre-GA location; prefer the non-`beta` one.
+
 ```python
+# illustrative: needs a model with structured-output support
 from pydantic import BaseModel
 from typing import Literal
+import os
 
 
 class ToolCall(BaseModel):
@@ -389,8 +402,8 @@ class AgentResponse(BaseModel):
     final_answer: str | None
 
 
-response = client.beta.chat.completions.parse(
-    model="gpt-4o",
+response = client.chat.completions.parse(
+    model=os.environ["AGENT_MODEL"],
     messages=[
         {
             "role": "system",
@@ -435,12 +448,14 @@ graph LR
 ### Example: Research Pipeline
 
 ```python
+import os
+
 def research_pipeline(question: str) -> str:
     """A simple prompt chain for research questions."""
 
     # Step 1: Decompose the question into sub-questions
     decomposition = client.chat.completions.create(
-        model="gpt-4o",
+        model=os.environ["AGENT_MODEL"],
         messages=[
             {
                 "role": "system",
@@ -460,7 +475,7 @@ def research_pipeline(question: str) -> str:
     findings = []
     for sq in sub_questions:
         research = client.chat.completions.create(
-            model="gpt-4o",
+            model=os.environ["AGENT_MODEL"],
             messages=[
                 {
                     "role": "system",
@@ -478,7 +493,7 @@ def research_pipeline(question: str) -> str:
 
     # Step 3: Synthesize findings into a coherent answer
     synthesis = client.chat.completions.create(
-        model="gpt-4o",
+        model=os.environ["AGENT_MODEL"],
         messages=[
             {
                 "role": "system",

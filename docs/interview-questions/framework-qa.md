@@ -1,15 +1,16 @@
 ---
 sidebar_position: 5
 title: "Framework Questions"
-description: "15 Q&A comparing and questioning LangChain, LangGraph, CrewAI, AutoGen, and other agentic AI frameworks."
+description: "19 Q&A comparing and questioning LangChain, LangGraph, CrewAI, LlamaIndex, Microsoft Agent Framework, and other current agentic AI frameworks (with AutoGen and Semantic Kernel as legacy context)."
+last_verified: 2026-10-12
 ---
 
 # Framework Questions
 
-These 15 questions test your practical knowledge of the major agentic AI frameworks. Interviewers want to see that you have hands-on experience, understand the trade-offs between frameworks, and can make informed technology choices.
+These 19 questions test your practical knowledge of the major agentic AI frameworks. Interviewers want to see that you have hands-on experience, understand the trade-offs between frameworks, and can make informed technology choices.
 
 :::info Framework Landscape (as of early 2026)
-The major frameworks are: **LangChain** (orchestration primitives), **LangGraph** (stateful graph workflows), **LlamaIndex** (data-centric agents), **CrewAI** (multi-agent collaboration), **AutoGen/AG2** (conversational multi-agent), **OpenAI Agents SDK** (native OpenAI agent runtime), and **Semantic Kernel** (Microsoft's enterprise SDK). Each has a sweet spot.
+The current framework taxonomy (see the [Framework Comparison](../frameworks/framework-comparison.md)): **LangChain** (high-level agents and integrations), **LangGraph** (stateful graphs, durable execution), **CrewAI** (role/task Crews and event-driven Flows), **Microsoft Agent Framework** (Microsoft's successor to AutoGen and Semantic Kernel), **LlamaIndex** (workflow-based, data-centric agents), **OpenAI Agents SDK**, **Claude Agent SDK**, **Google ADK**, and **PydanticAI** (typed agents). **AutoGen** and **Semantic Kernel** are legacy: AutoGen is in maintenance mode and Semantic Kernel has Microsoft Agent Framework as its successor (verified 2026-10-12; no dates are claimed). Each has a sweet spot.
 :::
 
 ---
@@ -30,7 +31,7 @@ LangChain is a Python (and TypeScript) framework that provides composable buildi
 <details>
 <summary>View Answer</summary>
 
-LangGraph is a library built on top of LangChain that models agent workflows as **directed graphs with state**. While LangChain's `AgentExecutor` runs an implicit loop (call LLM, maybe call tool, repeat), LangGraph makes the control flow explicit: you define nodes (processing steps), edges (transitions), and conditional edges (branching logic). Key differentiators: (1) **explicit state management** -- state is a typed dictionary that flows through the graph, with reducer functions for merging; (2) **persistent checkpointing** -- state is saved at each step, enabling pause/resume, time-travel debugging, and human-in-the-loop; (3) **cycles and branching** -- unlike chains, LangGraph supports loops (retry patterns) and conditional branching natively; (4) **streaming** -- you can stream the execution of the graph, observing each node's output in real time. Use LangGraph when: you need complex, multi-step workflows with branching logic; you need HITL approval gates; you need state persistence across sessions; or you need fine-grained control over the agent's execution flow. Stick with simple LangChain chains for straightforward, linear pipelines.
+LangGraph is a library built on top of LangChain that models agent workflows as **directed graphs with state**. LangChain's `create_agent` (which runs on LangGraph) provides a ready-made loop (call model, maybe call tools, repeat) that you customize with **middleware** hooks such as `before_model`, `wrap_tool_call`, and `after_model`. When the topology itself is custom, a LangGraph `StateGraph` makes the control flow explicit: you define nodes (processing steps), edges (transitions), and conditional edges (branching logic). Key differentiators: (1) **explicit state management** -- state is a typed dictionary that flows through the graph, with reducer functions for merging; (2) **persistent checkpointing** -- state is saved at each step, enabling pause/resume, time-travel debugging, and human-in-the-loop; (3) **cycles and branching** -- unlike chains, LangGraph supports loops (retry patterns) and conditional branching natively; (4) **streaming** -- you can stream the execution of the graph, observing each node's output in real time. Use LangGraph when: you need complex, multi-step workflows with branching logic; you need HITL approval gates; you need state persistence across sessions; or you need fine-grained control over the agent's execution flow. Stick with simple LangChain chains for straightforward, linear pipelines.
 
 </details>
 
@@ -74,7 +75,7 @@ The OpenAI Agents SDK is OpenAI's official framework for building agents using t
 <details>
 <summary>View Answer</summary>
 
-LlamaIndex is a **data-centric** framework, while LangChain is an **orchestration-centric** framework. LlamaIndex excels at connecting LLMs to data: it provides sophisticated document loaders, index structures (vector, keyword, tree, knowledge graph), query engines, and retrieval strategies. Its agent capabilities (via `ReActAgent` and `OpenAIAgent`) are built on top of this data infrastructure. Key differences: (1) **indexing flexibility** -- LlamaIndex offers multiple index types beyond simple vector stores, including summary indexes, tree indexes, and composable indexes; (2) **query pipelines** -- structured query transformation and routing; (3) **data agents** -- agents that specialize in querying and synthesizing from structured and unstructured data; (4) **sub-question query engine** -- automatically decomposes complex queries into sub-questions targeted at different data sources. Choose LlamaIndex when your application is primarily about querying and synthesizing from complex data sources (multiple document collections, databases, APIs). Choose LangChain/LangGraph when your application is primarily about orchestrating tools, managing workflows, and handling complex control flow. In practice, many production systems use both: LlamaIndex for the data/retrieval layer and LangChain/LangGraph for the agent orchestration layer.
+LlamaIndex is a **data-centric** framework, while LangChain is an **orchestration-centric** framework. LlamaIndex excels at connecting LLMs to data: it provides sophisticated document loaders, index structures (vector, keyword, tree, knowledge graph), query engines, and retrieval strategies. Its agent capabilities are built on top of this data infrastructure and, in current LlamaIndex, run on Workflows: `FunctionAgent` (uses the LLM provider's function/tool-calling capability), `ReActAgent` and `CodeActAgent` (other prompting strategies for executing tools), and `AgentWorkflow` (combines agents that hand off control to each other). Key differences: (1) **indexing flexibility** -- LlamaIndex offers multiple index types beyond simple vector stores, including summary indexes, tree indexes, and composable indexes; (2) **query pipelines** -- structured query transformation and routing; (3) **data agents** -- agents that specialize in querying and synthesizing from structured and unstructured data; (4) **sub-question query engine** -- automatically decomposes complex queries into sub-questions targeted at different data sources. Choose LlamaIndex when your application is primarily about querying and synthesizing from complex data sources (multiple document collections, databases, APIs). Choose LangChain/LangGraph when your application is primarily about orchestrating tools, managing workflows, and handling complex control flow. In practice, many production systems use both: LlamaIndex for the data/retrieval layer and LangChain/LangGraph for the agent orchestration layer.
 
 </details>
 
@@ -140,7 +141,7 @@ Each framework has its own approach to tool definition. **OpenAI API**: JSON Sch
 <details>
 <summary>View Answer</summary>
 
-**LangChain/LangGraph**: `handle_parsing_errors=True` on AgentExecutor automatically retries with a correction prompt when output parsing fails. LangGraph adds graph-level error handling: you can define error nodes and error edges, and the checkpointer allows manual state correction and replay. **CrewAI**: Agents have `max_iter` (iteration limit) and `max_retry_limit` parameters. The framework automatically retries failed tool calls and LLM calls. For task-level errors, you can define fallback tasks. **AutoGen**: Error handling is conversational -- if an agent produces an error, the other agents in the group chat see it and can respond. Code execution errors are returned to the AssistantAgent, which can fix the code. The UserProxyAgent can intervene if auto-retry fails. **OpenAI Agents SDK**: Built-in retry logic for API errors and rate limits. Guardrails can catch and handle invalid outputs before they reach the user. The practical recommendation for interviews: framework-level error handling is a starting point, not a complete solution. Production systems need additional layers: circuit breakers for external services, dead letter queues for messages that repeatedly fail, structured logging for debugging, and alerting on error rate spikes.
+**LangChain/LangGraph**: with `create_agent`, tool errors are handled in middleware (`wrap_tool_call`, or built-ins such as `ToolRetryMiddleware` and `ModelRetryMiddleware`), and with native tool calling there is no text format to mis-parse; schema validation failures on tool arguments come back to the model as error messages it can correct. (The old `AgentExecutor` `handle_parsing_errors=True` option exists only in legacy `langchain-classic`.) A custom LangGraph `StateGraph` adds graph-level error handling: you can define error nodes and error edges, and the checkpointer allows manual state correction and replay. **CrewAI**: Agents have `max_iter` (iteration limit) and `max_retry_limit` parameters. The framework automatically retries failed tool calls and LLM calls. For task-level errors, you can define fallback tasks. **AutoGen**: Error handling is conversational -- if an agent produces an error, the other agents in the group chat see it and can respond. Code execution errors are returned to the AssistantAgent, which can fix the code. The UserProxyAgent can intervene if auto-retry fails. **OpenAI Agents SDK**: Built-in retry logic for API errors and rate limits. Guardrails can catch and handle invalid outputs before they reach the user. The practical recommendation for interviews: framework-level error handling is a starting point, not a complete solution. Production systems need additional layers: circuit breakers for external services, dead letter queues for messages that repeatedly fail, structured logging for debugging, and alerting on error rate spikes.
 
 </details>
 
@@ -173,6 +174,62 @@ LCEL is a declarative composition syntax introduced in LangChain to replace the 
 <details>
 <summary>View Answer</summary>
 
-For a production agentic AI system in early 2026, the recommended stack is: **LLM Provider**: OpenAI GPT-4o for complex reasoning, GPT-4o-mini for simple tasks, with Anthropic Claude as a fallback provider. Consider open-source models (Llama 3) for cost-sensitive or privacy-sensitive components. **Orchestration**: LangGraph for the agent workflow, with explicit state management and checkpointing. **Retrieval**: LlamaIndex for document processing and indexing, with a hybrid search strategy (vector + BM25). **Vector Store**: Qdrant or Weaviate for production (managed options available), ChromaDB for development. **Memory**: Redis for session state, PostgreSQL for long-term memory, vector store for semantic memory. **Observability**: LangSmith for development and testing, OpenTelemetry + Grafana for production monitoring. **Evaluation**: Custom evaluation harness with LLM-as-judge scoring, integrated into CI/CD. **Guardrails**: Input validation (prompt injection detection), output validation (content moderation), and tool-level authorization. **Deployment**: Containerized (Docker/Kubernetes) with autoscaling based on queue depth. This stack optimizes for production readiness, observability, and flexibility. The key principle is to use frameworks where they add value (integrations, state management) and bypass them where they add unnecessary complexity (simple API calls, custom tools).
+For a production agentic AI system in early 2026, the recommended stack is: **LLM Provider**: a standard-tier model (`AGENT_MODEL`) for complex reasoning, a fast-tier model (`AGENT_MODEL_FAST`) for simple tasks, with a second provider's model (`AGENT_MODEL_ALT`) as a fallback. Consider open-source models (Llama 3) for cost-sensitive or privacy-sensitive components. **Orchestration**: LangGraph for the agent workflow, with explicit state management and checkpointing. **Retrieval**: LlamaIndex for document processing and indexing, with a hybrid search strategy (vector + BM25). **Vector Store**: Qdrant or Weaviate for production (managed options available), ChromaDB for development. **Memory**: Redis for session state, PostgreSQL for long-term memory, vector store for semantic memory. **Observability**: LangSmith for development and testing, OpenTelemetry + Grafana for production monitoring. **Evaluation**: Custom evaluation harness with LLM-as-judge scoring, integrated into CI/CD. **Guardrails**: Input validation (prompt injection detection), output validation (content moderation), and tool-level authorization. **Deployment**: Containerized (Docker/Kubernetes) with autoscaling based on queue depth. This stack optimizes for production readiness, observability, and flexibility. The key principle is to use frameworks where they add value (integrations, state management) and bypass them where they add unnecessary complexity (simple API calls, custom tools).
 
 </details>
+
+---
+
+## Q16. How do frameworks expose native (provider-run) tools, and what should you check?
+
+**Level: Mid**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** Check whether the framework passes the provider's built-in tools (web search, code execution, remote MCP) through to the API, or only supports tools you define. If it does not, you either wrap the capability as a client tool or call the provider SDK directly.
+
+**2-minute answer:** Native tool support is provider-specific: OpenAI's tools guide lists built-ins such as web search, file search, code interpreter, computer use, and remote MCP; Claude's tool docs describe server tools Anthropic executes, such as web search. A framework abstraction may expose some, all, or none of them, and its tracing and guardrail hooks may not see calls executed by the vendor. Checklist: (1) does the framework version you use expose the tool and its result blocks; (2) do your traces and logs capture vendor-executed calls; (3) can you restrict the tool (domains, usage limits); (4) what happens when you switch providers -- native tools do not port, so isolate them behind your own interface. Confirm against the framework's current docs rather than assuming.
+
+</details>
+
+## Q17. How do current frameworks relate to MCP, and why does the spec version matter?
+
+**Level: Mid**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** Most frameworks act as MCP clients through an adapter or SDK. The spec version matters because the 2026-07-28 revision is stateless (no initialize handshake or protocol sessions), so a client or server written for an older revision may need an update to interoperate.
+
+**2-minute answer:** In a framework, MCP tools typically appear as ordinary tools after an adapter converts them. Questions to ask: which MCP spec revision does the framework's MCP client implement; does it assume a persistent session (for example, caching tool lists per connection or relying on connection-scoped state); and how does it handle server-minted handles. Do not state that a framework "supports MCP" without a version -- say, for example, "supports the 2026-07-28 revision" only after checking its release notes. Operationally: pin versions of the framework and MCP SDK, test against the servers you actually use, and treat third-party MCP servers as untrusted supply chain (OWASP lists agentic supply-chain vulnerabilities as ASI04).
+
+</details>
+
+## Q18. Does your framework let you control reasoning effort, and what happens if it does not?
+
+**Level: Mid**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** Check that the framework forwards the provider's effort or reasoning setting to the API. If it does not, the setting never reaches the model and you get the default, so you may pay for more reasoning than needed or get less than required.
+
+**2-minute answer:** Effort and thinking controls are provider API parameters (for example, Claude's `output_config.effort`, with levels whose availability varies by model). Framework wrappers differ in whether they expose them as first-class options, pass-through keyword arguments, or not at all, and in whether they preserve the provider's thinking output across tool-call turns. Verify by inspecting the actual request (via tracing or a proxy) rather than trusting the constructor argument. Consider making effort a per-node setting in graph frameworks: cheap for routing and formatting nodes, higher for planning and verification nodes. And record the effort level in traces so cost and quality can be compared across runs.
+
+</details>
+
+## Q19. How do you attribute a result to the framework, the model, or your harness code?
+
+**Level: Senior**
+
+<details>
+<summary>View Answer</summary>
+
+**30-second answer:** The framework is part of your harness, not a separate layer to blame or credit. To attribute, vary one thing at a time: same model with different orchestration code, then same orchestration code with a different model, on one fixed eval set.
+
+**2-minute answer:** Frameworks decide defaults that quietly affect results: prompt templates, how context is trimmed, retry behavior, how tool errors are surfaced, and what state is persisted. So a result like "LangGraph beat CrewAI" usually means "this harness design with these defaults beat that one". To make a defensible comparison: (1) fix the model, tools, and eval; (2) disable or standardize framework defaults you do not control (prompts, retries, truncation); (3) run multiple trials and report variance and cost per success; (4) inspect traces to confirm the framework did what you think it did. If a migration improves results, check whether it was the framework or the rewrite you did while migrating. Frameworks mainly buy you speed of development, observability, and persistence; they do not by themselves make the model smarter.
+
+</details>
+
+*Sources (checked 2026-10-12): [Claude tool use overview](https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview), [OpenAI tools guide](https://developers.openai.com/api/docs/guides/tools), [MCP specification 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) and its [changelog](https://modelcontextprotocol.io/specification/2026-07-28/changelog), [Claude effort](https://platform.claude.com/docs/en/build-with-claude/effort) and [adaptive thinking](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost), [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents).*

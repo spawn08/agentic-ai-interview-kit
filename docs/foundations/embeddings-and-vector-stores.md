@@ -2,6 +2,7 @@
 sidebar_position: 3
 title: "Embeddings & Vector Stores"
 description: "Embedding models, similarity search, vector databases, and indexing strategies"
+last_verified: 2026-10-12
 ---
 
 # Embeddings and Vector Stores
@@ -42,7 +43,7 @@ graph LR
 
 Key properties of embeddings:
 
-- **Fixed dimensionality** -- regardless of input length, the output vector has a fixed number of dimensions (e.g., 1536 for OpenAI `text-embedding-3-small`).
+- **Fixed dimensionality** -- regardless of input length, the output vector has a fixed number of dimensions (set by the model; read it from the model card).
 - **Semantic capture** -- embeddings encode meaning, not just surface-level word overlap. "Dog" and "puppy" will have high similarity. "Bank" (financial) and "bank" (river) will differ based on context.
 - **Composability** -- you can embed sentences, paragraphs, or entire documents.
 
@@ -50,15 +51,16 @@ Key properties of embeddings:
 
 ## Embedding Models
 
-| Model | Provider | Dimensions | Max Tokens | Use Case |
-|---|---|---|---|---|
-| `text-embedding-3-small` | OpenAI | 1536 | 8,191 | Cost-effective general purpose |
-| `text-embedding-3-large` | OpenAI | 3072 | 8,191 | High-accuracy retrieval |
-| `all-MiniLM-L6-v2` | Sentence Transformers | 384 | 256 | Fast, local, lightweight |
-| `all-mpnet-base-v2` | Sentence Transformers | 768 | 384 | Best quality open-source |
-| `bge-large-en-v1.5` | BAAI | 1024 | 512 | Top MTEB benchmark performer |
-| `Cohere embed-v3` | Cohere | 1024 | 512 | Multi-language support |
-| `voyage-3` | Voyage AI | 1024 | 32,000 | Long-context embeddings |
+| Model class | Typical Dimensions | Use Case |
+|---|---|---|
+| Hosted API, small | hundreds to ~1.5K | Cost-effective general purpose |
+| Hosted API, large | ~1.5K-3K+ | High-accuracy retrieval |
+| Local sentence-transformers, small | a few hundred | Fast, local, lightweight |
+| Local, base/large open-weight | ~768-1K | Best open-source quality; top MTEB performers |
+| Hosted multilingual | ~1K | Multi-language support |
+| Hosted long-context | ~1K | Long-document embeddings |
+
+Specific IDs, dimensions, and token limits change; set the hosted-API model via `AGENT_EMBEDDING_MODEL` (OpenAI, Google, ...) and a local SentenceTransformer model via the separate `AGENT_LOCAL_EMBEDDING_MODEL`, and read its dimension and max-token limit from the vendor's model card (see the [shared model reference](../index.md#model-and-price-reference)).
 
 :::tip Choosing an Embedding Model
 For agentic systems, the most important factors are: (1) **retrieval accuracy** on your specific domain, (2) **latency** for real-time tool use, and (3) **cost** at your expected query volume. Run benchmarks on your own data before committing to a model.
@@ -71,12 +73,16 @@ For agentic systems, the most important factors are: (1) **retrieval accuracy** 
 ### Using the OpenAI API
 
 ```python
+import os
 from openai import OpenAI
+
+EMBEDDING_MODEL = os.environ["AGENT_EMBEDDING_MODEL"]
+
 
 client = OpenAI()
 
 
-def get_embeddings(texts: list[str], model: str = "text-embedding-3-small") -> list[list[float]]:
+def get_embeddings(texts: list[str], model: str = EMBEDDING_MODEL) -> list[list[float]]:
     """Generate embeddings for a list of texts."""
     response = client.embeddings.create(
         input=texts,
@@ -96,7 +102,7 @@ embeddings = get_embeddings(documents)
 print(f"Number of embeddings: {len(embeddings)}")
 print(f"Embedding dimensions: {len(embeddings[0])}")
 # Output: Number of embeddings: 3
-# Output: Embedding dimensions: 1536
+# Output: Embedding dimensions: <set by your model; use this value for any index or column>
 ```
 
 ### Using Sentence Transformers (Local, Free)
@@ -104,8 +110,9 @@ print(f"Embedding dimensions: {len(embeddings[0])}")
 ```python
 from sentence_transformers import SentenceTransformer
 import numpy as np
+import os
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer(os.environ["AGENT_LOCAL_EMBEDDING_MODEL"])
 
 documents = [
     "Retrieval-Augmented Generation combines search with LLM generation.",
@@ -114,7 +121,7 @@ documents = [
 ]
 
 embeddings = model.encode(documents)
-print(f"Shape: {embeddings.shape}")  # (3, 384)
+print(f"Shape: {embeddings.shape}")  # (3, <dimension of your local model>)
 ```
 
 ---
@@ -239,8 +246,9 @@ graph TB
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import os
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer(os.environ["AGENT_LOCAL_EMBEDDING_MODEL"])
 
 # Prepare documents and embeddings
 documents = [
@@ -253,7 +261,7 @@ documents = [
 embeddings = model.encode(documents).astype("float32")
 
 # Build FAISS index
-dimension = embeddings.shape[1]  # 384
+dimension = embeddings.shape[1]  # read from the actual embeddings, never hardcoded
 index = faiss.IndexFlatL2(dimension)  # Exact search (L2 distance)
 index.add(embeddings)
 
@@ -272,11 +280,12 @@ for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
 ```python
 import chromadb
 from chromadb.utils import embedding_functions
+import os
 
 # Initialize client and embedding function
 client = chromadb.Client()
 ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
+    model_name=os.environ["AGENT_LOCAL_EMBEDDING_MODEL"]
 )
 
 # Create collection
@@ -338,7 +347,7 @@ graph LR
 ```
 
 :::warning HNSW Memory Usage
-HNSW indexes store the full vector data plus a graph structure in memory. For 1 million 1536-dimensional vectors (float32), expect approximately 6 GB of RAM for vectors alone, plus 2-4 GB for the graph. Plan your infrastructure accordingly.
+HNSW indexes store the full vector data plus a graph structure in memory. For 1 million vectors of 1536 dimensions (float32; an illustrative size -- substitute your model's dimension), expect approximately 6 GB of RAM for vectors alone, plus 2-4 GB for the graph. Plan your infrastructure accordingly.
 :::
 
 <details>
@@ -452,14 +461,14 @@ There are two approaches to filtered search: **pre-filtering** (filter first, th
 <details>
 <summary><strong>Q: You are building a RAG system for a 10-million-document corpus. Walk me through your vector database selection and indexing strategy.</strong></summary>
 
-At 10M documents, I would choose a production-grade vector database like Qdrant or Milvus, or Pinecone if managed infrastructure is preferred. For the index, I would use HNSW if memory permits (~60 GB for 10M x 1536-dim vectors), or IVF-PQ if memory is constrained. I would chunk documents to 512 tokens, use a high-quality embedding model (text-embedding-3-large or bge-large), and build metadata indices for common filter fields. I would also implement a re-ranking stage using a cross-encoder model to improve precision in the final results.
+At 10M documents, I would choose a production-grade vector database like Qdrant or Milvus, or Pinecone if managed infrastructure is preferred. For the index, I would use HNSW if memory permits (~60 GB for 10M x 1536-dim vectors), or IVF-PQ if memory is constrained. I would chunk documents to 512 tokens, use a high-quality embedding model (a large hosted or open-weight model, set via `AGENT_EMBEDDING_MODEL`), and build metadata indices for common filter fields. I would also implement a re-ranking stage using a cross-encoder model to improve precision in the final results.
 
 </details>
 
 <details>
 <summary><strong>Q: Why might cosine similarity return unexpected results for very short texts?</strong></summary>
 
-Short texts (1-3 words) produce embeddings that are heavily influenced by the model's global semantic space rather than the specific meaning of those words. The embedding of "bank" might end up equidistant between financial and river contexts. Additionally, short texts have less information for the model to create a discriminative embedding. Mitigation: expand short queries with context (e.g., "bank: financial institution" instead of just "bank"), or use a model specifically trained for short-text similarity like `all-MiniLM-L6-v2`.
+Short texts (1-3 words) produce embeddings that are heavily influenced by the model's global semantic space rather than the specific meaning of those words. The embedding of "bank" might end up equidistant between financial and river contexts. Additionally, short texts have less information for the model to create a discriminative embedding. Mitigation: expand short queries with context (e.g., "bank: financial institution" instead of just "bank"), or use a model specifically trained for short-text similarity like a small local sentence-transformers model.
 
 </details>
 

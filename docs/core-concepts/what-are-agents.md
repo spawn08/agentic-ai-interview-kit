@@ -2,7 +2,10 @@
 sidebar_position: 1
 title: What Are AI Agents?
 description: Understanding AI agents, the autonomy spectrum, key properties, and how agents differ from chatbots, workflows, and pipelines.
+last_verified: 2026-10-12
 ---
+
+import DiagramEmbed from '@site/src/components/DiagramEmbed';
 
 # What Are AI Agents?
 
@@ -176,11 +179,38 @@ Start with the simplest system that solves your problem. Do not build an agent w
 
 ---
 
+## Agent = Model + Harness
+
+A useful working definition: an **agent is a model plus a harness**. The *model* is the foundation model that reasons and chooses the next action. The *harness* is everything else that turns those choices into a reliable system: the loop, tool definitions and execution, memory and state, context management, guardrails and permissions, and observability.
+
+<DiagramEmbed src="/diagrams/model-and-harness.html" title="Agent = Model + Harness">
+  The model proposes actions; the harness owns approval and execution. The policy gate is
+  harness-owned even though it shares a layout lane with the model. State and evaluation are
+  drawn as side branches for clarity; production loops also read memory and trace every step.
+  This is the continuing tool-action loop; completion and stop conditions appear in the Agent Loop above.
+</DiagramEmbed>
+
+| Layer | Owns | Examples |
+|-------|------|----------|
+| **Model** | Reasoning quality, tool-selection judgment, how much to think per step | The LLM and its reasoning/effort settings |
+| **Harness** | Loop control, tool execution, context assembly, state persistence, permissions, stop conditions | The orchestration code, tool runtime, memory store, approval gates |
+
+This also sharpens the **agents vs. workflows** distinction. Anthropic's *Building effective agents* defines workflows as systems where LLMs and tools are orchestrated through predefined code paths, and agents as systems where the LLM dynamically directs its own process and tool usage. In harness terms: in a workflow, the **developer's code** decides the next step; in an agent, the **model** decides the next step inside a harness that bounds what it can do. Many production systems are hybrids -- a workflow skeleton with agentic steps.
+
+:::tip Interview Angle
+When a result is attributed to "the agent", ask which half changed: the model, or the harness (context assembly, tool design, retry and stop logic). Harness changes can shift results independently of the model, and they are the part you fully control; measure both with the same evals. Context assembly is the harness's hardest job -- see [Context Engineering](./context-engineering.md).
+:::
+
+*Source: Anthropic, [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents) (checked 2026-10-12; see `reports/batch-4.md`).*
+
+---
+
 ## Anatomy of a Minimal Agent in LangGraph
 
 Here is a stripped-down agent loop built with **LangGraph** to illustrate the perceive-think-act-observe cycle as an explicit state graph. LangGraph models agent control flow as a directed graph where nodes are processing steps and edges define transitions -- making the loop visible, debuggable, and extensible.
 
 ```python
+import os
 from __future__ import annotations
 
 from typing import Annotated, TypedDict
@@ -190,6 +220,9 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+
+MODEL = os.environ["AGENT_MODEL"]
+
 
 
 # --- Tools the agent can use -------------------------------------------
@@ -218,7 +251,7 @@ class AgentState(TypedDict):
 
 # --- Graph construction -------------------------------------------------
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0).bind_tools(tools)
+llm = ChatOpenAI(model=MODEL, temperature=0).bind_tools(tools)
 
 
 def think(state: AgentState) -> AgentState:
@@ -273,6 +306,7 @@ The graph above maps directly onto the perceive-think-act-observe diagram: the `
 - Agents sit at the higher end of the **autonomy spectrum**, above chatbots, workflows, and pipelines.
 - The four key properties are **perception**, **reasoning**, **action**, and **learning**.
 - Use agents when tasks require **dynamic planning and adaptive behavior** -- not for every LLM-powered feature.
+- An agent is a **model plus a harness**; workflows are developer-directed code paths, agents are model-directed within harness limits.
 
 ---
 
@@ -280,5 +314,6 @@ The graph above maps directly onto the perceive-think-act-observe diagram: the `
 
 - [Tools and Function Calling](./tools-and-function-calling.md) -- How agents interact with the outside world.
 - [Planning and Reasoning](./planning-and-reasoning.md) -- How agents decompose goals and think step by step.
+- [Context Engineering](./context-engineering.md) -- The harness's core job: deciding what the model sees each step.
 - [Memory Systems](./memory-systems.md) -- How agents remember and learn.
 - [Agent Architectures](./agent-architectures.md) -- Single-agent vs. multi-agent system design.

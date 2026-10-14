@@ -1,0 +1,10 @@
+# Tier 1 / crewai-guide.md. Own environment (crewai pins its own openai/pydantic/chromadb ranges);
+# floors only (latest otherwise). crewai-tools is large; the page imports crewai_tools.
+# docs/implementations/multi-agent-crew.md is checked here too: it imports langgraph and langchain_openai.
+# Run: python examples/langchain-v1/check_doc_imports.py docs/frameworks/crewai-guide.md docs/implementations/multi-agent-crew.md
+#      pytest examples/tier1/crewai
+crewai
+crewai-tools
+pytest
+langgraph
+langchain-openai

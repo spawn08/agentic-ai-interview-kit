@@ -2,6 +2,7 @@
 sidebar_position: 5
 title: "Fine-Tuning Overview"
 description: "When to fine-tune, LoRA, QLoRA, RLHF, DPO, and decision frameworks for choosing the right approach"
+last_verified: 2026-10-12
 ---
 
 # Fine-Tuning Overview
@@ -71,8 +72,9 @@ from transformers import (
     TrainingArguments,
 )
 from datasets import load_dataset
+import os
 
-model_name = "meta-llama/Llama-3.1-8B"
+model_name = os.environ["AGENT_BASE_MODEL"]
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(model_name)
 
@@ -293,7 +295,7 @@ trainer.train()
 | Quality | Slightly better on complex tasks | Comparable for most tasks |
 
 :::info Industry Trend
-DPO has largely replaced RLHF in practice for most alignment tasks. Major open-source models (Llama 3, Mistral) use DPO or its variants (IPO, KTO) for alignment. RLHF remains relevant for frontier model training where marginal quality improvements justify the complexity.
+DPO has largely replaced RLHF in practice for most alignment tasks. Major open-weight models use DPO or its variants (IPO, KTO) for alignment. RLHF remains relevant for frontier model training where marginal quality improvements justify the complexity.
 :::
 
 ---
@@ -332,7 +334,7 @@ The quality of your fine-tuning data determines the quality of your fine-tuned m
 <details>
 <summary><strong>Deep Dive: Synthetic Data Generation for Fine-Tuning</strong></summary>
 
-When you lack sufficient training data, you can use a stronger model (e.g., GPT-4o) to generate synthetic training data for a weaker model (e.g., Llama 3.1 8B). This technique is called **model distillation**.
+When you lack sufficient training data, you can use a stronger model (e.g., the standard-tier model) to generate synthetic training data for a weaker model (e.g., a small open-weight model). This technique is called **model distillation**.
 
 Steps:
 1. Define your task with clear instructions and examples.
@@ -341,7 +343,7 @@ Steps:
 4. Have humans review and filter the generated data.
 5. Fine-tune the weaker model on the filtered synthetic data.
 
-This is cost-effective: generating 1,000 examples with GPT-4o costs roughly $5-20, while fine-tuning on that data can produce a model that handles 80-90% of the strong model's quality on your specific task.
+This is cost-effective: generating 1,000 examples with the standard-tier model costs a small fraction of a fine-tuning run (tokens x `p` / 1M), while fine-tuning on that data can produce a model that handles 80-90% of the strong model's quality on your specific task.
 
 **Caution:** Check the terms of service of the model you are distilling from. Some providers restrict using their model's outputs to train competing models.
 

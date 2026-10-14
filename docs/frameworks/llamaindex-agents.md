@@ -1,11 +1,16 @@
 ---
 sidebar_position: 6
 title: "LlamaIndex Agents"
+last_verified: 2026-10-12
 ---
 
 # LlamaIndex Agents
 
 LlamaIndex (formerly GPT Index) started as a data framework for connecting LLMs to external data sources. It has since evolved into a full agent framework with a distinctive strength: **treating data retrieval pipelines as first-class agent tools**. If your agent's primary job is to query, synthesize, and reason over complex data sources, LlamaIndex agents are purpose-built for that workflow.
+
+:::note Historical interview framing
+Older material (including earlier versions of this page) describes `OpenAIAgent`, `ReActAgent.from_tools`, and an "Agent Runner / Agent Worker" split. The current official docs organize agents around `FunctionAgent`, `ReActAgent`, `CodeActAgent`, and `AgentWorkflow` on top of Workflows. Know both vocabularies, but build against the current one.
+:::
 
 ## Core Philosophy
 
@@ -15,14 +20,15 @@ While LangChain is "tool-first" and CrewAI is "role-first," LlamaIndex is **data
 |---------|-------------|
 | **Query Engine** | A pipeline that takes a natural language query and returns a synthesized response from an index |
 | **Tool** | Any callable the agent can use, including query engines wrapped as tools |
-| **Agent Runner** | The orchestrator that manages the agent loop, tool selection, and state |
-| **Agent Worker** | The reasoning component that decides which tools to call |
+| **Agent** (`FunctionAgent`, `ReActAgent`, `CodeActAgent`) | A Workflow-based agent that runs the tool loop and decides which tools to call |
+| **AgentWorkflow** | A pre-built Workflow that coordinates one or more agents, shared state, and handoffs |
 
 ## Query Engines as Tools
 
 The defining pattern in LlamaIndex agents is wrapping query engines -- which themselves may involve retrieval, reranking, and synthesis -- as tools the agent can select from.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 
@@ -55,63 +61,124 @@ hr_tool = QueryEngineTool(
 ```
 
 :::tip Tool Descriptions Are Critical
-The agent selects tools based entirely on their descriptions. A vague description like "search documents" will cause poor routing. Be specific about what data the tool covers, the time range, and the types of questions it can answer.
+The agent selects tools based entirely on their descriptions. A vague description like "search documents" will cause poor routing. Be specific about what datthe tool covers, the time range, and the types of questions it can answer.
 :::
 
 ## Building an Agent
 
-LlamaIndex provides several agent types. The most common is the `OpenAIAgent`, which uses OpenAI's native function calling.
+**Verified against official documentation: 2026-10-12** ([agents guide](https://developers.llamaindex.ai/python/framework/module_guides/deploying/agents/), [building agents](https://developers.llamaindex.ai/python/framework/understanding/agent/)). Current agents are built on the **Workflows** engine and live in `llama_index.core.agent.workflow`. All code on this page is **illustrative and untested**; set `AGENT_MODEL` to a model your provider account supports. The `OpenAIAgent` class (built via `from_tools`, driven with `.chat`) in older tutorials does not appear on the current agent pages fetched; check your installed version before using it.
+
+| Class | Strategy | When to consider |
+|-------|----------|------------------|
+| `FunctionAgent` | Uses the LLM provider's function/tool-calling API | The model supports native tool calling (the default starting point in the docs) |
+| `ReActAgent` | Text-based Thought/Action/Observation prompting | Models without reliable native tool calling, or when you want an inspectable reasoning loop |
+| `CodeActAgent` | The model writes code that calls your tools; you supply `code_execute_fn` | Multi-step tool composition where code is more compact than many tool calls |
+| `AgentWorkflow` | A Workflow that manages one or more agents, shared state, and handoffs | Multi-agent systems and shared state |
+
+### FunctionAgent
 
 ```python
-from llama_index.agent.openai import OpenAIAgent
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
+import asyncio
+import os
+from llama_index.core.agent.workflow import FunctionAgent
 from llama_index.llms.openai import OpenAI
 
-llm = OpenAI(model="gpt-4o", temperature=0)
+llm = OpenAI(model=os.environ["AGENT_MODEL"])  # provider class is your choice
 
-agent = OpenAIAgent.from_tools(
-    tools=[financial_tool, hr_tool],
+agent = FunctionAgent(
+    tools=[financial_tool, hr_tool],  # QueryEngineTools defined above
     llm=llm,
-    verbose=True,
-    system_prompt="""You are a corporate assistant that helps employees find 
-    information from financial reports and HR policies. Always cite which 
+    system_prompt="""You are a corporate assistant that helps employees find
+    information from financial reports and HR policies. Always cite which
     source you used to answer the question.""",
 )
 
-response = agent.chat("What was our Q3 2024 revenue and what is the parental leave policy?")
-print(response)
+async def main():
+    response = await agent.run(
+        "What was our latest quarterly revenue and what is the parental leave policy?"
+    )
+    print(str(response))
+
+asyncio.run(main())
 ```
 
-### ReAct Agent
+The docs note that `FunctionAgent` streams by default and that `streaming=False` can be set if you hit an error with your provider.
 
-For models without native function calling, LlamaIndex provides a ReAct agent that uses the Reason+Act prompting pattern.
+### ReActAgent
 
 ```python
-from llama_index.core.agent import ReActAgent
-from llama_index.llms.anthropic import Anthropic
+from llama_index.core.agent.workflow import ReActAgent
 
-llm = Anthropic(model="claude-sonnet-4-20250514", temperature=0)
-
-react_agent = ReActAgent.from_tools(
-    tools=[financial_tool, hr_tool],
-    llm=llm,
-    verbose=True,
-    max_iterations=10,
-)
-
-response = react_agent.chat("Compare Q2 and Q3 revenue trends.")
+# Illustrative, untested.
+react_agent = ReActAgent(tools=[financial_tool, hr_tool], llm=llm)
+response = await react_agent.run("Compare recent revenue trends.")
 ```
 
 :::info ReAct vs Function Calling
-**Function Calling** agents rely on the LLM's built-in tool-calling API (structured JSON). **ReAct** agents use a text-based reasoning loop (Thought/Action/Observation). Function calling is more reliable when available, but ReAct works with any LLM.
+**Function calling** agents rely on the LLM provider's structured tool-calling API. **ReAct** agents use a text-based reasoning loop (Thought/Action/Observation) and so depend on the model following a prompt format. Native function calling is generally more reliable where available, but verify with your own evaluations.
 :::
+
+### CodeActAgent
+
+`CodeActAgent` needs a `code_execute_fn` that runs model-generated code. The official example runs code **in-process and warns it is not safe for production**; use proper sandboxing.
+
+```python
+from llama_index.core.agent.workflow import CodeActAgent
+
+# Illustrative, untested. `execute_in_sandbox` is a placeholder for YOUR
+# isolated executor (container, restricted runtime); never exec model code
+# in your application process.
+agent = CodeActAgent(
+    code_execute_fn=execute_in_sandbox,
+    llm=llm,
+    tools=[add, subtract, multiply, divide],
+)
+```
+
+### AgentWorkflow: Multi-Agent and State
+
+`AgentWorkflow` is a pre-built `Workflow` that takes several agents, a `root_agent` (by name), and optional `initial_state`. Agents hand off control according to `can_handoff_to`. Further patterns (orchestrator agent with sub-agents as tools, custom planner) are in the [multi-agent guide](https://developers.llamaindex.ai/python/framework/understanding/agent/multi_agent/).
+
+```python
+from llama_index.core.agent.workflow import AgentWorkflow, FunctionAgent
+
+# Illustrative, untested; search_web, record_notes, write_report are your tools.
+research_agent = FunctionAgent(
+    name="ResearchAgent",
+    description="Search sources and record notes.",
+    system_prompt="Research the topic, then hand off to WriteAgent.",
+    llm=llm,
+    tools=[search_web, record_notes],
+    can_handoff_to=["WriteAgent"],
+)
+write_agent = FunctionAgent(
+    name="WriteAgent",
+    description="Writes a report from the notes.",
+    system_prompt="Write the report from recorded notes.",
+    llm=llm,
+    tools=[write_report],
+)
+workflow = AgentWorkflow(
+    agents=[research_agent, write_agent],
+    root_agent=research_agent.name,
+    initial_state={"research_notes": {}, "report_content": "Not written yet."},
+)
+response = await workflow.run(user_msg="Write a short report on retrieval evaluation.")
+```
+
+**State.** An `AgentWorkflow` is stateless between runs by default. Create `ctx = Context(workflow)` and pass it to each run to keep state, and use `ctx.to_dict(serializer=JsonSerializer())` / `Context.from_dict(...)` to persist and restore it ([state guide](https://developers.llamaindex.ai/python/framework/understanding/agent/state/)). Tools can read and edit the shared `state` through `ctx.store`. Treat deserializing a context as trusting its source; the docs also list `JsonPickleSerializer`, which carries the usual pickle risks.
+
+**Human-in-the-loop.** A tool can call `ctx.wait_for_event(HumanResponseEvent, waiter_event=InputRequiredEvent(...), ...)`; the caller sees `InputRequiredEvent` while streaming events and answers with `handler.ctx.send_event(HumanResponseEvent(...))` ([HITL guide](https://developers.llamaindex.ai/python/framework/understanding/agent/human_in_the_loop/)). For slow or cross-process approvals the docs suggest serializing the context so the workflow can resume later. Authentication of the approver and idempotent side effects remain your responsibility.
 
 ## Sub-Question Query Engine
 
 The Sub-Question Query Engine is a powerful LlamaIndex pattern that automatically decomposes a complex question into sub-questions, routes each to the appropriate tool, and synthesizes the answers.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
-from llama_index.question_gen.openai import OpenAIQuestionGenerator
+from llama_index.core.question_gen import LLMQuestionGenerator
 from llama_index.core.query_engine import SubQuestionQueryEngine
 
 # Each tool covers a different data domain
@@ -141,7 +208,7 @@ tools = [
 
 sub_question_engine = SubQuestionQueryEngine.from_defaults(
     query_engine_tools=tools,
-    question_gen=OpenAIQuestionGenerator.from_defaults(),
+    question_gen=LLMQuestionGenerator.from_defaults(),  # uses Settings.llm; core, no extra package
     use_async=True,
 )
 
@@ -167,6 +234,7 @@ LlamaIndex provides multiple ways to define tools beyond query engine wrappers.
 ### Function Tools
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from llama_index.core.tools import FunctionTool
 
 def calculate_runway(
@@ -187,6 +255,7 @@ runway_tool = FunctionTool.from_defaults(
 ### Pydantic Tools (Structured Input)
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from pydantic import BaseModel, Field
 from llama_index.core.tools import FunctionTool
 
@@ -215,6 +284,7 @@ stock_tool = FunctionTool.from_defaults(
 Route queries to different indexes based on the question type.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from llama_index.core.query_engine import RouterQueryEngine
 from llama_index.core.selectors import LLMSingleSelector
 
@@ -244,8 +314,10 @@ router_engine = RouterQueryEngine(
 Build agents that reason across many documents, each with its own query engine.
 
 ```python
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core import VectorStoreIndex, SummaryIndex
+import os
 
 # Build per-document tools
 doc_tools = []
@@ -272,10 +344,9 @@ for doc_name, documents in document_collections.items():
     doc_tools.extend([query_tool, summary_tool])
 
 # Create an agent with tools spanning all documents
-agent = OpenAIAgent.from_tools(
+agent = FunctionAgent(
     tools=doc_tools,
-    llm=OpenAI(model="gpt-4o"),
-    verbose=True,
+    llm=OpenAI(model=os.environ["AGENT_MODEL"]),
     system_prompt="You are a research assistant with access to multiple documents.",
 )
 ```
@@ -289,7 +360,10 @@ When an agent has access to many tools (e.g., 2 tools per document across 50 doc
 Combining retrieval, tool use, and multi-step reasoning into a cohesive pipeline.
 
 ```python
-from llama_index.agent.openai import OpenAIAgent
+# Illustrative, untested: needs provider credentials / your own data; not run in CI.
+import os
+from llama_index.core.agent.workflow import FunctionAgent
+from llama_index.llms.openai import OpenAI
 from llama_index.core.tools import QueryEngineTool, FunctionTool
 
 # RAG tools
@@ -310,16 +384,16 @@ def analyze_sentiment(text: str) -> str:
 sentiment_tool = FunctionTool.from_defaults(fn=analyze_sentiment)
 
 # Build the agentic RAG pipeline
-agent = OpenAIAgent.from_tools(
+agent = FunctionAgent(
     tools=[knowledge_tool, sentiment_tool],
-    llm=OpenAI(model="gpt-4o"),
+    llm=OpenAI(model=os.environ["AGENT_MODEL"]),
     system_prompt="""You are an analyst. First retrieve relevant information 
     from the knowledge base, then analyze it using available tools before 
     providing your final answer.""",
 )
 
 # The agent decides: retrieve -> analyze -> synthesize
-response = agent.chat("What do customers think about our latest product launch?")
+response = await agent.run("What do customers think about our latest product launch?")  # inside an async function
 ```
 
 ## Pros and Cons
@@ -335,7 +409,7 @@ response = agent.chat("What do customers think about our latest product launch?"
 ### Weaknesses
 
 - **Data-centric scope**: Less suited for agents that primarily need to take actions rather than query data.
-- **Limited multi-agent**: No built-in multi-agent orchestration (unlike CrewAI or AutoGen).
+- **Multi-agent is Workflow-centric**: `AgentWorkflow` provides handoffs and shared state, but the role-based collaboration abstractions of other frameworks are not its focus; custom orchestration uses lower-level Workflows.
 - **Complexity at scale**: Configuring retrieval pipelines with reranking, filtering, and hybrid search adds significant complexity.
 - **Overlap with LangChain**: Many users find themselves using both frameworks, which adds dependency overhead.
 
@@ -350,3 +424,9 @@ Choose LlamaIndex when your agent's primary function is **intelligent data retri
 - Compare LlamaIndex's **data-first** philosophy with LangChain's **tool-first** approach.
 - Discuss strategies for handling **many tools** (tool retrieval, hierarchical agents).
 - Explain when you would combine LlamaIndex with LangGraph rather than using either alone.
+- Distinguish `FunctionAgent`, `ReActAgent`, and `CodeActAgent`, and explain why `CodeActAgent` needs a sandbox.
+- Explain how `AgentWorkflow` handoffs and shared state work, and how `Context` serialization supports resuming.
+
+## Official Sources
+
+Checked **2026-10-12**: [agents guide](https://developers.llamaindex.ai/python/framework/module_guides/deploying/agents/), [building agents](https://developers.llamaindex.ai/python/framework/understanding/agent/), [multi-agent patterns](https://developers.llamaindex.ai/python/framework/understanding/agent/multi_agent/), [maintaining state](https://developers.llamaindex.ai/python/framework/understanding/agent/state/), [human in the loop](https://developers.llamaindex.ai/python/framework/understanding/agent/human_in_the_loop/), [CodeActAgent example](https://developers.llamaindex.ai/python/examples/agent/code_act_agent/), and the `llama_index.core.agent.workflow` package exports on GitHub. `ReActAgent`'s constructor arguments, and `QueryEngineTool` / `SubQuestionQueryEngine` snippets retained from the original page, were not re-verified.

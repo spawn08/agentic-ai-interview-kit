@@ -2,6 +2,7 @@
 sidebar_position: 2
 title: "Project: Deep Research Agent"
 description: "Build an autonomous research agent with LangGraph — plan-and-execute, multi-source search, synthesis with citations, and iterative deepening"
+last_verified: 2026-10-12
 ---
 
 # Project: Deep Research Agent
@@ -14,7 +15,7 @@ Build an autonomous research agent that takes a question, creates a research pla
 - **State checkpointing** -- Long-running research (minutes to hours) can resume from any checkpoint if interrupted
 - **Parallel fan-out** -- LangGraph's `Send` API enables parallel search across multiple sources
 - **Budget enforcement** -- State tracks token/cost usage; conditional edges can halt when budget is reached
-- **Why not LangChain AgentExecutor?** -- No native support for cycles, parallel fan-out, or budget-aware termination
+- **Why not a single `create_agent` loop?** -- The standard loop has no explicit gap-analysis cycle, parallel fan-out, or budget-aware termination; a custom LangGraph `StateGraph` makes these explicit
 - **Why not Custom?** -- The iterative deepening cycle with state tracking, checkpointing, and parallel execution is exactly what LangGraph is built for
 :::
 
@@ -273,11 +274,14 @@ from pydantic import BaseModel, Field
 
 from state import ResearchState, Source, Finding
 from tools import web_search, academic_search
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
-creative_llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+llm = ChatOpenAI(model=MODEL, temperature=0.0)
+creative_llm = ChatOpenAI(model=MODEL, temperature=0.3)
 
 
 # -- Structured output schemas --
@@ -887,7 +891,7 @@ FINAL RESEARCH REPORT
 - **Fact verification node**: Add a dedicated verification node that cross-checks each claim against its cited source text, catching hallucinated citations before they reach the report
 - **Export formats**: Generate Markdown, PDF (via WeasyPrint), or Notion page from the final report
 - **Human-in-the-loop**: Add an interrupt before the report_writer node so a human can review findings and redirect research
-- **Multi-model routing**: Use a cheaper model (gpt-4o-mini) for planning and searching, reserving gpt-4o for synthesis and report writing to reduce cost by 40-60%
+- **Multi-model routing**: Use a fast-tier model for planning and searching, reserving the standard-tier model for synthesis and report writing to reduce cost by 40-60%
 - **LangSmith tracing**: Enable LangSmith for full observability into each node's inputs, outputs, and token consumption across iterations
 
 ---
@@ -895,7 +899,7 @@ FINAL RESEARCH REPORT
 ## Interview Talking Points
 
 :::tip Key Points to Emphasize
-1. **LangGraph's cyclic graph support** is the reason this uses LangGraph over LangChain AgentExecutor. The iterative deepening loop (gap_analyzer to planner) is a cycle that LangGraph handles natively.
+1. **LangGraph's cyclic graph support** is the reason this uses a custom LangGraph `StateGraph` rather than a single `create_agent` loop. The iterative deepening loop (gap_analyzer to planner) is a cycle that LangGraph handles natively.
 2. **State checkpointing** means a 15-minute deep research task can resume from the last completed node if the process crashes. This is critical for long-running agent workloads.
 3. **Budget-aware termination** is a first-class concern, not an afterthought. The 80% threshold ensures the agent always reserves capacity for report generation.
 4. **Source deduplication** across iterations prevents the common failure mode where an agent re-fetches and re-processes the same content in each loop, wasting tokens without adding information.

@@ -2,6 +2,7 @@
 sidebar_position: 12
 title: "Agent Evaluation Platform"
 description: "Architecture design for a platform that evaluates AI agent performance across correctness, safety, cost, and latency"
+last_verified: 2026-10-12
 ---
 
 # Agent Evaluation Platform
@@ -178,7 +179,7 @@ The LLM-as-Judge component evaluates subjective dimensions that deterministic ch
 
 **Bias mitigation** is the core differentiator of a production-grade judge system. LLM judges have three known biases: verbosity bias (longer answers get higher scores), position bias (first option in a comparison is preferred), and self-preference bias (a model rates its own outputs higher). The platform mitigates these through three mechanisms:
 
-- **Multi-model consensus**: Each test case is judged by at least two different models (e.g., Claude Sonnet and GPT-4o). Scores are aggregated with outlier detection -- if one judge diverges by more than 2 points from the median, it is excluded from the average.
+- **Multi-model consensus**: Each test case is judged by at least two different models (e.g., a second-provider standard-tier model and the standard-tier model). Scores are aggregated with outlier detection -- if one judge diverges by more than 2 points from the median, it is excluded from the average.
 - **Randomized presentation**: The execution trace is presented in both standard and reversed order to detect position bias. If scores differ significantly between presentations, the test case is flagged for human review.
 - **Calibration sets**: A small set of human-labeled gold examples is run through the judge pipeline periodically. If judge scores drift from human labels, the system adjusts weights or alerts operators.
 
@@ -283,15 +284,15 @@ For the target throughput of 10,000 test cases per hour, the system needs approx
 
 | Component | Cost | Notes |
 |-----------|------|-------|
-| Agent execution (LLM) | $5-50 | Depends on agent complexity and model used |
-| LLM-as-judge (3 judges) | $3-10 | Approximately $0.01 per judge per test case |
+| Agent execution (LLM) | tokens x assumed `p_agent` rate | Depends on agent complexity and model used |
+| LLM-as-judge (3 judges) | 3 x judge-call cost | One judge call = (in x `p_in` + out x `p_out`) / 1M per test case |
 | Sandbox compute | $2-5 | Container runtime costs |
 | Infrastructure | $1 | Storage, orchestration, networking |
-| **Total** | **$11-66** | **$0.01-0.07 per test case** |
+| **Total** | **sum of the rows** | **per-test-case cost = total / number of test cases** |
 
 ### Cost Optimization Strategies
 
-- **Tiered judging**: Use a cheap model (GPT-4o-mini) for initial screening. Only escalate to expensive multi-judge evaluation for borderline scores (e.g., scores between 2.5 and 3.5).
+- **Tiered judging**: Use a cheap model (the fast-tier model) for initial screening. Only escalate to expensive multi-judge evaluation for borderline scores (e.g., scores between 2.5 and 3.5).
 - **Incremental evaluation**: On code changes, only re-evaluate test cases in affected categories rather than the full suite.
 - **Cached sandbox images**: Pre-build sandbox images with common configurations to avoid redundant setup costs.
 - **Score caching**: If the agent version and test case have not changed, reuse previous scores instead of re-running.
@@ -356,7 +357,7 @@ CREATE TABLE eval_runs (
     suite_id          UUID NOT NULL REFERENCES eval_suites(id),
     model_version     VARCHAR(100) NOT NULL,
     agent_config      JSONB NOT NULL,
-        -- Example: {"model": "claude-sonnet-4-20250514", "temperature": 0.0,
+        -- Example: {"model": "<AGENT_MODEL value>", "temperature": 0.0,
         --           "max_tokens": 4096, "tools": ["search", "book"]}
     status            VARCHAR(20) NOT NULL DEFAULT 'pending'
                       CHECK (status IN ('pending', 'running', 'completed', 'failed')),
@@ -673,7 +674,7 @@ graph LR
 
 ### Issue 1: Evaluation Costs Exceeding Budget
 
-**Symptom**: A nightly evaluation suite with 5,000 test cases using GPT-4 as both the agent model and the judge costs $300+ per run. Monthly evaluation costs reach $9,000, exceeding the team's $5,000 budget.
+**Symptom**: A nightly evaluation suite with 5,000 test cases using a frontier-tier model as both the agent model and the judge costs 5,000 x `c_case` per run. Thirty such runs per month exceed the team's budget.
 
 **Root Cause**: No cost estimation or approval workflow before triggering expensive evaluation runs.
 
@@ -681,8 +682,8 @@ graph LR
 
 ```
 Cost estimate = test_cases x avg_tokens_per_case x price_per_token x judge_multiplier
-             = 5,000 x 2,000 x $0.01/1K x 3 (judges)
-             = $300 per run
+             = 5,000 cases x 2,000 tokens x (`p_judge` per token) x 3 (judges)
+             = 5,000 x `c_case` per run
 ```
 
 ### Issue 2: Flaky Test Cases

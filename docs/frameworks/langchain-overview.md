@@ -1,11 +1,16 @@
 ---
 sidebar_position: 1
 title: "LangChain"
+last_verified: 2026-10-12
 ---
 
 # LangChain
 
-LangChain is the most widely adopted framework for building applications powered by large language models. It provides a composable set of abstractions that let you connect LLMs to tools, data sources, and multi-step reasoning pipelines with minimal boilerplate.
+LangChain is the most widely adopted framework for building applications powered by large language models. Since v1, the `langchain` package is deliberately small and agent-focused: `create_agent` is the standard way to build an agent, **middleware** customizes every step of the agent loop, and **structured output** is built in. Everything else (legacy chains, retrievers, the old `AgentExecutor`) moved to `langchain-classic`.
+
+:::info Sources and Verification
+Verified against the official LangChain docs (v1 migration guide, agents, middleware, structured output) on 2026-10-12. Snippets marked `# illustrative` were not executed; runnable ones live in `examples/langchain-v1/`. See `reports/batch-2.md`.
+:::
 
 ## Core Abstractions
 
@@ -16,19 +21,20 @@ LangChain organizes its functionality around several foundational primitives. Un
 LangChain wraps LLM providers behind a unified interface so you can swap providers without rewriting application logic.
 
 ```python
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
+import os
 
-# Switch providers by changing one line
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
-# llm = ChatAnthropic(model="claude-sonnet-4-20250514")
+from langchain.chat_models import init_chat_model
+
+# AGENT_MODEL is "<provider>:<model>", e.g. "openai:<model-id>" or "anthropic:<model-id>".
+# Switch providers by changing the environment variable, not the code.
+llm = init_chat_model(os.environ["AGENT_MODEL"], temperature=0)
 
 response = llm.invoke("Explain agentic AI in two sentences.")
 print(response.content)
 ```
 
 :::info Model Types
-LangChain distinguishes between **LLMs** (raw text completion) and **Chat Models** (message-based). Modern applications almost always use Chat Models. The `ChatOpenAI` and `ChatAnthropic` classes are chat model wrappers.
+LangChain distinguishes between **LLMs** (raw text completion) and **Chat Models** (message-based). Modern applications almost always use Chat Models. Provider classes such as `ChatOpenAI` (`langchain-openai`) and `ChatAnthropic` (`langchain-anthropic`) are chat model wrappers; `init_chat_model` picks the right one from the `provider:model` string.
 :::
 
 ### Prompt Templates
@@ -47,11 +53,12 @@ prompt = ChatPromptTemplate.from_messages([
 messages = prompt.invoke({"role": "data scientist", "question": "What is RAG?"})
 ```
 
-### Output Parsers
+### Output Parsers and Structured Output
 
-Output parsers transform raw LLM text into structured Python objects.
+Output parsers transform raw LLM text into structured Python objects. This works for plain chains, but for agents (and for models that support it) prefer **native structured output**, covered in the `create_agent` section below.
 
 ```python
+# illustrative
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 
@@ -108,7 +115,9 @@ LCEL is LangChain's declarative composition API. It uses the pipe operator (`|`)
 ### Basic Chain
 
 ```python
-from langchain_openai import ChatOpenAI
+import os
+
+from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -117,7 +126,7 @@ prompt = ChatPromptTemplate.from_messages([
     ("human", "{question}"),
 ])
 
-chain = prompt | ChatOpenAI(model="gpt-4o") | StrOutputParser()
+chain = prompt | init_chat_model(os.environ["AGENT_MODEL"]) | StrOutputParser()
 
 # Invoke synchronously
 answer = chain.invoke({"question": "Explain decorators in Python"})
@@ -162,23 +171,41 @@ route_chain = RunnableBranch(
 
 | Module | Purpose |
 |--------|---------|
-| `langchain-core` | Base abstractions, LCEL, interfaces |
-| `langchain-openai` | OpenAI and Azure OpenAI integrations |
-| `langchain-anthropic` | Anthropic Claude integrations |
-| `langchain-community` | Third-party integrations (300+) |
-| `langchain` | Orchestration chains and higher-level logic |
-| `langgraph` | Stateful, multi-actor agent graphs |
+| `langchain-core` | Base abstractions, LCEL, `@tool`, messages, `InMemoryVectorStore` |
+| `langchain` (v1) | `create_agent`, middleware, `init_chat_model`, structured output strategies, message types |
+| `langchain-openai`, `langchain-anthropic`, `langchain-chroma`, ... | Partner packages: one integration per package, versioned independently |
+| `langchain-community` | Long tail of community integrations (being sunset; the package emits a deprecation warning, prefer partner packages) |
+| `langchain-classic` | Legacy code removed from `langchain` v1: `AgentExecutor`, legacy chains, `langchain.retrievers`, indexing API, hub |
+| `langgraph` | Runtime under `create_agent`; use `StateGraph` directly for custom topologies |
 | `langsmith` | Observability, tracing, and evaluation |
 
-## Building a Simple Agent
+### The `langchain-classic` Boundary
 
-Agents use an LLM to decide which tools to call and when to stop.
+In v1 the `langchain` namespace exposes essentially `langchain.agents` (`create_agent`, `AgentState`), `langchain.messages`, `langchain.tools`, `langchain.chat_models` and `langchain.embeddings`. Anything else you previously imported from `langchain` (for example `LLMChain`, `ConversationChain`, `MultiQueryRetriever`, `langchain.indexes`, `langchain.hub`, `AgentExecutor`) now lives in `langchain-classic`:
+
+<details>
+<summary>Legacy imports (pre-v1 names, kept for recognizing old code)</summary>
 
 ```python
-from langchain_openai import ChatOpenAI
+# illustrative
+# pip install langchain-classic
+from langchain_classic.chains import LLMChain
+from langchain_classic.retrievers import MultiQueryRetriever
+```
+
+</details>
+
+Treat `langchain-classic` as a migration bridge for existing code, not a target for new code.
+
+## Building a Simple Agent with `create_agent`
+
+Agents use an LLM to decide which tools to call and when to stop. `create_agent` returns a compiled LangGraph graph running the standard loop: model call, tool execution, repeat until the model calls no more tools.
+
+```python
+import os
+
+from langchain.agents import create_agent
 from langchain_core.tools import tool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate
 
 @tool
 def get_weather(city: str) -> str:
@@ -192,46 +219,141 @@ def get_population(city: str) -> str:
     populations = {"tokyo": "14M", "london": "9M", "paris": "2.1M"}
     return populations.get(city.lower(), "Unknown")
 
-tools = [get_weather, get_population]
+agent = create_agent(
+    model=os.environ["AGENT_MODEL"],  # "<provider>:<model>"
+    tools=[get_weather, get_population],
+    system_prompt="You are a helpful travel assistant.",
+)
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful travel assistant."),
-    ("human", "{input}"),
-    ("placeholder", "{agent_scratchpad}"),
-])
-
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
-agent = create_tool_calling_agent(llm, tools, prompt)
-executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-result = executor.invoke({
-    "input": "What's the weather and population of Tokyo?"
-})
-print(result["output"])
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "What's the weather and population of Tokyo?"}]}
+)
+print(result["messages"][-1].content)
 ```
+
+The agent is invoked with a `messages` state and returns the full message list; the answer is the last message. There is no prompt template with `{agent_scratchpad}`: the tool-call history is part of the message list.
 
 ### Agent Execution Flow
 
-1. The LLM receives the user query and available tool descriptions.
-2. It decides to call `get_weather("Tokyo")` and `get_population("Tokyo")`.
+1. The model receives the conversation, the `system_prompt`, and the tool schemas.
+2. It emits native tool calls, e.g. `get_weather("Tokyo")` and `get_population("Tokyo")`, possibly in parallel.
 3. Tool results are appended to the conversation as tool messages.
-4. The LLM synthesizes a final answer from the tool outputs.
-5. The `AgentExecutor` returns the final response.
+4. The model synthesizes a final answer from the tool outputs.
+5. The loop ends when the model responds without tool calls.
+
+### Middleware
+
+Middleware hooks into the agent loop (`before_agent`, `before_model`, `wrap_model_call`, `wrap_tool_call`, `after_model`, `after_agent`). It replaces the old `pre_model_hook`/`post_model_hook` arguments and the dynamic-prompt/error-handling options of earlier agent APIs. Built-ins include `SummarizationMiddleware`, `HumanInTheLoopMiddleware`, `ModelCallLimitMiddleware`, `ToolRetryMiddleware`, `ModelFallbackMiddleware`, and `PIIMiddleware`.
+
+```python
+# illustrative
+import os
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    ModelRequest,
+    SummarizationMiddleware,
+    dynamic_prompt,
+    wrap_tool_call,
+)
+from langchain.messages import ToolMessage
+
+@dynamic_prompt
+def role_prompt(request: ModelRequest) -> str:
+    return "You are a helpful travel assistant. Be concise."
+
+@wrap_tool_call
+def tool_errors_as_messages(request, handler):
+    try:
+        return handler(request)
+    except Exception as exc:
+        return ToolMessage(content=f"Tool failed: {exc}", tool_call_id=request.tool_call["id"])
+
+agent = create_agent(
+    model=os.environ["AGENT_MODEL"],
+    tools=[get_weather, get_population],
+    middleware=[
+        role_prompt,
+        tool_errors_as_messages,
+        SummarizationMiddleware(model=os.environ["AGENT_MODEL"]),
+    ],
+)
+```
+
+Middleware is not a separate runtime: hooks run inside the compiled LangGraph that `create_agent` returns, so the same agent can be dropped into a larger `StateGraph` as a node or subgraph.
+
+### Structured Output
+
+Pass `response_format` to get a validated object back in the `structured_response` key of the final state. Given a bare schema type, LangChain chooses `ProviderStrategy` (native provider structured output) when the model supports it, otherwise `ToolStrategy` (an artificial tool call). JSON Schema dicts must be wrapped explicitly in one of the strategies. The old "prompted output" mode was removed.
+
+```python
+# illustrative
+import os
+
+from pydantic import BaseModel
+
+from langchain.agents import create_agent
+
+class Answer(BaseModel):
+    summary: str
+    confidence: float
+
+agent = create_agent(
+    model=os.environ["AGENT_MODEL"],
+    tools=[get_weather, get_population],
+    response_format=Answer,
+)
+result = agent.invoke({"messages": [{"role": "user", "content": "Summarize Tokyo."}]})
+print(result["structured_response"])  # Answer(summary=..., confidence=...)
+```
+
+### `create_agent` vs `StateGraph`
+
+| Need | Use |
+|------|-----|
+| Standard loop: model, tools, repeat | `create_agent` with middleware |
+| Cross-cutting concerns: summarization, approvals, retries, guardrails, dynamic prompts | Middleware |
+| Custom topology: routing, parallel fan-out, deterministic steps between agents | LangGraph `StateGraph` (agents can be nodes) |
+
+## Legacy: `AgentExecutor`
+
+:::warning Legacy
+`AgentExecutor`, `create_tool_calling_agent`, and `create_react_agent` (LangChain's text-parsing variant) are no longer part of the `langchain` v1 namespace. They are available from `langchain_classic.agents` for existing code only. Do not use them for new projects.
+:::
+
+<details>
+<summary>Legacy example (pre-v1, kept for recognizing old code)</summary>
+
+```python
+# illustrative
+# pip install langchain-classic
+from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
+
+agent = create_tool_calling_agent(llm, tools, prompt)  # prompt needs an {agent_scratchpad} placeholder
+executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+result = executor.invoke({"input": "What's the weather and population of Tokyo?"})
+```
+
+</details>
 
 ## Retrieval-Augmented Generation (RAG)
 
 LangChain provides first-class support for RAG pipelines.
 
 ```python
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import FAISS
+import os
+
+from langchain.chat_models import init_chat_model
+from langchain.embeddings import init_embeddings
+from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 # Build a retriever from documents
-embeddings = OpenAIEmbeddings()
-vectorstore = FAISS.from_texts(
+# AGENT_EMBEDDINGS is "<provider>:<embedding-model>"
+embeddings = init_embeddings(os.environ["AGENT_EMBEDDINGS"])
+vectorstore = InMemoryVectorStore.from_texts(
     ["LangChain is a framework for LLM apps.",
      "Agents use tools to interact with the world.",
      "RAG grounds LLM responses in real data."],
@@ -248,7 +370,7 @@ prompt = ChatPromptTemplate.from_messages([
 rag_chain = (
     {"context": retriever, "question": RunnablePassthrough()}
     | prompt
-    | ChatOpenAI(model="gpt-4o")
+    | init_chat_model(os.environ["AGENT_MODEL"])
     | StrOutputParser()
 )
 
@@ -259,7 +381,7 @@ answer = rag_chain.invoke("What is RAG?")
 
 ### Strengths
 
-- **Massive ecosystem**: 300+ integrations covering vector stores, LLM providers, tools, and document loaders.
+- **Massive ecosystem**: hundreds of integrations (mostly separate partner packages) covering vector stores, LLM providers, tools, and document loaders.
 - **LCEL composability**: Declarative chaining that keeps code readable and maintainable.
 - **Production tooling**: LangSmith provides tracing, evaluation, and monitoring out of the box.
 - **Active community**: Frequent releases, extensive documentation, and a large contributor base.
@@ -267,12 +389,12 @@ answer = rag_chain.invoke("What is RAG?")
 ### Weaknesses
 
 - **Abstraction overhead**: Multiple layers of abstraction can make debugging harder when things go wrong.
-- **Rapid API churn**: The framework evolves quickly; code written three months ago may use deprecated patterns.
-- **Complex agent control flow**: For multi-step agents with branching logic, LangGraph (covered next) is a better fit.
+- **Rapid API churn**: The framework evolves quickly; v1 moved legacy chains and `AgentExecutor` to `langchain-classic`, so older tutorials often use removed imports.
+- **Complex agent control flow**: For custom branching topologies, drop down to LangGraph (covered next); `create_agent` already runs on it.
 - **Performance**: The abstraction layers add latency compared to direct API calls.
 
 :::tip When to Choose LangChain
-LangChain excels when you need **rapid prototyping**, **broad integrations**, or **straightforward chains and RAG pipelines**. For complex agent orchestration with state management, consider LangGraph instead.
+LangChain excels when you need **rapid prototyping**, **broad integrations**, or **straightforward chains and RAG pipelines**. For custom orchestration topologies, use LangGraph `StateGraph` directly (agents built with `create_agent` can be nodes in it).
 :::
 
 ## Interview Talking Points
@@ -280,4 +402,6 @@ LangChain excels when you need **rapid prototyping**, **broad integrations**, or
 - Explain the difference between a **chain** (deterministic sequence) and an **agent** (LLM-decided tool calls).
 - Describe how LCEL's pipe operator composes `Runnable` objects with a shared `invoke/stream/batch` interface.
 - Discuss the trade-off between LangChain's convenience and the debugging complexity of deep abstraction layers.
-- Compare `AgentExecutor` (LangChain) with `StateGraph` (LangGraph) for stateful agent workflows.
+- Explain why `create_agent` plus middleware replaced `AgentExecutor` and `langgraph.prebuilt.create_react_agent`, and what moved to `langchain-classic`.
+- Compare `create_agent` middleware (cross-cutting hooks on a standard loop) with a custom `StateGraph` (custom topology).
+- Describe `ProviderStrategy` vs `ToolStrategy` for structured output and when each is chosen.

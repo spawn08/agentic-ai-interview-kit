@@ -2,6 +2,7 @@
 sidebar_position: 4
 title: "LangGraph Stateful Workflow"
 description: "Production-grade LangGraph workflow with parallel execution, PostgreSQL persistence, error recovery, streaming, and subgraph composition."
+last_verified: 2026-10-12
 ---
 
 # LangGraph Stateful Workflow
@@ -117,10 +118,13 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from state import TicketState
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+llm = ChatOpenAI(model=MODEL, temperature=0.0)
 
 
 class Classification(BaseModel):

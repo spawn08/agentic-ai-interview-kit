@@ -1,9 +1,19 @@
 ---
 sidebar_position: 5
 title: "Semantic Kernel"
+last_verified: 2026-10-12
 ---
 
 # Semantic Kernel
+
+:::warning Superseded: Microsoft Agent Framework is the successor
+**Verified against official sources: 2026-10-12.** The [Semantic Kernel repository README](https://github.com/microsoft/semantic-kernel) describes [Microsoft Agent Framework](./microsoft-agent-framework.md) as the enterprise-ready successor to Semantic Kernel, states that Agent Framework is available at version 1.0, and links the official [Semantic Kernel migration guide](https://learn.microsoft.com/en-us/agent-framework/migration-guide/from-semantic-kernel). The README fetched states a successor relationship; it does not give a Semantic Kernel end-of-support date, so none is claimed here. Check the repository and your support agreement before planning retirement.
+
+The legacy section below preserves the original Kernel/plugin/planner/memory material as interview history. Its code is **not verified against any current release**; planner and memory APIs in particular have changed across versions.
+:::
+
+<details>
+<summary>Legacy Semantic Kernel content (historical interview reference; do not use for new projects)</summary>
 
 Semantic Kernel (SK) is Microsoft's open-source SDK for integrating large language models into applications. Originally designed for .NET, it now has full Python and Java SDKs. Semantic Kernel differentiates itself with a **plugin-centric architecture** and tight integration with the Azure ecosystem, making it a strong choice for enterprise applications.
 
@@ -22,6 +32,7 @@ Semantic Kernel is built around a central **Kernel** object that orchestrates th
 ```python
 from semantic_kernel import Kernel
 from semantic_kernel.connectors.ai.open_ai import OpenAIChatCompletion
+import os
 
 # Create the kernel
 kernel = Kernel()
@@ -30,7 +41,7 @@ kernel = Kernel()
 kernel.add_service(
     OpenAIChatCompletion(
         service_id="chat",
-        ai_model_id="gpt-4o",
+        ai_model_id=os.environ["AGENT_MODEL"],
     )
 )
 ```
@@ -197,9 +208,10 @@ import asyncio
 
 from semantic_kernel.memory import SemanticTextMemory, VolatileMemoryStore
 from semantic_kernel.connectors.ai.open_ai import OpenAITextEmbedding
+import os
 
 # Configure memory with an embedding model and a store
-embedding = OpenAITextEmbedding(ai_model_id="text-embedding-3-small")
+embedding = OpenAITextEmbedding(ai_model_id=os.environ["AGENT_EMBEDDING_MODEL"])
 
 # In-memory store for development
 store = VolatileMemoryStore()
@@ -242,6 +254,7 @@ from semantic_kernel.connectors.ai.function_choice_behavior import FunctionChoic
 from semantic_kernel.contents import ChatHistory
 from semantic_kernel.functions import kernel_function
 from typing import Annotated
+import os
 
 # --- Plugins ---
 class WeatherPlugin:
@@ -270,7 +283,7 @@ class RecommendationPlugin:
 # --- Kernel Setup ---
 async def main():
     kernel = Kernel()
-    kernel.add_service(OpenAIChatCompletion(service_id="chat", ai_model_id="gpt-4o"))
+    kernel.add_service(OpenAIChatCompletion(service_id="chat", ai_model_id=os.environ["AGENT_MODEL"]))
     kernel.add_plugin(WeatherPlugin(), plugin_name="weather")
     kernel.add_plugin(RecommendationPlugin(), plugin_name="recommendations")
 
@@ -362,3 +375,11 @@ kernel.add_function_invocation_filter(logging_filter)
 - Compare the **kernel/plugin** architecture with LangChain's **chain/tool** architecture.
 - Discuss when you would choose Semantic Kernel over LangChain for an enterprise project.
 - Explain how **filters** enable cross-cutting concerns without modifying plugin code.
+
+</details>
+
+## Current Interview Framing
+
+- Know the concepts SK taught: plugins/functions as model-callable tools, automatic function calling versus legacy planners, memory/vector-store connectors, and filters/middleware for cross-cutting control.
+- In Agent Framework, the corresponding ideas are tools, agent sessions and context providers, middleware, telemetry, and workflows. See [Microsoft Agent Framework](./microsoft-agent-framework.md) and the [Framework Comparison](./framework-comparison.md).
+- A migration answer should cover inventorying plugins and prompts, mapping state/memory, rebuilding observability, and running regression evaluations.

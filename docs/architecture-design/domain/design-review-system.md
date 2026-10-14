@@ -2,6 +2,7 @@
 sidebar_position: 4
 title: "Multi-Agent Design Review System"
 description: "System design for a multi-agent system that reviews engineering designs with specialized agents for structural, compliance, sustainability, and cost analysis"
+last_verified: 2026-10-12
 ---
 
 # Multi-Agent Design Review System
@@ -284,11 +285,11 @@ Building codes vary by jurisdiction and are updated regularly. The standards dat
 | Component | Cost/Review | Notes |
 |-----------|------------|-------|
 | BIM parsing and pre-processing | $0.05-0.10 | CPU + geometry extraction |
-| Agent LLM inference (6 agents) | $0.30-0.80 | 3-5 LLM calls per agent, parallel |
+| Agent LLM inference (6 agents) | 6 x (3-5) x `c_llm` | 3-5 LLM calls per agent, parallel |
 | RAG retrieval (standards) | $0.01-0.02 | Pre-computed embeddings, cached |
-| Conflict detection + consensus | $0.05-0.10 | 2-3 LLM calls for conflict analysis |
-| Report generation | $0.05-0.10 | LLM summary + template rendering |
-| **Total per review** | **$0.46-1.12** | For a typical building design |
+| Conflict detection + consensus | (2-3) x `c_llm` | 2-3 LLM calls for conflict analysis |
+| Report generation | 1 x `c_llm` | LLM summary + template rendering |
+| **Total per review** | **sum of the rows (LLM rows are symbolic)** | For a typical building design |
 
 For a design review that would take a team of specialists 2-4 hours ($500-1,500 in labor), an automated first-pass at $1 per review provides enormous ROI, especially when considering that it catches issues early in the design cycle where fixes are cheapest.
 

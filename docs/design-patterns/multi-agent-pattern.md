@@ -1,6 +1,7 @@
 ---
 sidebar_position: 5
 title: "Multi-Agent Collaboration"
+last_verified: 2026-10-12
 ---
 
 # Multi-Agent Collaboration
@@ -49,6 +50,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +89,7 @@ WORKER_SYSTEM_PROMPTS: dict[str, str] = {
 
 def supervisor_node(state: SupervisorState) -> dict[str, Any]:
     """Decide which worker to invoke next."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(RouteDecision)
 
     workers = list(WORKER_SYSTEM_PROMPTS.keys())
@@ -108,7 +112,7 @@ def supervisor_node(state: SupervisorState) -> dict[str, Any]:
 def _make_worker_node(worker_name: str):
     """Factory for worker nodes."""
     def worker_node(state: SupervisorState) -> dict[str, Any]:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+        llm = ChatOpenAI(model=MODEL, temperature=0.0)
         response: AIMessage = llm.invoke([
             SystemMessage(content=WORKER_SYSTEM_PROMPTS[worker_name]),
             *state["messages"],
@@ -150,7 +154,7 @@ def build_supervisor_graph(max_iterations: int = 6) -> Any:
 ```
 
 :::tip Supervisor Best Practice
-Give the supervisor a high-capability model (e.g., GPT-4o, Claude Opus) and workers cheaper, faster models. The supervisor needs strong reasoning for planning; workers need domain expertise but not as much general intelligence.
+Give the supervisor a high-capability model (e.g., the standard-tier model, a frontier-tier model) and workers cheaper, faster models. The supervisor needs strong reasoning for planning; workers need domain expertise but not as much general intelligence.
 :::
 
 ## Pattern 2: Debate as a Cycle Between Agents
@@ -180,6 +184,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +208,7 @@ class DebateState(TypedDict):
 
 
 def debater_a_node(state: DebateState) -> dict[str, Any]:
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+    llm = ChatOpenAI(model=MODEL, temperature=0.3)
     response: AIMessage = llm.invoke([
         SystemMessage(content="You are Debater A. Argue FOR the proposition. Be persuasive and evidence-based."),
         *state["messages"],
@@ -210,7 +217,7 @@ def debater_a_node(state: DebateState) -> dict[str, Any]:
 
 
 def debater_b_node(state: DebateState) -> dict[str, Any]:
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+    llm = ChatOpenAI(model=MODEL, temperature=0.3)
     response: AIMessage = llm.invoke([
         SystemMessage(content="You are Debater B. Argue AGAINST the proposition. Find weaknesses in A's arguments."),
         *state["messages"],
@@ -219,7 +226,7 @@ def debater_b_node(state: DebateState) -> dict[str, Any]:
 
 
 def judge_node(state: DebateState) -> dict[str, Any]:
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(JudgeVerdict)
 
     verdict: JudgeVerdict = structured_llm.invoke([
@@ -285,6 +292,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +316,7 @@ class SwarmState(TypedDict):
 def _make_agent_node(agent_name: str, system_prompt: str):
     """Create an agent node that can hand off to other agents."""
     def node(state: SwarmState) -> dict[str, Any]:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+        llm = ChatOpenAI(model=MODEL, temperature=0.0)
         structured_llm = llm.with_structured_output(HandoffDecision)
 
         decision: HandoffDecision = structured_llm.invoke([
@@ -329,7 +339,7 @@ def _make_agent_node(agent_name: str, system_prompt: str):
 
 def triage_node(state: SwarmState) -> dict[str, Any]:
     """Initial triage agent that routes to the right specialist."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(HandoffDecision)
 
     decision: HandoffDecision = structured_llm.invoke([
@@ -403,6 +413,40 @@ Multi-agent systems in LangGraph share state through the `TypedDict` state objec
 Multi-agent systems multiply LLM costs by the number of agents times the number of rounds. Start with the simplest pattern that fits your use case; add complexity only when needed.
 :::
 
+## Counter-Position: When Multi-Agent Is the Wrong Choice
+
+Multi-agent is not an upgrade by default. Two widely cited engineering write-ups reach different conclusions, and both are useful:
+
+| Source | Position | Condition |
+|--------|----------|-----------|
+| Anthropic, *How we built our multi-agent research system* | Orchestrator-worker multi-agent beat a single agent on an internal research eval (reported +90.2%) because it spends more tokens in parallel, separate context windows | **Breadth-first, parallelizable** work; high task value |
+| Cognition, *Don't Build Multi-Agents* | Multi-agent systems are fragile: decisions get dispersed and context is not shared thoroughly; prefer a single-threaded linear agent (with context compression when needed) | **Tightly coupled** work such as writing code, where actions carry implicit decisions that can conflict |
+
+Why the objections are real:
+
+- **Tightly coupled tasks.** When subtasks depend on each other's decisions (an API shape, a naming scheme, a design choice), parallel workers make conflicting assumptions that no one reconciles. Anthropic itself notes that domains requiring all agents to share the same context, or with many inter-agent dependencies, are a poor fit today, and that most coding tasks have fewer parallelizable pieces than research.
+- **Context fragmentation.** A subagent that receives only a task summary lacks the history that explains *why* the task exists. Messages alone are lossy; Cognition argues for sharing full agent traces, which re-creates the cost you tried to avoid.
+- **Token multiplier.** Anthropic reports agents using about 4x the tokens of chat and multi-agent systems about 15x. Token spend is also a large part of why multi-agent can perform better, so you are partly buying quality with cost -- worthwhile only when task value justifies it.
+
+:::tip Decision rule
+Default to one agent with good tools and context management. Add workers for **independent, read-heavy, parallelizable** subtasks (search, analysis) and keep **writes and final decisions** in a single thread.
+:::
+
+### Context: Isolate vs. Fork
+
+When a lead agent delegates, it chooses how much context the worker receives:
+
+| Mode | Worker receives | Benefits | Risks |
+|------|-----------------|----------|-------|
+| **Isolate** (fresh context) | Only a task prompt and its own tools | Keeps the lead's context small; limits what a compromised or confused worker can see or leak; cheaper per worker | Worker lacks background; the brief must be explicit about goal, constraints, and output format; the worker may redo or contradict earlier decisions |
+| **Fork** (inherit context) | A copy of the lead's full history at spawn time | Worker shares all prior decisions and conventions, reducing conflicts | Pays for the whole history again per fork; **leaks** everything in the lead's context -- including secrets, private user data, and untrusted content that may carry an injection -- into the worker; forks do not see each other's later work |
+
+Claude Code documents both modes: a fork inherits the main session's full conversation history, system prompt, tools, and model, while a regular subagent starts fresh from its own definition and the prompt you pass.
+
+Leakage cuts both ways. Fork leaks *down* (lead context into worker); isolate still leaks *up* unless you filter, because a worker's returned text re-enters the lead's context and can carry injected instructions. Return **structured, validated summaries** rather than raw transcripts, and give each worker only the tools and data its subtask needs (see [Security Considerations](../architecture-design/security-considerations.md)).
+
+*Sources (checked 2026-10-12): Anthropic, [How we built our multi-agent research system](https://www.anthropic.com/engineering/multi-agent-research-system); Cognition, [Don't Build Multi-Agents](https://cognition.com/blog/dont-build-multi-agents); Claude Code [subagents docs](https://code.claude.com/docs/en/sub-agents).*
+
 ## Key Takeaways
 
 - Multi-agent systems decompose complex problems into specialized roles, improving quality and maintainability.
@@ -410,7 +454,8 @@ Multi-agent systems multiply LLM costs by the number of agents times the number 
 - **Debate** is modeled as a cycle: debaters take turns, a judge node decides when to stop.
 - **Swarm handoff** lets agents transfer control to specialists via structured routing decisions.
 - LangGraph's shared `TypedDict` state provides natural inter-agent communication.
-- Start simple; add agents and coordination only when single-agent approaches are insufficient.
+- Start simple; add agents and coordination only when single-agent approaches are insufficient. Tightly coupled work, fragmented context, and roughly 15x token cost (Anthropic's reported figure) are the main reasons not to.
+- Delegation is a context decision: **isolate** (fresh, smaller, safer, less informed) vs. **fork** (inherits everything, including anything sensitive).
 
 ## Further Reading
 

@@ -2,6 +2,7 @@
 sidebar_position: 1
 title: "Build a ReAct Agent with LangGraph"
 description: "Production-grade ReAct agent implementation using LangGraph with Pydantic state, conditional routing, memory, and async support."
+last_verified: 2026-10-12
 ---
 
 # Build a ReAct Agent with LangGraph
@@ -10,6 +11,10 @@ This page walks through a complete implementation of the **ReAct (Reasoning + Ac
 
 :::tip Why LangGraph for ReAct?
 LangGraph makes the ReAct loop an explicit, inspectable graph rather than a hidden while-loop. Every state transition is a typed edge you can test, visualize, and checkpoint. When your agent misbehaves in production, you can replay from any snapshot.
+:::
+
+:::info Prebuilt alternative
+If you do not need a custom loop, `from langchain.agents import create_agent` gives you this same model-tools-repeat graph in one call (the older `langgraph.prebuilt.create_react_agent` is its predecessor). This page builds the graph by hand to show what happens inside. Set `AGENT_MODEL` (`"<provider>:<model>"`) before running the code below.
 :::
 
 ---
@@ -153,10 +158,12 @@ ALL_TOOLS = [calculator, get_current_time, wikipedia_search]
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
+from langchain.chat_models import init_chat_model
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
-from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
 
 from state import AgentState
@@ -168,15 +175,16 @@ MAX_ITERATIONS = 10
 
 
 def create_model(
-    model_name: str = "gpt-4o",
+    model_name: str | None = None,
     temperature: float = 0.0,
-) -> ChatOpenAI:
+) -> BaseChatModel:
     """Create the LLM with tools bound.
 
     Separating construction from node logic supports dependency injection
     and makes testing with mock models straightforward.
     """
-    llm = ChatOpenAI(model=model_name, temperature=temperature)
+    # AGENT_MODEL is "<provider>:<model>"; pass model_name to override.
+    llm = init_chat_model(model_name or os.environ["AGENT_MODEL"], temperature=temperature)
     return llm.bind_tools(ALL_TOOLS)
 
 
@@ -291,7 +299,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s
 async def main() -> None:
     app = build_react_graph()
 
-    # Each thread_id gets its own conversation memory via the checkpointer.
+    # Each thread_id gets its own conversation memory vithe checkpointer.
     config = {"configurable": {"thread_id": "demo-session-1"}}
 
     queries = [
@@ -422,7 +430,7 @@ async def test_iteration_cap():
 ## Key Takeaways for Interviews
 
 :::tip Interview Talking Points
-1. **LangGraph makes the ReAct loop an explicit graph.** Each node, edge, and conditional is visible and testable -- unlike opaque `AgentExecutor` loops.
+1. **LangGraph makes the ReAct loop an explicit graph.** Each node, edge, and conditional is visible and testable -- unlike a prebuilt loop such as `create_agent`, where the cycle is hidden behind middleware hooks.
 2. **`add_messages` is a reducer.** It appends instead of replacing, which is how conversation history accumulates across the agent-tool cycle.
 3. **Checkpointing enables memory and time-travel.** `MemorySaver` persists state at every step so you can resume, replay, or debug any execution.
 4. **Async support is first-class.** `ainvoke` and `astream_events` let you build non-blocking agents for web servers and high-throughput pipelines.

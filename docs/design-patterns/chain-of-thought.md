@@ -1,6 +1,7 @@
 ---
 sidebar_position: 2
 title: "Chain-of-Thought Reasoning"
+last_verified: 2026-10-12
 ---
 
 # Chain-of-Thought Reasoning
@@ -73,6 +74,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +133,7 @@ Be thorough but concise. Show every logical inference."""
 
 def reasoning_node(state: CoTState) -> dict[str, Any]:
     """Perform structured chain-of-thought reasoning."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(CoTOutput)
 
     messages = [
@@ -154,7 +158,7 @@ def reasoning_node(state: CoTState) -> dict[str, Any]:
 
 def action_node(state: CoTState) -> dict[str, Any]:
     """Take action based on reasoning -- e.g., look up info or verify."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     reasoning = state["reasoning"]
 
     messages = [
@@ -277,6 +281,7 @@ flowchart TD
 | **action** | Verification node invoked only when confidence is below threshold |
 | **output** | Formats the final answer with reasoning trace for the user |
 
+
 ## Self-Consistency via Parallel CoT Branches
 
 LangGraph can model self-consistency by spawning parallel reasoning branches and aggregating with a majority-vote node.
@@ -291,6 +296,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 
 class SampleAnswer(BaseModel):
@@ -306,7 +314,7 @@ class ConsistencyState(TypedDict):
 
 def sample_node(state: ConsistencyState) -> dict[str, Any]:
     """Generate N diverse reasoning paths at higher temperature."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+    llm = ChatOpenAI(model=MODEL, temperature=0.7)
     structured_llm = llm.with_structured_output(SampleAnswer)
     num_samples = 5
 

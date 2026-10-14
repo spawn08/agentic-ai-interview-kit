@@ -2,6 +2,7 @@
 sidebar_position: 2
 title: "Agent Orchestration at Scale"
 description: "Patterns for dispatching, routing, and scaling agentic workloads in production"
+last_verified: 2026-10-12
 ---
 
 # Agent Orchestration at Scale
@@ -219,9 +220,9 @@ Not all agent tasks are equal. A simple FAQ lookup needs a fast, cheap model. A 
 ```mermaid
 graph LR
     Input[Incoming Task] --> Classifier[Task Classifier]
-    Classifier -->|Simple| Pool1[Lightweight Agents<br/>GPT-4o-mini, no tools]
-    Classifier -->|Standard| Pool2[Standard Agents<br/>GPT-4o, basic tools]
-    Classifier -->|Complex| Pool3[Heavy Agents<br/>Claude Opus, full tool suite]
+    Classifier -->|Simple| Pool1[Lightweight Agents<br/>fast-tier model, no tools]
+    Classifier -->|Standard| Pool2[Standard Agents<br/>standard-tier model, basic tools]
+    Classifier -->|Complex| Pool3[Heavy Agents<br/>frontier-tier model, full tool suite]
     Classifier -->|Specialized| Pool4[Domain Agents<br/>Fine-tuned models]
 ```
 
@@ -493,11 +494,15 @@ For complex, multi-step agent orchestration -- especially when steps can run for
 ### Temporal Example
 
 ```python
+import os
 import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+
+MODEL = os.environ["AGENT_MODEL"]
+
 
 # Activities (call_llm, execute_tool) are defined elsewhere and registered
 # with the worker. Helpers parse_plan / synthesis_prompt live in the same module.
@@ -521,7 +526,7 @@ class AgentWorkflow:
         # Step 1: LLM plans (durable activity with automatic retry).
         plan = await workflow.execute_activity(
             call_llm,
-            args=[task["prompt"], "gpt-4o"],
+            args=[task["prompt"], MODEL],
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
@@ -544,7 +549,7 @@ class AgentWorkflow:
         # Step 3: Synthesize results via LLM.
         return await workflow.execute_activity(
             call_llm,
-            args=[synthesis_prompt(results), "gpt-4o"],
+            args=[synthesis_prompt(results), MODEL],
             start_to_close_timeout=timedelta(seconds=30),
         )
 ```
@@ -602,6 +607,7 @@ class BackpressureController:
 
 ## The Budget-Aware Agent Loop
 
+
 The ReAct (Reasoning + Acting) loop is the core execution primitive in agentic AI. A naive implementation runs until the LLM emits a "final answer" token -- but in production, a confused or under-specified model can loop indefinitely, calling the same tool with the same parameters and burning through the entire token budget in seconds. This section presents a production-grade ReAct loop with three safety mechanisms that prevent runaway cost.
 
 ```python
@@ -609,6 +615,10 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from enum import Enum
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
+MODEL_FAST = os.environ["AGENT_MODEL_FAST"]
 
 # --- Supporting types ---
 
@@ -767,10 +777,10 @@ class BudgetAwareReActLoop:
         aggressively to preserve capacity for final synthesis.
         """
         if step == 0:
-            return "gpt-4o"         # planning needs strong reasoning
+            return MODEL         # planning needs strong reasoning
         if self.budget.spent_ratio > 0.6:
-            return "gpt-4o-mini"    # conserve budget in late steps
-        return "gpt-4o"
+            return MODEL_FAST    # conserve budget in late steps
+        return MODEL
 
     def _build_prompt(self, task: str, context: list[dict], scratchpad: list[dict]) -> str:
         """Construct the ReAct prompt with task, context, and accumulated scratchpad."""
@@ -804,7 +814,7 @@ class BudgetAwareReActLoop:
             f"Task: {task}\n\n"
             f"Gathered information ({len(observations)} observations):\n{formatted}"
         )
-        answer = await self.llm.generate(prompt, model="gpt-4o-mini")
+        answer = await self.llm.generate(prompt, model=MODEL_FAST)
         self.budget.record_step(answer.usage)
         return AgentResult(
             answer=answer.content,

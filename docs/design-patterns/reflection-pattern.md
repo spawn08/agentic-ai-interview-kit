@@ -1,6 +1,7 @@
 ---
 sidebar_position: 4
 title: "Reflection and Self-Critique"
+last_verified: 2026-10-12
 ---
 
 # Reflection and Self-Critique
@@ -81,6 +82,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
+import os
+
+MODEL = os.environ["AGENT_MODEL"]
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +130,7 @@ GENERATOR_SYSTEM = (
 
 def generator_node(state: ReflectionState) -> dict[str, Any]:
     """Generate or revise the output based on task and prior critiques."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
 
     messages: list[BaseMessage] = [SystemMessage(content=GENERATOR_SYSTEM)]
 
@@ -167,7 +171,7 @@ CRITIC_SYSTEM = (
 
 def critic_node(state: ReflectionState) -> dict[str, Any]:
     """Critique the current output and produce a structured evaluation."""
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    llm = ChatOpenAI(model=MODEL, temperature=0.0)
     structured_llm = llm.with_structured_output(Critique)
 
     critique: Critique = structured_llm.invoke([
